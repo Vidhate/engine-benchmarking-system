@@ -90,6 +90,13 @@ class LlmFaultMiddleware(AgentMiddleware):
         fault = _armed_llm_fault()
         return response if fault is None else _truncate_final_message(response, fault)
 
+    async def awrap_model_call(self, request: ModelRequest, handler) -> ModelResponse:
+        # The LangGraph server drives the graph asynchronously, so the async
+        # twin is required — without it the run fails with NotImplementedError.
+        response = await handler(request)
+        fault = _armed_llm_fault()
+        return response if fault is None else _truncate_final_message(response, fault)
+
 
 def _armed_llm_fault() -> Fault | None:
     try:
