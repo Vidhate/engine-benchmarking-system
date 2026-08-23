@@ -97,7 +97,6 @@ def score_descriptions(
         if cfg.description_mode == "similarity":
             score = text_similarity(pred_issue.description, gt_issue.description)
         else:
-            assert judge is not None  # guarded above
             score = judge.score(gt_issue, pred_issue)
 
         scores_by_known[m.matched_error_id].append(score)

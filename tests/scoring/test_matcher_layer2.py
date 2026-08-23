@@ -3,6 +3,7 @@
 
 from benchmark.schemas import Issue, Issueboard, IssueOccurrence, ScoringConfig
 from benchmark.scoring.matcher import pair_issues, resolve_occurrences
+from benchmark.scoring.scorer_per_error import score_per_error
 
 
 def make_issue(error_id, category_id, title="issue", description=None, severity="medium"):
@@ -83,6 +84,15 @@ def test_coarser_predicted_issue_pairs_only_with_its_majority_partner():
     assert m.matched_error_id == "K1"  # majority partner (3 traces vs 1)
     assert m.overlap == 3
     assert not m.tie_broken_by_text
+
+    # "Occurrence-level detection credit stays fair throughout" (spec): even
+    # though Layer 2 pairing left K2 without an issue-level partner, Layer 1
+    # still resolved P1's t4 occurrence to K2 via the exact key, so Scorer 2's
+    # per-error recall for the minority known error is untouched by the lump.
+    per_error_scores = score_per_error(gt, pred, occ_matches, ["t1", "t2", "t3", "t4"])
+    by_error = {s.category_id: s for s in per_error_scores}
+    assert by_error["K2"].recall == 1.0
+    assert by_error["K2"].precision == 1.0
 
 
 def test_tie_break_uses_text_similarity_of_descriptions():
