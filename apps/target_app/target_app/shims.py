@@ -45,7 +45,14 @@ class Fault:
 
 
 def read_fault(config: Any, key: str) -> Fault | None:
-    """Extract the fault armed under `key`, or None when the shim is disarmed."""
+    """Extract the fault armed under `key`, or None when the shim is disarmed.
+
+    The value MUST be a mapping, e.g. `{"behavior": "stale"}`. A scalar
+    (`"stale"`) is refused: `langchain_core.runnables.config.ensure_config`
+    promotes every str/int/float/bool `configurable` entry into the run's
+    tracing metadata, which would stamp "this trace was ablated" onto every
+    span of every armed run. A mapping is not promoted.
+    """
     if key not in FAULT_BEHAVIORS:
         raise ValueError(f"{key!r} is not a declared fault key")
     configurable = (config or {}).get("configurable") or {}
@@ -53,13 +60,15 @@ def read_fault(config: Any, key: str) -> Fault | None:
     if not value:
         return None
 
-    if isinstance(value, str):
-        behavior, params = value, {}
-    elif isinstance(value, dict):
-        behavior = value.get("behavior") or value.get("mode") or ""
-        params = {k: v for k, v in value.items() if k not in ("behavior", "mode")}
-    else:
-        raise ValueError(f"{key!r} expects a behavior string or a dict, got {type(value).__name__}")
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{key!r} must be armed with a mapping such as {{'behavior': ...}}, got "
+            f"{type(value).__name__}; scalar values leak into tracing metadata"
+        )
+
+    behavior = value.get("behavior") or value.get("mode") or ""
+    params = dict(value.get("params") or {})
+    params.update({k: v for k, v in value.items() if k not in ("behavior", "mode", "params")})
 
     if behavior not in FAULT_BEHAVIORS[key]:
         raise ValueError(

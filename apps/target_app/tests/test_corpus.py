@@ -1,5 +1,7 @@
 """Corpus loading: frontmatter parsing, body/archived split, determinism."""
 
+import pytest
+
 from target_app.corpus import CORPUS_DIR, Document, load_corpus
 
 
@@ -50,6 +52,41 @@ def test_loading_is_deterministic_and_sorted():
     second = load_corpus()
     assert [d.doc_id for d in first] == [d.doc_id for d in second]
     assert [d.doc_id for d in first] == sorted(d.doc_id for d in first)
+
+
+GOOD = (
+    "---\n"
+    "doc_id: solo\n"
+    "title: Solo Doc\n"
+    "tags: alpha, beta\n"
+    "updated: 2026-01-01\n"
+    "---\n\n"
+    "Current body.\n\n"
+    "<!-- ARCHIVED 2001-01-01 -->\n\n"
+    "Archived body.\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "raw", "complaint"),
+    [
+        ("no frontmatter", GOOD.split("---\n", 2)[2], "frontmatter"),
+        ("unterminated frontmatter", GOOD.replace("updated: 2026-01-01\n---\n", ""), "frontmatter"),
+        ("missing doc_id", GOOD.replace("doc_id: solo\n", ""), "doc_id"),
+        ("missing tags", GOOD.replace("tags: alpha, beta\n", ""), "tags"),
+        ("no archived revision", GOOD.split("<!-- ARCHIVED")[0], "ARCHIVED"),
+    ],
+)
+def test_a_malformed_document_fails_loudly(tmp_path, name, raw, complaint):
+    """A silently half-loaded corpus would poison every retrieval downstream."""
+    (tmp_path / "broken.md").write_text(raw)
+    with pytest.raises(ValueError, match=complaint):
+        load_corpus(tmp_path)
+
+
+def test_the_malformed_cases_start_from_a_document_that_does_load(tmp_path):
+    (tmp_path / "solo.md").write_text(GOOD)
+    assert len(load_corpus(tmp_path)) == 1
 
 
 def test_load_corpus_accepts_an_explicit_directory(tmp_path):

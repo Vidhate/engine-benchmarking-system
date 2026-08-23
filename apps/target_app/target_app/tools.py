@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextvars import ContextVar
 from typing import Any, Literal
 
 from langchain_core.runnables import RunnableConfig
@@ -30,10 +31,21 @@ DEFAULT_K = 3
 DEFAULT_ETA_HOURS = 24
 
 
+# The armed fault is passed to the traced retrieval step out-of-band. If it
+# were an argument, `@traceable` would record it verbatim in the retriever
+# span's inputs — "Fault(behavior='stale')" sitting in the trace we are asking
+# an Engine to analyse blind.
+_ARMED_RETRIEVER_FAULT: ContextVar[Fault | None] = ContextVar(
+    "armed_retriever_fault", default=None
+)
+
+
 @traceable(run_type="retriever", name="corpus_search")
-def _retrieve(query: str, k: int, fault: Fault | None) -> list[dict[str, Any]]:
+def _retrieve(query: str, k: int) -> list[dict[str, Any]]:
     """The retrieval step itself — emitted as its own retriever span."""
-    hits = apply_retriever_fault(fault, query=query, retriever=RETRIEVER, k=k)
+    hits = apply_retriever_fault(
+        _ARMED_RETRIEVER_FAULT.get(), query=query, retriever=RETRIEVER, k=k
+    )
     return [hit.as_payload() for hit in hits]
 
 
@@ -48,8 +60,11 @@ def rag_search(query: str, config: RunnableConfig) -> str:
     Args:
         query: A natural-language description of what to look up.
     """
-    fault = read_fault(config, FAULT_RETRIEVER_KEY)
-    results = _retrieve(query, DEFAULT_K, fault)
+    token = _ARMED_RETRIEVER_FAULT.set(read_fault(config, FAULT_RETRIEVER_KEY))
+    try:
+        results = _retrieve(query, DEFAULT_K)
+    finally:
+        _ARMED_RETRIEVER_FAULT.reset(token)
     return json.dumps({"query": query, "results": results}, indent=2)
 
 

@@ -3,7 +3,12 @@
 base_url: "http://127.0.0.1:2024"
 assistant_id: "target_app"
 langsmith_project: "engine-bench-target"
-fault_configurable_keys:            # declared Mode C shim surface
+# Declared Mode C shim surface. Values MUST be mappings, e.g.
+#   configurable = {"fault_retriever": {"behavior": "stale"}}
+# A bare string is refused by the app: langchain promotes str/int/float/bool
+# `configurable` entries into inheritable tracing metadata, which would stamp
+# the fault name onto every span of every ablated trace.
+fault_configurable_keys:
   retriever: "fault_retriever"      #   irrelevant_docs | empty | stale
   tool: "fault_tool"                #   error | timeout | corrupted_result
   llm: "fault_llm"                  #   truncate_output

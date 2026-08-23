@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Target AI app under benchmark: a product-support assistant (LangGraph)"
 requires-python = ">=3.12"
 dependencies = [
-    "deepagents>=0.2",
     "langchain-openai>=0.3",
     "langgraph>=0.6",
     "langsmith>=0.3",

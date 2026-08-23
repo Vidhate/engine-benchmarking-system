@@ -48,11 +48,16 @@ class RetrievedDoc:
     score: float
 
     def as_payload(self) -> dict[str, object]:
+        """What the tool actually returns.
+
+        The BM25 score is deliberately omitted: an `irrelevant_docs` run would
+        show near-zero scores next to non-zero ones on an organic run, which is
+        a statistical tell an Engine could learn instead of reading the docs.
+        """
         return {
             "doc_id": self.doc_id,
             "title": self.title,
             "updated": self.updated,
-            "score": round(self.score, 4),
             "content": self.text,
         }
 

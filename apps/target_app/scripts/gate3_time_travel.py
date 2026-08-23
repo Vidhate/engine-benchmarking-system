@@ -19,16 +19,23 @@ from langgraph_sdk import get_sync_client  # noqa: E402
 
 TURN_1 = "What is your refund policy for an annual plan?"
 TURN_2 = "Thanks. Anything different for a monthly plan?"
-# A recall question: the point is to see the model reuse what it "said".
+# A recall question. The case reference below exists ONLY in the edited
+# checkpoint — it is in no document and no earlier turn — so a continuation
+# that reproduces it can only have been built on the corrupted state. The
+# refund window is reported too, but it is a weaker signal: the model can
+# legitimately re-derive "30 days" by searching the corpus again.
 TURN_2_REPLAYED = (
     "Sorry, I got distracted and did not read that. Without looking anything up again, "
-    "just repeat the refund window in days that you gave me a moment ago."
+    "remind me of the case reference you gave me and the refund window in days you quoted."
 )
+CASE_REFERENCE = "NBX-4471"
 CORRUPTED_ANSWER = (
-    "Annual plans on Nimbus Notes are refundable in full within 365 days of the charge "
-    "date, and refunds are paid out in Nimbus Credit rather than to your card."
+    f"Annual plans on Nimbus Notes are refundable in full within 365 days of the charge "
+    f"date, and refunds are paid out in Nimbus Credit rather than to your card. "
+    f"I have logged this conversation under case reference {CASE_REFERENCE}."
 )
-CORRUPTION_MARKERS = ("365", "nimbus credit")
+REQUIRED_MARKER = CASE_REFERENCE.lower()
+SOFT_MARKERS = ("365", "nimbus credit")
 
 
 def text_of(message: dict) -> str:
@@ -112,10 +119,13 @@ def main() -> int:
     print(f"\ncontinuation after the edit:\n  {continuation[:400]}")
 
     lowered = continuation.lower()
-    hits = [marker for marker in CORRUPTION_MARKERS if marker in lowered]
-    print(f"\noriginal answer mentioned '30 days': {'30 days' in original_answer.lower()}")
-    print(f"continuation echoes the edited content: {hits}")
-    assert hits, "continuation did not build on the edited checkpoint content"
+    soft_hits = [marker for marker in SOFT_MARKERS if marker in lowered]
+    print(f"\noriginal answer mentioned '30 days'   : {'30 days' in original_answer.lower()}")
+    print(f"case reference existed only in the edit: {CASE_REFERENCE not in original_answer}")
+    print(f"continuation reproduces it             : {REQUIRED_MARKER in lowered}")
+    print(f"continuation also echoes               : {soft_hits}")
+    assert CASE_REFERENCE not in original_answer, "the marker was not unique to the edit"
+    assert REQUIRED_MARKER in lowered, "continuation did not build on the edited checkpoint"
     print("\nOK — forked from an earlier checkpoint, edited state, resumed coherently")
     return 0
 

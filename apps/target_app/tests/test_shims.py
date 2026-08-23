@@ -52,14 +52,9 @@ def test_no_fault_key_means_no_fault(config):
 
 
 def test_other_keys_are_ignored():
-    config = {"configurable": {"thread_id": "abc", "fault_tool": "error"}}
+    config = {"configurable": {"thread_id": "abc", FAULT_TOOL_KEY: {"behavior": "error"}}}
     assert read_fault(config, FAULT_RETRIEVER_KEY) is None
     assert read_fault(config, FAULT_TOOL_KEY) == Fault("error", {})
-
-
-def test_string_value_is_the_behavior():
-    fault = read_fault({"configurable": {FAULT_RETRIEVER_KEY: "empty"}}, FAULT_RETRIEVER_KEY)
-    assert fault == Fault("empty", {})
 
 
 def test_dict_value_carries_params():
@@ -69,19 +64,58 @@ def test_dict_value_carries_params():
     assert fault.params == {"delay_seconds": 0.01}
 
 
-@pytest.mark.parametrize("value", ["", None, False])
+def test_params_may_be_nested():
+    config = {
+        "configurable": {FAULT_TOOL_KEY: {"behavior": "timeout", "params": {"delay_seconds": 2}}}
+    }
+    assert read_fault(config, FAULT_TOOL_KEY) == Fault("timeout", {"delay_seconds": 2})
+
+
+@pytest.mark.parametrize("scalar", ["empty", 3, 1.5, True])
+def test_scalar_values_are_refused_because_langchain_promotes_them_into_metadata(scalar):
+    """LangChain copies str/int/float/bool configurable entries into tracing
+    metadata on every span. A scalar fault value would therefore label the whole
+    trace as ablated. Only the mapping form is accepted."""
+    with pytest.raises(ValueError, match="mapping"):
+        read_fault({"configurable": {FAULT_RETRIEVER_KEY: scalar}}, FAULT_RETRIEVER_KEY)
+
+
+@pytest.mark.parametrize("value", ["", None, False, {}])
 def test_falsy_values_disarm_the_shim(value):
     assert read_fault({"configurable": {FAULT_LLM_KEY: value}}, FAULT_LLM_KEY) is None
 
 
 def test_unknown_behavior_is_rejected():
     with pytest.raises(ValueError, match="unknown"):
-        read_fault({"configurable": {FAULT_RETRIEVER_KEY: "explode"}}, FAULT_RETRIEVER_KEY)
+        read_fault({"configurable": {FAULT_RETRIEVER_KEY: {"behavior": "explode"}}},
+                   FAULT_RETRIEVER_KEY)
 
 
 def test_behavior_from_the_wrong_family_is_rejected():
     with pytest.raises(ValueError, match="unknown"):
-        read_fault({"configurable": {FAULT_RETRIEVER_KEY: "timeout"}}, FAULT_RETRIEVER_KEY)
+        read_fault({"configurable": {FAULT_RETRIEVER_KEY: {"behavior": "timeout"}}},
+                   FAULT_RETRIEVER_KEY)
+
+
+def test_mapping_without_a_behavior_is_rejected():
+    with pytest.raises(ValueError, match="unknown"):
+        read_fault({"configurable": {FAULT_TOOL_KEY: {"delay_seconds": 1}}}, FAULT_TOOL_KEY)
+
+
+def test_the_mapping_rule_actually_defeats_langchain_metadata_promotion():
+    """Pin the upstream behaviour the mapping-only rule depends on.
+
+    If a langchain upgrade starts promoting mappings too, this fails here
+    instead of silently stamping every ablated trace with a giveaway.
+    """
+    from langchain_core.runnables.config import (
+        _get_langsmith_inheritable_metadata_from_config as promote,
+    )
+
+    assert promote({"configurable": {FAULT_RETRIEVER_KEY: "empty"}}) == {
+        FAULT_RETRIEVER_KEY: "empty"
+    }  # the shape we refuse
+    assert promote({"configurable": {FAULT_RETRIEVER_KEY: {"behavior": "empty"}}}) is None
 
 
 # -------------------------------------------------------- retriever shim

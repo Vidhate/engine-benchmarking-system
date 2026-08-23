@@ -7,10 +7,10 @@ from `configs/target_app.yaml` and the LangGraph Server API.
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
+import yaml
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -25,28 +25,8 @@ def load_contract() -> dict:
     sys.path.insert(0, str(REPO_ROOT))
     from benchmark.schemas.configs import TargetAppConfig  # noqa: PLC0415
 
-    config = TargetAppConfig(**_parse_yaml(CONFIG_PATH.read_text()))
+    config = TargetAppConfig(**yaml.safe_load(CONFIG_PATH.read_text()))
     return config.model_dump()
-
-
-def _parse_yaml(text: str) -> dict:
-    """Tiny loader for this one flat file (pyyaml is not a benchmark dependency)."""
-    root: dict = {}
-    section: dict | None = None
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        indented = line.startswith(("  ", "\t"))
-        key, _, value = line.strip().partition(":")
-        value = value.strip().strip('"')
-        target = section if indented and section is not None else root
-        if value == "":
-            section = {}
-            root[key.strip()] = section
-        else:
-            target[key.strip()] = int(value) if re.fullmatch(r"-?\d+", value) else value
-    return root
 
 
 def banner(title: str) -> None:

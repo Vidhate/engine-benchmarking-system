@@ -1,11 +1,14 @@
 """configs/target_app.yaml is the black-box contract — keep it in sync with the code.
 
-Schema validation against benchmark.schemas.configs.TargetAppConfig happens in
-the root package; here we only check that what the app publishes matches what
-the app actually implements.
+The app publishes this file, so the app tests it: it must validate against the
+Phase-0 schema *and* describe what the shims actually implement.
+
+Importing `benchmark.schemas` here does not cross the black-box boundary — the
+rule is that `benchmark/` must never import `apps/`, not the reverse.
 """
 
 import json
+import sys
 from pathlib import Path
 
 import yaml
@@ -27,6 +30,18 @@ LANGGRAPH_JSON = APP_DIR / "langgraph.json"
 
 def load_config() -> dict:
     return yaml.safe_load(CONFIG_PATH.read_text())
+
+
+def test_the_published_config_validates_against_the_phase_0_schema():
+    sys.path.insert(0, str(REPO_ROOT))
+    from benchmark.schemas.configs import TargetAppConfig
+
+    config = TargetAppConfig(**load_config())
+    assert config.base_url == "http://127.0.0.1:2024"
+    assert config.assistant_id == "target_app"
+    assert config.langsmith_project == LANGSMITH_PROJECT
+    assert config.max_turns_supported == 8
+    assert set(config.fault_configurable_keys) == {"retriever", "tool", "llm"}
 
 
 def test_declared_fault_keys_are_the_ones_the_shims_read():
