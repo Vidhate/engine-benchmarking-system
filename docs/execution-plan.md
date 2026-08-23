@@ -8,9 +8,12 @@ sessions.
 
 1. **One phase = one worktree.** Parallel batches → parallel sessions.
 2. **Python backend**; OpenAI models wherever an LLM is needed.
-3. **LangGraph primitives everywhere they fit**: LangSmith for tracing, LangChain
-   deep-agents for the target app and the dummy Engine, LangGraph Server (`langgraph.json`)
-   as the invocation surface, LangGraph checkpoint time-travel for replay.
+3. **LangGraph primitives everywhere they fit**: LangSmith for tracing, LangGraph Server
+   (`langgraph.json`) as the invocation surface, LangGraph checkpoint time-travel for
+   replay. The target app is a plain `create_react_agent` graph (deepagents was dropped in
+   Phase 2 review: overkill for a 2-tool app, and its scaffold registered shell/filesystem
+   built-in tools and added ~15 noise spans per trace); the dummy Engine may still use
+   deep-agents where its trace-analysis loop warrants it.
 4. **Black-box boundary (hard rule)**: the target AI app and the Engine live in their own
    subdirectories as self-contained codebases. Benchmark code NEVER imports from them —
    everything it knows about either comes from a **config file**, and everything it does to
@@ -177,12 +180,14 @@ Deliverables ([06-scoring.md](architecture/06-scoring.md)):
 
 **Worktree:** `phase-2-target-app` · **Deps:** Phase 0 · **Batch A**
 
-A `apps/target_app/` deep-agent on a small OpenAI model. Domain: pick something RAG-natural
-(e.g. product-support assistant over a small local doc store). **≤2 tools**: one RAG
-retrieval tool, one action tool (`create_ticket` stub) — low latency for high-volume I/O.
+A `apps/target_app/` agent (`langgraph.prebuilt.create_react_agent`) on a small OpenAI
+model. Domain: pick something RAG-natural (e.g. product-support assistant over a small
+local doc store). **≤2 tools**: one RAG retrieval tool, one action tool (`create_ticket`
+stub) — low latency for high-volume I/O.
 
 Deliverables:
-- Deep-agent graph + `langgraph.json`; runs under `langgraph dev`; LangSmith tracing on.
+- `create_react_agent` graph + `langgraph.json`; runs under `langgraph dev`; LangSmith
+  tracing on. The graph registers exactly the two tools — nothing else dispatchable.
 - **Checkpointing enabled** — required for thread time-travel (the Mode A surface).
 - **Shim hooks** (Mode C surface): retriever shim (irrelevant/empty/stale docs), tool
   wrapper (error/timeout/corrupted result), LLM proxy (`base_url` swap / truncation) — all
