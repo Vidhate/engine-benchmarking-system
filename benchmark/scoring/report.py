@@ -17,11 +17,6 @@ from benchmark.scoring.scorer_per_error import score_per_error
 from benchmark.scoring.scorer_severity import score_severity
 
 
-def _all_trace_ids(gt: Issueboard, pred: Issueboard) -> list[str]:
-    ids = {occ.trace_id for occ in gt.occurrences} | {occ.trace_id for occ in pred.occurrences}
-    return sorted(ids)
-
-
 def _macro_mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -31,10 +26,19 @@ def score(
     predicted: Issueboard,
     cfg: ScoringConfig,
     base_rates: dict,
+    trace_ids: list[str],
     engine_config: EngineConfig | None = None,
     judge: DescriptionJudge | None = None,
 ) -> BenchmarkReport:
     """Score `predicted` against `ground_truth` and assemble a BenchmarkReport.
+
+    `trace_ids` MUST be the true trace universe (every trace in the dataset,
+    including control/clean traces with zero occurrences in either board) —
+    NOT derived from occurrences. Cohen's kappa (Scorer 1 and Scorer 2)
+    depends on n = len(trace_ids) via TN/po/pe: dropping clean traces (the
+    majority of any real dataset at a realistic control_fraction) silently
+    collapses kappa's whole point of correcting for chance agreement under
+    low prevalence. There is deliberately no silent fallback here.
 
     `engine_config` defaults to a placeholder identity when the caller doesn't
     have Engine-run provenance handy (e.g. scoring in isolation); real
@@ -44,7 +48,6 @@ def score(
 
     occ_matches = resolve_occurrences(ground_truth, predicted, cfg)
     matches = pair_issues(occ_matches, ground_truth, predicted)
-    trace_ids = _all_trace_ids(ground_truth, predicted)
 
     category_scores = score_categories(ground_truth, predicted, trace_ids)
     per_error_scores = score_per_error(ground_truth, predicted, occ_matches, trace_ids)
