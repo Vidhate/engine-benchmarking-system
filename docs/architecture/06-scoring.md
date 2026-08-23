@@ -17,7 +17,7 @@ flowchart TB
     GT["GT Issueboard [N,E_K]"] --> SC1
     PR["Predicted Issueboard [N,E_P]"] --> SC1
     SC1["Scorer 1 · Category-level<br/>trace classification"] --> R
-    GT --> MATCH["Error matcher<br/>E_P → E_K (within category)"]
+    GT --> MATCH["Error matcher<br/>exact key (trace, category) → K_i<br/>+ argmax-overlap issue pairing"]
     PR --> MATCH
     MATCH --> SC2["Scorer 2 · Per-error<br/>trace classification"]
     MATCH --> SC3["Scorer 3 · Severity<br/>(asymmetric loss)"]
@@ -60,31 +60,70 @@ the injected definitions.
 
 ## Error matcher — mapping `E_P → E_K`
 
-Within each category, predicted errors are matched to known errors by text similarity over
-`title + description`.
+Matching is **exact bookkeeping, not fuzzy text similarity** — a direct payoff of the
+ablation engine's [same-category disjointness invariant](04-ablation-engine.md): since two
+errors of one category are never injected into the same trace, **`(trace_id, category_id)`
+uniquely identifies the injected known error**. Matching happens in two layers.
+
+### Layer 1 — occurrence-level resolution (exact key)
 
 ```mermaid
 flowchart TB
-    EP["Predicted issues E_P"] --> GRP["group by category"]
-    EK["Known issues E_K"] --> GRP
-    GRP --> SIM["pairwise similarity<br/>TF-IDF cosine (fast path)<br/>embedding cosine (robust path)"]
-    SIM --> ASSIGN["greedy / Hungarian assignment<br/>above threshold τ"]
-    ASSIGN --> MAPPED["ErrorMatch list<br/>matched pairs"]
-    ASSIGN --> UNM_P["unmatched E_P<br/>→ FP candidates (or E_h hits)"]
-    ASSIGN --> UNM_K["unmatched E_K<br/>→ missed errors (FN)"]
+    PO["Each predicted occurrence<br/>(trace_id, category_id)"] --> KEY{"key hits an<br/>injected E_K error?"}
+    KEY -- yes --> RES["resolved to exactly one K_i<br/>(guaranteed by disjointness)"]
+    KEY -- no --> FB{"same trace has an injection<br/>in a DIFFERENT category?"}
+    FB -- yes --> TXT["text-sim fallback (TF-IDF):<br/>possible right-finding, wrong-category<br/>— fallback rate reported as<br/>matcher reliability stat"]
+    FB -- no --> POOL["FP / E_h-candidate pool<br/>(incl. clean-trace flags,<br/>'other'-category predictions)"]
 ```
 
 ```python
-def match_errors(known: list[Issue], predicted: list[Issue],
-                 method: Literal["tfidf", "embedding"] = "tfidf",
-                 threshold: float = 0.5) -> list[ErrorMatch]:
-    """Within-category, one-to-one assignment maximizing total similarity.
-    Unmatched predictions stay as candidate FPs; unmatched knowns are FNs."""
+def resolve_occurrences(gt: Issueboard, pred: Issueboard) -> list[OccurrenceMatch]:
+    """Exact-key resolution: predicted occurrence (trace_id, category_id) → the one
+    known error injected under that key, or fallback/unmatched. No thresholds on
+    the primary path; text similarity only fires for wrong-category cases and its
+    firing rate is itself reported (matcher reliability)."""
 ```
 
-Category grouping keeps the assignment problem small and prevents cross-category
-false-matches (a hallucination error should never match a latency error however similar the
-wording).
+### Layer 2 — issue-level pairing (argmax overlap / "majority vote")
+
+Scorers 3–4 compare issue *objects* (severity vs severity, write-up vs write-up), so each
+predicted issue needs one known-error partner. Its resolved occurrences decide:
+
+```
+matched(P_j) = argmax_{K_i ∈ same category} | occurrences(P_j) ∩ traces(K_i) |
+```
+
+Well-posed because the `K_i` trace sets partition the ablated traces: a coherent predicted
+cluster concentrates overlap on one `K_i`; a lumped cluster dilutes itself. Ties break by
+text similarity between descriptions (the only other place TF-IDF re-enters).
+
+```python
+def pair_issues(occ_matches: list[OccurrenceMatch],
+                gt: Issueboard, pred: Issueboard) -> list[ErrorMatch]:
+    """Per predicted issue: argmax over known errors of occurrence-set overlap.
+    Many-to-one predicted→known allowed; the reverse is structurally excluded."""
+```
+
+### Granularity asymmetry (by design)
+
+- **Predicted finer than known — fine.** Two predicted issues splitting one `K_i` both
+  argmax to it: both keep occurrence credit, both are description-scored against `K_i`.
+- **Predicted coarser than known — penalized where it hurts.** A cluster lumping `K_1, K_2`
+  pairs with only its majority partner; its write-up scores poorly as a description of one
+  specific error, and the minority known error is left without an issue-level partner.
+  Occurrence-level detection credit stays fair throughout.
+
+### Future work
+
+- **Weak supervision** (multiple labeling functions over traces) as the upgrade path for
+  the wrong-category text fallback — the exact-key primary path needs no upgrade.
+- **Cluster purity metric** (homogeneity of resolved known-error labels within each
+  predicted issue) to penalize under-splitting directly; drops out of Layer 1 for free.
+- **Net-new-category expansion**: hide category definitions from Engine, perform a
+  category-level alignment (predicted free-form category → `C_E`) before scorer 1, then run
+  all downstream measures unchanged. v1 sticks to the known shared taxonomy plus an
+  **`other` escape category** so Engine is never forced to shoehorn genuine out-of-taxonomy
+  (`E_h`) discoveries — `other` predictions flow straight to the `E_h`-candidates appendix.
 
 ## Scorer 2 — Per-error trace classification
 
@@ -93,8 +132,9 @@ traces did you say exhibit this error?").
 
 ```python
 def score_per_error(gt: Issueboard, pred: Issueboard,
-                    matches: list[ErrorMatch]) -> list[CategoryScore]:
-    """Per matched error: precision, recall, F1, Cohen's kappa over trace sets.
+                    occ_matches: list[OccurrenceMatch]) -> list[CategoryScore]:
+    """Per known error K_i: precision, recall, F1, Cohen's kappa over trace sets,
+    computed from Layer-1 exact-key resolutions (independent of issue pairing).
     This is the strictest localization test: right error, right traces."""
 ```
 

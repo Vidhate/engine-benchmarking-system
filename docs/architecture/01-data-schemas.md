@@ -144,7 +144,9 @@ class ErrorCategory(BaseModel):
     """C_E — the high-level taxonomy. Input to ablation, shared vocabulary for scoring."""
     category_id: str
     name: str            # e.g. "tool_misuse", "hallucination", "retrieval_failure",
-                         #      "instruction_violation", "formatting", "state_loss"
+                         #      "instruction_violation", "formatting", "state_loss",
+                         #      "other" (escape hatch — always in Engine's vocabulary so
+                         #      out-of-taxonomy E_h discoveries aren't shoehorned)
     description: str
 
 class Issue(BaseModel):
@@ -154,6 +156,9 @@ class Issue(BaseModel):
     description: str                   # verbose description
     category_id: str                   # FK → ErrorCategory
     severity: Literal["low", "medium", "high"]
+    injection_mode: Literal["replay_edit", "dependency_fault"] | None = None
+    # ^ E_K entries ONLY — post-hoc analysis of which ablation kind benchmarks
+    #   more fairly. Stripped from anything Engine sees; never consumed by scorers.
 
 class IssueOccurrence(BaseModel):
     error_id: str
@@ -179,9 +184,18 @@ must **update**, mirroring the real product where an issueboard already exists.
 class AblationSpec(BaseModel):
     """Filter + strategy for injecting one error. Produced by step 2, validated by step 3."""
     error_id: str                      # FK → Issue (the E_K entry this injects)
+    mode: Literal["replay_edit", "dependency_fault"]
     filter: TraceFilter                # which traces are eligible
-    ablation_actions: list[AblationAction]
+    ablation_actions: list[AblationAction] = []   # replay_edit: turn-k mutations
+    fault_config: FaultConfig | None = None       # dependency_fault: shim + behavior
     target_count: int                  # sub-sample size after filtering
+
+class FaultConfig(BaseModel):
+    """dependency_fault mode: which external-dependency shim to arm, and how."""
+    shim: Literal["llm_proxy", "retriever", "tool"]
+    target: str                        # e.g. tool name, retriever endpoint
+    behavior: str                      # "irrelevant_docs", "timeout", "truncate_output"…
+    params: dict = {}
 
 class TraceFilter(BaseModel):
     """Declarative selection over trace properties — a list of SDK predicate steps."""
@@ -205,16 +219,33 @@ class AblationRecord(BaseModel):
     trace_id: str
     actions_applied: list[AblationAction]
     before_after: list[tuple[str, str]]    # (original, mutated) per action — audit trail
+
+class AblationSplit(BaseModel):
+    """Input-level control/ablate assignment, made once before any ablation.
+    Ground-truth side only — stripped from everything Engine sees."""
+    seed: int
+    control_fraction: float
+    strata: list[str]                      # stratification keys (mode, safe/adv, dim)
+    control_input_ids: list[str]           # never ablated, never re-run with shims
+    ablate_input_ids: list[str]            # sole population filters run against
 ```
 
 ## 5. Benchmark report (Stage V output)
 
 ```python
-class ErrorMatch(BaseModel):
+class OccurrenceMatch(BaseModel):
+    """Layer 1: one predicted occurrence resolved via the exact (trace, category) key."""
+    trace_id: str
     predicted_error_id: str
-    matched_error_id: str | None       # None → unmatched prediction (candidate FP / E_h hit)
-    similarity: float
-    method: Literal["tfidf", "embedding", "llm_judge"]
+    resolved_error_id: str | None      # None → FP / E_h candidate pool
+    method: Literal["exact_key", "text_fallback"]   # fallback = wrong-category case
+
+class ErrorMatch(BaseModel):
+    """Layer 2: predicted issue → known error, by argmax occurrence-set overlap."""
+    predicted_error_id: str
+    matched_error_id: str | None       # None → no resolved occurrences (candidate FP / E_h)
+    overlap: int                       # winning |occurrences ∩ traces(K_i)| vote count
+    tie_broken_by_text: bool = False
 
 class CategoryScore(BaseModel):
     category_id: str
@@ -224,6 +255,9 @@ class CategoryScore(BaseModel):
 class BenchmarkReport(BaseModel):
     report_id: str
     engine_config: EngineConfig            # which model/agent produced E_P
+    base_rates: dict                       # control fraction, per-error injection counts
+    matcher_fallback_rate: float           # how often text fallback fired (reliability)
+    occurrence_matches: list[OccurrenceMatch]
     matches: list[ErrorMatch]
     category_scores: list[CategoryScore]   # scorer 1
     per_error_scores: list[CategoryScore]  # scorer 2 (after E_P→E_K mapping)
