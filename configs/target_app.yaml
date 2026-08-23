@@ -1,0 +1,10 @@
+# The ONLY thing the benchmark knows about the target app.
+# Matches benchmark.schemas.configs.TargetAppConfig.
+base_url: "http://127.0.0.1:2024"
+assistant_id: "target_app"
+langsmith_project: "engine-bench-target"
+fault_configurable_keys:            # declared Mode C shim surface
+  retriever: "fault_retriever"      #   irrelevant_docs | empty | stale
+  tool: "fault_tool"                #   error | timeout | corrupted_result
+  llm: "fault_llm"                  #   truncate_output
+max_turns_supported: 8
