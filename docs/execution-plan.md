@@ -89,6 +89,23 @@ Notes:
 - Engine sees only: the leak-stripped trace file, the seed issueboard, and the category
   vocabulary (names + descriptions, incl. `other`). Nothing else crosses the boundary.
 
+## Tracing backend: LangSmith in v0, our schema as the contract (future work)
+
+The assignment explicitly asks for the right **trace data structure**, and the architecture
+docs define one (`Trace/Turn/Span`). That schema — not LangSmith's — is the system's
+contract:
+
+- **v0**: LangSmith is the *collection* backend (fastest path off the ground). The Phase 4
+  collector normalizes LangSmith run trees into our `Trace` schema and writes them to a
+  local filesystem **`TraceStore`**.
+- **Boundary rule**: everything downstream of collection — ablation engine, dummy Engine
+  inputs, scoring, pipeline — reads and writes traces **only through the `TraceStore`
+  interface** (our schema, local JSON). No LangSmith types or SDK calls south of the
+  collector.
+- **Future work**: swap the collection side to write our schema directly (e.g. an OTel/
+  callback exporter in the target app config) and drop LangSmith entirely. Because the
+  boundary already exists, this replaces one collector implementation and nothing else.
+
 ## Model pinning (`benchmark/models.py` + app configs)
 
 | Role | Tier | Where configured |
@@ -122,6 +139,9 @@ Deliverables:
   `OccurrenceMatch/ErrorMatch/CategoryScore/BenchmarkReport`, config models
   (`GenerationConfig`, `TargetAppConfig`, `EngineAppConfig`, `ScoringConfig`).
 - Dataset I/O: JSON read/write, content-hash `dataset_id`, `parent_dataset_id` lineage.
+- **`TraceStore` boundary**: protocol + `LocalTraceStore` (filesystem, our `Trace` schema)
+  — the replaceable seam that keeps LangSmith on the collection side only (see
+  "Tracing backend" above).
 - Import-boundary test: `benchmark/` must not import `apps/*` (fails CI if violated).
 
 **Gate:**
@@ -204,9 +224,11 @@ Drives the target app exclusively through `langgraph_sdk` + `configs/target_app.
 Deliverables ([03-trace-harness.md](architecture/03-trace-harness.md)):
 - Batch single-turn runner; multi-turn persona-simulator loop (user-simulator LLM,
   `[DONE]` termination, max_turns); concurrency semaphore.
-- **Trace collector**: LangSmith run trees → our `Trace` schema; `status="app_error"`
-  traces kept (organic `E_h` signal); malformed traces quarantined; idempotent
-  `session_id = hash(dataset_id, input_id)` in run metadata for resumability.
+- **Trace collector**: LangSmith run trees → our `Trace` schema, written into the Phase 0
+  `TraceStore` (the *only* LangSmith-aware component; everything downstream reads the
+  store); `status="app_error"` traces kept (organic `E_h` signal); malformed traces
+  quarantined; idempotent `session_id = hash(dataset_id, input_id)` in run metadata for
+  resumability.
 - **Public API consumed by Phase 5** (defined + tested here):
   - `replay(thread_ref, checkpoint_ref, corrupted_state, remaining_plan) -> Trace`
     — Mode A, via LangGraph time-travel fork.
