@@ -3,6 +3,8 @@
 N = (D×V_D)+(A_c×V_AC)+A_F for single-turn; N = (P×D1)+(P_A×D2) for multi-turn.
 """
 
+import pytest
+
 from benchmark.generation.expander import MockPromptExpander
 from benchmark.generation.generators import (
     assemble_multi_turn,
@@ -177,3 +179,19 @@ def test_assemble_multi_turn_ids_unique():
     personas = [make_persona("p1"), make_persona("p2")]
     out = assemble_multi_turn(personas, [], safe_pool, [], MockPromptExpander(), seed=1)
     assert len({s.input_id for s in out}) == len(out)
+
+
+def test_assemble_multi_turn_rejects_adversarial_persona_in_personas():
+    """A misconfigured YAML putting an adversarial persona under `personas:`
+    must not be silently crossed with the safe pool."""
+    safe_pool = generate_safe_inputs(make_safe_dims(1, 1), MockPromptExpander(), seed=1)
+    bad_persona = make_persona("p1", kind="adversarial")
+    with pytest.raises(ValueError, match="target"):
+        assemble_multi_turn([bad_persona], [], safe_pool, [], MockPromptExpander(), seed=1)
+
+
+def test_assemble_multi_turn_rejects_target_persona_in_adversarial_personas():
+    adv_pool = generate_adversarial_inputs(make_adv_dims(1, 1), [], MockPromptExpander(), seed=1)
+    bad_persona = make_persona("pa1", kind="target")
+    with pytest.raises(ValueError, match="adversarial"):
+        assemble_multi_turn([], [bad_persona], [], adv_pool, MockPromptExpander(), seed=1)

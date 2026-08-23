@@ -6,6 +6,7 @@
 - Injectable clock keeps created_at deterministic.
 """
 
+import time
 from datetime import UTC, datetime
 
 from benchmark.generation.expander import MockPromptExpander
@@ -95,6 +96,18 @@ def test_multi_turn_count_matches_formula(tmp_path):
     assert all(i.mode == "multi_turn" for i in ds.inputs)
 
 
+def test_multi_turn_mode_performs_no_single_turn_expansion(tmp_path):
+    """multi_turn-only configs need only pool-item (dim_id, variation) identity
+    for expand_scenario — expanding the full single-turn prompt text (a
+    throwaway) wastes an LLM call per grid cell."""
+    cfg = make_cfg(mode="multi_turn")
+    expander = MockPromptExpander()
+    gen(cfg, tmp_path, expander=expander)
+    call_kinds = {call[0] for call in expander.calls}
+    assert call_kinds == {"expand_scenario"}
+    assert len(expander.calls) > 0
+
+
 def test_mixed_count_is_sum_of_both(tmp_path):
     cfg = make_cfg(mode="mixed")
     ds = gen(cfg, tmp_path)
@@ -126,6 +139,20 @@ def test_same_config_and_seed_same_dataset_id_via_cache(tmp_path):
     assert ds1.inputs == ds2.inputs
     # second run served entirely from the on-disk cache
     assert len(expander_second.calls) == 0
+
+
+def test_same_config_and_seed_same_dataset_id_with_real_clock(tmp_path):
+    """No injected clock: two real generate_inputs runs, seconds apart, must
+    still stamp the same dataset_id — created_at is volatile provenance, not
+    content (see benchmark/schemas/io.py _VOLATILE_FIELDS)."""
+    cfg = make_cfg(mode="mixed")
+
+    ds1 = generate_inputs(cfg, expander=MockPromptExpander(), cache_dir=tmp_path)
+    time.sleep(0.01)
+    ds2 = generate_inputs(cfg, expander=MockPromptExpander(), cache_dir=tmp_path)
+
+    assert ds1.created_at != ds2.created_at
+    assert ds1.dataset_id == ds2.dataset_id != ""
 
 
 def test_different_seed_different_dataset_id(tmp_path):
