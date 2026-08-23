@@ -229,6 +229,13 @@ Deliverables ([03-trace-harness.md](architecture/03-trace-harness.md)):
   store); `status="app_error"` traces kept (organic `E_h` signal); malformed traces
   quarantined; idempotent `session_id = hash(dataset_id, input_id)` in run metadata for
   resumability.
+- **BLOCKING (from Phase 2 review)** — leak scrubbing at collection: LangChain promotes
+  string-valued `config.configurable` entries into LangSmith run metadata inherited by
+  every span, so armed fault keys can appear on all spans of a Mode-C trace. The collector
+  MUST drop run metadata / configurable echoes (allowlist the attributes it copies, never
+  pass-through) and a no-leak test must assert no fault/shim token survives into `Trace`.
+  Also: filter deepagents middleware noise spans (`*.wrap_model_call` etc.) and poll for
+  LangSmith child-span ingestion (lags the root by up to ~30s).
 - **Public API consumed by Phase 5** (defined + tested here):
   - `replay(thread_ref, checkpoint_ref, corrupted_state, remaining_plan) -> Trace`
     — Mode A, via LangGraph time-travel fork.
