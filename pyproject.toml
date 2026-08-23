@@ -5,6 +5,7 @@ description = "Benchmark for Engine: trace generation, error ablation, and issue
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.7",
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
