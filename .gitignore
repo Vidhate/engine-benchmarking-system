@@ -7,3 +7,9 @@ __pycache__/
 dist/
 .env
 data/
+
+# target_app smoke-script scratch
+apps/target_app/scripts/.server.pid
+apps/target_app/scripts/.server.log
+apps/target_app/scripts/.last_sessions.json
+apps/target_app/.langgraph_api/
