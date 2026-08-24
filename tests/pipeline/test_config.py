@@ -84,6 +84,54 @@ def test_the_full_config_is_scoped_to_the_documented_run_size():
     assert len(sliced.inputs) >= cfg.deliverables.min_traces
 
 
+def test_the_checked_in_submission_config_parses_and_is_full_scale():
+    cfg = load_pipeline_config(REPO_ROOT / "configs" / "pipeline" / "submission.yaml")
+    assert cfg.engine.analysis_concurrency == 16
+    assert cfg.engine.recursion_limit >= 10_000
+    assert cfg.deliverables.min_traces >= 300
+    assert cfg.resolve(cfg.generation_config).name == "v0.yaml"
+    assert cfg.input_modes == ["single_turn"]
+    assert cfg.max_inputs_per_mode == {"single_turn": 300, "multi_turn": 0}
+
+
+def test_the_submission_config_slices_to_exactly_300_single_turn_inputs():
+    """The assignment's own deliverable number, single-turn only — no sampled
+    multi-turn tail the way full.yaml has one (mirrors
+    test_the_full_config_is_scoped_to_the_documented_run_size)."""
+    from benchmark.generation.config_loader import load_generation_config
+    from benchmark.pipeline.runner import slice_inputs
+    from benchmark.schemas import InputDataset, InputSpec
+
+    cfg = load_pipeline_config(REPO_ROOT / "configs" / "pipeline" / "submission.yaml")
+    generation = load_generation_config(cfg.resolve(cfg.generation_config))
+
+    single = sum(len(d.variations) for d in generation.safe_dims)
+    single += sum(len(d.variations) for d in generation.adversarial_dims)
+    single += len(generation.fixed_adversarial)
+    multi = len(generation.personas) * sum(
+        len(d.variations) for d in generation.safe_dims
+    ) + len(generation.adversarial_personas) * (
+        sum(len(d.variations) for d in generation.adversarial_dims)
+        + len(generation.fixed_adversarial)
+    )
+    assert (single, multi) == (310, 920), "v0.yaml changed shape; re-check the slice"
+
+    grid = InputDataset(
+        inputs=[
+            InputSpec(input_id=f"st-{i}", mode="single_turn", dim_id="d", variation="v")
+            for i in range(single)
+        ]
+        + [
+            InputSpec(input_id=f"mt-{i}", mode="multi_turn", dim_id="d", variation="v")
+            for i in range(multi)
+        ]
+    )
+    sliced = slice_inputs(grid, cfg)
+    modes = {m: sum(1 for s in sliced.inputs if s.mode == m) for m in ("single_turn", "multi_turn")}
+    assert modes == {"single_turn": 300, "multi_turn": 0}
+    assert len(sliced.inputs) == 300 == cfg.deliverables.min_traces
+
+
 def test_run_dir_is_run_id_under_artifacts_root(tmp_path):
     cfg = PipelineConfig(run_id="r1", generation_config="g.yaml", artifacts_root="data/p")
     cfg = cfg.with_root(tmp_path)
