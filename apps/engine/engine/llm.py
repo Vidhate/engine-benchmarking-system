@@ -9,6 +9,7 @@ same consolidation code, different model id.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -22,8 +23,15 @@ MODEL_ENV_VAR = "ENGINE_MODEL"
 DEFAULT_MODEL = "gpt-5-mini"
 
 
-def resolve_model_name(config: dict[str, Any] | None) -> str:
-    """Run config wins, then ENGINE_MODEL, then the pinned default."""
+def resolve_model_name(config: Mapping[str, Any] | None) -> str:
+    """Run config wins, then ENGINE_MODEL, then the pinned default.
+
+    NOTE for callers: LangGraph only injects the run config into a node whose
+    `config` parameter is annotated `RunnableConfig`. A `dict[str, Any]`
+    annotation is silently ignored and the node sees no config at all — which
+    looks exactly like "the caller did not pass a model", i.e. both arms of the
+    comparison quietly run the default. See `graph.analyze_node`.
+    """
     configurable = (config or {}).get("configurable") or {}
     requested = configurable.get(MODEL_CONFIGURABLE_KEY)
     if isinstance(requested, str) and requested.strip():

@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 from typing import Annotated, Any, NotRequired, TypedDict
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from engine.analysis import DEFAULT_MAX_TOOL_CALLS, analyze_trace, consolidate
@@ -27,6 +28,17 @@ from engine.models import Category, RawFinding, SeedIssueboard
 from engine.traces import TraceIndex, load_categories
 
 MAX_TOOL_CALLS_ENV_VAR = "ENGINE_MAX_TOOL_CALLS_PER_TRACE"
+
+# The node `config` parameter MUST be annotated exactly `RunnableConfig`.
+# `_runnable.KWARGS_CONFIG_KEYS` matches the annotation against a fixed list,
+# and because `from __future__ import annotations` turns annotations into
+# strings, only the literal strings "RunnableConfig" and
+# "Optional[RunnableConfig]" are accepted — the PEP-604 form
+# `RunnableConfig | None` is not, and a node annotated that way is silently
+# never given the run config. That failure is invisible: the node just sees no
+# model override and falls back to the default, so BOTH arms of the
+# Sol-vs-mini comparison would quietly run the same model.
+# Guarded by tests/test_graph.py::test_the_model_comes_from_the_run_configurable.
 
 # Supersteps per run are 2 + one per trace, so the LangGraph default recursion
 # limit of 25 caps a run at ~23 traces. Raised on the compiled graph; callers
@@ -110,7 +122,7 @@ def load_node(state: EngineState) -> dict[str, Any]:
     return {"trace_ids": index.trace_ids, "cursor": 0}
 
 
-def analyze_node(state: EngineState, config: dict[str, Any] | None = None) -> dict[str, Any]:
+def analyze_node(state: EngineState, config: RunnableConfig) -> dict[str, Any]:
     """One superstep = one trace, so a long run checkpoints as it goes."""
     index = trace_index(state["trace_file"])
     cursor = state.get("cursor", 0)
@@ -148,10 +160,11 @@ def analyze_node(state: EngineState, config: dict[str, Any] | None = None) -> di
 
 
 def more_traces(state: EngineState) -> str:
-    return "analyze" if state.get("cursor", 0) < len(state.get("trace_ids") or []) else "consolidate"
+    done = state.get("cursor", 0) >= len(state.get("trace_ids") or [])
+    return "consolidate" if done else "analyze"
 
 
-def consolidate_node(state: EngineState, config: dict[str, Any] | None = None) -> dict[str, Any]:
+def consolidate_node(state: EngineState, config: RunnableConfig) -> dict[str, Any]:
     trace_ids = state.get("trace_ids") or []
     errors = state.get("errors") or []
     if trace_ids and len(errors) == len(trace_ids):

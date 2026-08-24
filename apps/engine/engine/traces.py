@@ -183,7 +183,9 @@ class TraceIndex:
             if trace_id not in self._by_id:
                 return self._unknown_trace(trace_id)
             known = [span.span_id for _, span in self.spans(trace_id)]
-            return _dumps({"error": f"no span {span_id!r} in {trace_id!r}", "known_span_ids": known})
+            return _dumps(
+                {"error": f"no span {span_id!r} in {trace_id!r}", "known_span_ids": known}
+            )
         turn_index, span = found
         view = span.model_dump(mode="json")
         view["turn_index"] = turn_index
@@ -245,4 +247,6 @@ class TraceIndex:
         return [{**where, "snippet": haystack[start : start + SNIPPET_CHARS]}]
 
     def _unknown_trace(self, trace_id: str) -> str:
-        return _dumps({"error": f"unknown trace_id {trace_id!r}", "known_trace_ids": self.trace_ids})
+        return _dumps(
+            {"error": f"unknown trace_id {trace_id!r}", "known_trace_ids": self.trace_ids}
+        )

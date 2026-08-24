@@ -66,8 +66,9 @@ def analyze_trace(
         messages.append(response)
         calls = list(getattr(response, "tool_calls", None) or [])
         if not calls:
-            if isinstance(response, AIMessage) and response.text():
-                log.append(f"ANALYST NOTES:\n{response.text()}")
+            notes = response.text if isinstance(response, AIMessage) else ""
+            if isinstance(notes, str) and notes.strip():
+                log.append(f"ANALYST NOTES:\n{notes}")
             break
         for call in calls:
             budget -= 1

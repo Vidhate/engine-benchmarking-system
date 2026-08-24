@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+
 from engine.traces import MAX_RESULT_CHARS, SNIPPET_CHARS, TraceIndex, load_traces, truncate
 
 ALL_TRACE_IDS = [

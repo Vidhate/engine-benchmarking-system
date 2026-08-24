@@ -101,7 +101,9 @@ def complete_plan(plan: ConsolidationPlan, findings: list[RawFinding]) -> Consol
         return plan
     extra = fallback_plan([findings[i] for i in leftover])
     remapped = [
-        cluster.model_copy(update={"finding_indices": [leftover[i] for i in cluster.finding_indices]})
+        cluster.model_copy(
+            update={"finding_indices": [leftover[i] for i in cluster.finding_indices]}
+        )
         for cluster in extra.clusters
     ]
     return ConsolidationPlan(clusters=[*plan.clusters, *remapped])
