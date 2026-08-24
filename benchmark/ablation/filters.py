@@ -112,6 +112,21 @@ def _descend(nodes: list[Any], name: str, indexes: list[str]) -> list[Any]:
     return out
 
 
+def known_field(path: str) -> bool:
+    """Whether `path`'s root segment names something a Trace actually has.
+
+    The proposing agent authors filter fields as free text, so a hallucinated
+    root (`turns[*].tool_calls`) has to be caught where it is cheap — at
+    proposal time, by dropping that one step — rather than as an exception out
+    of the middle of validation, which would abort the whole run.
+    """
+    head = _SEGMENT.match(path.split(".")[0])
+    if head is None:
+        return False
+    root = head.group(1)
+    return root in DERIVED_FIELDS or root in Trace.model_fields
+
+
 def resolve(trace: Trace, path: str) -> list[Any]:
     """Every value `path` reaches in `trace`, flattened. See the module docstring."""
     segments = path.split(".")

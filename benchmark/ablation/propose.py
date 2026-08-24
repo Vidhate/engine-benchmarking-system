@@ -28,6 +28,7 @@ from benchmark.ablation.agent import (
     CorpusDigest,
     ProposedError,
 )
+from benchmark.ablation.filters import known_field
 from benchmark.harness.faults import SHIM_TO_CONFIG_KIND
 from benchmark.schemas.configs import TargetAppConfig
 from benchmark.schemas.issues import ErrorCategory, InjectionMode, Issue
@@ -189,7 +190,20 @@ def propose_errors(
                     "category_id": category.category_id,
                 }
             )
-            out.append(draft.model_copy(update={"issue": issue}))
+            steps = []
+            for step in draft.filter_steps:
+                if known_field(step.field):
+                    steps.append(step)
+                else:
+                    # One hallucinated field costs that step, not the error:
+                    # letting it through would raise out of the middle of
+                    # validation and take the whole run with it.
+                    log.warning(
+                        "%s: dropping filter step on unknown field %r",
+                        issue.error_id,
+                        step.field,
+                    )
+            out.append(draft.model_copy(update={"issue": issue, "filter_steps": steps}))
     return out, digest
 
 

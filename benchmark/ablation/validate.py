@@ -210,15 +210,23 @@ def validate_specs(
 
         for attempt in range(max_replans + 1):
             spec = plan_ablation(current, attempt=attempt)
-            candidates = filters.eligible(traces, spec.filter, ablate_input_ids)
-            if spec.mode == "replay_edit" and replayable_trace_ids is not None:
-                candidates = [t for t in candidates if t.trace_id in replayable_trace_ids]
-
-            if len(candidates) < min_eligible:
+            try:
+                candidates = filters.eligible(traces, spec.filter, ablate_input_ids)
+            except filters.UnknownFilterField as exc:
+                # `propose_errors` already drops hallucinated fields; this is
+                # the second layer, so a filter authored anywhere else cannot
+                # abort the run either.
+                candidates = []
+                reason = f"the filter names a field no trace has: {exc}"
+            else:
+                if spec.mode == "replay_edit" and replayable_trace_ids is not None:
+                    candidates = [t for t in candidates if t.trace_id in replayable_trace_ids]
                 reason = (
                     f"filter matched {len(candidates)} trace(s) in the ablate set, "
                     f"below min_eligible={min_eligible}"
                 )
+
+            if len(candidates) < min_eligible:
                 outcome.failures.append(
                     ValidationFailure(
                         error_id=error_id, attempt=attempt, stage="filter", reason=reason

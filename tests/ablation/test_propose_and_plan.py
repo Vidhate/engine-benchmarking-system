@@ -163,6 +163,29 @@ def test_behaviour_rotation_walks_the_vocabulary_and_then_gives_up():
     assert rotate_behavior("llm_proxy", "truncate_output") is None
 
 
+def test_a_hallucinated_filter_field_costs_the_step_not_the_error(
+    store, traces, categories, target_cfg
+):
+    """The agent authors filter fields as free text; one bad root must not
+    raise out of the middle of validation and take the whole run with it.
+
+    Only the ROOT is checked: a path that merely reaches nothing
+    (`turns[*].nope`) is an ordinary "this trace does not have one" and
+    resolves to `[]`, which is exactly what a filter step is for.
+    """
+    proposal = make_proposal(
+        filter_steps=[
+            FilterStep(field="tool_calls[*].name", op="exists"),
+            FilterStep(field="span_types", op="eq", value="tool"),
+        ]
+    )
+    agent = ScriptedAblationAgent({"hallucination": [proposal]})
+    proposals, _ = propose_errors(
+        store, [t.trace_id for t in traces.traces], categories, 1, target_cfg, agent
+    )
+    assert [s.field for s in proposals[0].filter_steps] == ["span_types"]
+
+
 def test_a_proposal_with_no_injection_mode_cannot_be_planned():
     proposal = make_proposal()
     proposal.issue.injection_mode = None
