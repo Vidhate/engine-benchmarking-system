@@ -60,20 +60,28 @@ def _require_persona_kind(personas: list[Persona], expected_kind: str, field_nam
 
 
 def generate_safe_inputs(
-    dims: list[Dimension], expander: PromptExpander, seed: int, *, expand: bool = True
+    dims: list[Dimension],
+    expander: PromptExpander,
+    seed: int,
+    *,
+    expand: bool = True,
+    app_context: str = "",
 ) -> list[InputSpec]:
     """[D, V_D] -> D x V_D single-turn prompts.
 
     The expander turns each (dim, variation) grid cell into a concrete,
-    natural user message. Pass expand=False to build the grid-cell identity
-    (dim_id/variation/input_id) only, without spending an expander call per
-    cell — used when only the pool's identity is needed (e.g. multi_turn-only
-    generation, where the single-turn prompt text itself is never emitted).
+    natural user message, guided by `app_context` (sourced from
+    GenerationConfig.app_context — the sole description of the target app;
+    this function itself stays app-agnostic). Pass expand=False to build the
+    grid-cell identity (dim_id/variation/input_id) only, without spending an
+    expander call per cell — used when only the pool's identity is needed
+    (e.g. multi_turn-only generation, where the single-turn prompt text
+    itself is never emitted).
     """
     out: list[InputSpec] = []
     for dim in dims:
         for variation in dim.variations:
-            prompt = expander.expand(dim, variation, seed) if expand else None
+            prompt = expander.expand(dim, variation, seed, app_context) if expand else None
             out.append(
                 InputSpec(
                     input_id=_input_id("safe", dim.dim_id, variation),
@@ -93,19 +101,20 @@ def generate_adversarial_inputs(
     seed: int,
     *,
     expand: bool = True,
+    app_context: str = "",
 ) -> list[InputSpec]:
     """[A_c, V_AC], [A_F] -> (A_c x V_AC) + A_F adversarial inputs.
 
     Custom adversarial dims are LLM-expanded like safe dims (expand=False
-    skips that call, same as generate_safe_inputs); the fixed library is
-    always a passthrough (its `prompt` text is reused as-is, no expander
-    call either way), re-stamped with a deterministic input_id and its
-    fixed_adversarial_id provenance.
+    skips that call, same as generate_safe_inputs; app_context is forwarded
+    the same way); the fixed library is always a passthrough (its `prompt`
+    text is reused as-is, no expander call either way), re-stamped with a
+    deterministic input_id and its fixed_adversarial_id provenance.
     """
     out: list[InputSpec] = []
     for dim in custom_dims:
         for variation in dim.variations:
-            prompt = expander.expand(dim, variation, seed) if expand else None
+            prompt = expander.expand(dim, variation, seed, app_context) if expand else None
             out.append(
                 InputSpec(
                     input_id=_input_id("adv", dim.dim_id, variation),
@@ -137,6 +146,7 @@ def assemble_multi_turn(
     adversarial_pool: list[InputSpec],
     expander: PromptExpander,
     seed: int,
+    app_context: str = "",
 ) -> list[InputSpec]:
     """[P],[P_A],D1,D2 -> (P x D1)+(P_A x D2) persona-crossed scenarios.
 
@@ -144,6 +154,8 @@ def assemble_multi_turn(
     personas P_A are crossed with the adversarial scenario pool D2. Each
     resulting InputSpec carries a persona_id + scenario brief — no literal
     prompt (that's produced downstream by the Stage II user-simulator).
+    `app_context` is forwarded to the expander unchanged (see
+    generate_safe_inputs).
 
     Raises ValueError if `personas` contains a non-target persona or
     `adversarial_personas` contains a non-adversarial one — a misconfigured
@@ -156,7 +168,9 @@ def assemble_multi_turn(
     out: list[InputSpec] = []
     for persona, pool in ((p, safe_pool) for p in personas):
         for item in pool:
-            scenario = expander.expand_scenario(persona, item.dim_id, item.variation, seed)
+            scenario = expander.expand_scenario(
+                persona, item.dim_id, item.variation, seed, app_context
+            )
             out.append(
                 InputSpec(
                     input_id=_input_id(
@@ -173,7 +187,9 @@ def assemble_multi_turn(
             )
     for persona, pool in ((p, adversarial_pool) for p in adversarial_personas):
         for item in pool:
-            scenario = expander.expand_scenario(persona, item.dim_id, item.variation, seed)
+            scenario = expander.expand_scenario(
+                persona, item.dim_id, item.variation, seed, app_context
+            )
             out.append(
                 InputSpec(
                     input_id=_input_id(
@@ -217,11 +233,12 @@ def generate_inputs(
     needs_single_turn_text = cfg.mode in ("single_turn", "mixed")
 
     safe_pool = generate_safe_inputs(
-        cfg.safe_dims, cached, cfg.seed, expand=needs_single_turn_text
+        cfg.safe_dims, cached, cfg.seed,
+        expand=needs_single_turn_text, app_context=cfg.app_context,
     )
     adversarial_pool = generate_adversarial_inputs(
         cfg.adversarial_dims, cfg.fixed_adversarial, cached, cfg.seed,
-        expand=needs_single_turn_text,
+        expand=needs_single_turn_text, app_context=cfg.app_context,
     )
 
     inputs: list[InputSpec] = []
@@ -237,6 +254,7 @@ def generate_inputs(
                 adversarial_pool,
                 cached,
                 cfg.seed,
+                app_context=cfg.app_context,
             )
         )
 

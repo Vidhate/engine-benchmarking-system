@@ -58,6 +58,12 @@ class GenerationConfig(BaseModel):
     mode: GenerationMode = "single_turn"
     max_turns: int = 1
     seed: int = 0  # reproducibility of LLM expansion
+    # Free-text description of the target app these inputs are generated for
+    # (what it does, its domain, its capabilities) — the ONLY place app
+    # identity may live. The generic generators/expanders must stay
+    # app-agnostic and consume this field rather than hardcoding any app's
+    # vocabulary in code.
+    app_context: str = ""
 
 
 class InputDataset(BaseModel):

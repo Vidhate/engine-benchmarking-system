@@ -22,7 +22,7 @@ def gen(cfg: GenerationConfig, tmp_path, expander=None) -> InputDataset:
     )
 
 
-def make_cfg(mode="single_turn", seed=7) -> GenerationConfig:
+def make_cfg(mode="single_turn", seed=7, app_context="") -> GenerationConfig:
     safe_dims = [
         Dimension(
             dim_id="topic", name="query_topic", kind="safe",
@@ -62,6 +62,7 @@ def make_cfg(mode="single_turn", seed=7) -> GenerationConfig:
         mode=mode,
         max_turns=4,
         seed=seed,
+        app_context=app_context,
     )
 
 
@@ -196,3 +197,41 @@ def test_dataset_carries_generation_config(tmp_path):
     cfg = make_cfg()
     ds = gen(cfg, tmp_path)
     assert ds.generation_config == cfg
+
+
+# ---------------------------------------------------------------------------
+# app_context — the only control surface for target-app description; the
+# generic generators stay app-agnostic (docs: PR #2 review finding).
+# ---------------------------------------------------------------------------
+
+
+def test_app_context_flows_from_config_into_expander_calls(tmp_path):
+    cfg = make_cfg(mode="mixed", app_context="A fictional payroll app.")
+    expander = MockPromptExpander()
+    gen(cfg, tmp_path, expander=expander)
+    assert expander.calls  # sanity: expansions actually happened
+    assert all(call[-1] == "A fictional payroll app." for call in expander.calls)
+
+
+def test_different_app_context_different_dataset_id(tmp_path):
+    """app_context participates in the GenerationConfig content hash, so it
+    must produce a distinct dataset_id (and thus distinct cache entries)."""
+    cfg_a = make_cfg(mode="mixed", app_context="A fictional payroll app.")
+    cfg_b = make_cfg(mode="mixed", app_context="A fictional travel booking app.")
+
+    ds_a = gen(cfg_a, tmp_path, expander=MockPromptExpander())
+    ds_b = gen(cfg_b, tmp_path, expander=MockPromptExpander())
+
+    assert ds_a.dataset_id != ds_b.dataset_id
+    # each config's expander was actually invoked (no accidental cache hit
+    # across the two distinct app_context configs)
+    ds_a_prompts = {i.input_id: i.prompt for i in ds_a.inputs if i.mode == "single_turn"}
+    ds_b_prompts = {i.input_id: i.prompt for i in ds_b.inputs if i.mode == "single_turn"}
+    assert ds_a_prompts != ds_b_prompts
+
+
+def test_empty_app_context_still_generates_without_crashing(tmp_path):
+    cfg = make_cfg(mode="mixed", app_context="")
+    ds = gen(cfg, tmp_path)
+    assert ds.inputs
+    assert ds.generation_config.app_context == ""

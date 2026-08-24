@@ -195,3 +195,33 @@ def test_assemble_multi_turn_rejects_target_persona_in_adversarial_personas():
     bad_persona = make_persona("pa1", kind="target")
     with pytest.raises(ValueError, match="adversarial"):
         assemble_multi_turn([], [bad_persona], [], adv_pool, MockPromptExpander(), seed=1)
+
+
+# ---------------------------------------------------------------------------
+# app_context threading — generators stay app-agnostic; only the yaml-supplied
+# app_context describes the target app to the expander.
+# ---------------------------------------------------------------------------
+
+
+def test_generate_safe_inputs_threads_app_context_to_expander():
+    dims = make_safe_dims(n_dims=1, n_var=1)
+    expander = MockPromptExpander()
+    generate_safe_inputs(dims, expander, seed=1, app_context="A fictional payroll app.")
+    assert expander.calls[0][-1] == "A fictional payroll app."
+
+
+def test_generate_adversarial_inputs_threads_app_context_to_expander():
+    dims = make_adv_dims(n_dims=1, n_var=1)
+    expander = MockPromptExpander()
+    generate_adversarial_inputs(dims, [], expander, seed=1, app_context="A fictional travel app.")
+    assert expander.calls[0][-1] == "A fictional travel app."
+
+
+def test_assemble_multi_turn_threads_app_context_to_expander():
+    safe_pool = generate_safe_inputs(make_safe_dims(1, 1), MockPromptExpander(), seed=1)
+    persona = make_persona("p1")
+    expander = MockPromptExpander()
+    assemble_multi_turn(
+        [persona], [], safe_pool, [], expander, seed=1, app_context="A fictional CRM app."
+    )
+    assert expander.calls[0][-1] == "A fictional CRM app."

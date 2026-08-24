@@ -94,3 +94,24 @@ def test_cache_writes_files_under_cache_dir(tmp_path):
     cache = DiskExpansionCache(expander=inner, cache_dir=tmp_path, config_hash="cfg1")
     cache.expand(make_dim(), "refunds", seed=7)
     assert any(tmp_path.iterdir())
+
+
+def test_cache_forwards_app_context_to_inner_expander(tmp_path):
+    """app_context isn't itself part of the cache key (it's already folded
+    into config_hash upstream) but must still reach the expander on a miss."""
+    inner = MockPromptExpander()
+    cache = DiskExpansionCache(expander=inner, cache_dir=tmp_path, config_hash="cfg1")
+    text = cache.expand(make_dim(), "refunds", seed=7, app_context="A fictional payroll app.")
+    assert "A fictional payroll app." in text
+    assert inner.calls[0][-1] == "A fictional payroll app."
+
+
+def test_cache_forwards_app_context_for_expand_scenario(tmp_path):
+    inner = MockPromptExpander()
+    cache = DiskExpansionCache(expander=inner, cache_dir=tmp_path, config_hash="cfg1")
+    persona = make_persona()
+    text = cache.expand_scenario(
+        persona, "d1", "refunds", seed=7, app_context="A fictional travel app."
+    )
+    assert "A fictional travel app." in text
+    assert inner.calls[0][-1] == "A fictional travel app."

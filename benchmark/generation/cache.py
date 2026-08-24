@@ -5,6 +5,11 @@ Keyed by (config content hash, dim_id, variation, persona_id, seed) — plus a
 call shapes never collide on the same cache slot. Identical config + seed
 reruns hit the cache and reproduce byte-identical output without
 re-invoking the underlying (possibly network-backed) expander.
+
+`app_context` (GenerationConfig.app_context) is forwarded to the wrapped
+expander on a cache miss but is not folded into the key by itself: it's
+already part of the GenerationConfig content that produced `config_hash`, so
+a changed app_context lands on a different key automatically.
 """
 
 from __future__ import annotations
@@ -64,14 +69,22 @@ class DiskExpansionCache:
         tmp_path.replace(path)
         return text
 
-    def expand(self, dim: Dimension, variation: str, seed: int) -> str:
+    def expand(self, dim: Dimension, variation: str, seed: int, app_context: str = "") -> str:
+        # app_context is not folded into the key separately — it's already
+        # part of the config content hash that produced self._config_hash,
+        # so a changed app_context naturally lands on a different key.
         key = ExpansionCacheKey(self._config_hash, "expand", dim.dim_id, variation, None, seed)
-        return self._load_or_compute(key, lambda: self._expander.expand(dim, variation, seed))
+        return self._load_or_compute(
+            key, lambda: self._expander.expand(dim, variation, seed, app_context)
+        )
 
-    def expand_scenario(self, persona: Persona, dim_id: str, variation: str, seed: int) -> str:
+    def expand_scenario(
+        self, persona: Persona, dim_id: str, variation: str, seed: int, app_context: str = ""
+    ) -> str:
         key = ExpansionCacheKey(
             self._config_hash, "expand_scenario", dim_id, variation, persona.persona_id, seed
         )
         return self._load_or_compute(
-            key, lambda: self._expander.expand_scenario(persona, dim_id, variation, seed)
+            key,
+            lambda: self._expander.expand_scenario(persona, dim_id, variation, seed, app_context),
         )

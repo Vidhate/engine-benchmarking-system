@@ -8,6 +8,11 @@
 mode: mixed
 max_turns: 6
 seed: 20260823
+app_context: 'A small product-support assistant for a fictional SaaS product. It answers user questions
+  by retrieving from a RAG help-center document store covering billing, account, subscription, and integration
+  topics, and it can take one action: create_ticket, which files a support ticket for a human agent when
+  the assistant can''t resolve something itself. Users are the SaaS product''s own customers — end users,
+  workspace admins, and billing contacts — reaching the assistant through an in-app chat widget.'
 safe_dims:
 - dim_id: topic
   name: query_topic

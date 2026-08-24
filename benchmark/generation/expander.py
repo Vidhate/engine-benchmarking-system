@@ -26,13 +26,22 @@ from benchmark.schemas.inputs import Dimension, Persona
 
 @runtime_checkable
 class PromptExpander(Protocol):
-    """Boundary Protocol implemented by both the mock and the OpenAI expander."""
+    """Boundary Protocol implemented by both the mock and the OpenAI expander.
 
-    def expand(self, dim: Dimension, variation: str, seed: int) -> str:
+    `app_context` is the ONLY channel through which a target app's identity
+    (domain, capabilities, vocabulary) reaches the expander — it is sourced
+    from GenerationConfig.app_context (i.e. the yaml config), never
+    hardcoded in the expander implementation. Empty app_context must still
+    produce a sane, generic expansion.
+    """
+
+    def expand(self, dim: Dimension, variation: str, seed: int, app_context: str = "") -> str:
         """Turn one (dim, variation) grid cell into a concrete single-turn prompt."""
         ...
 
-    def expand_scenario(self, persona: Persona, dim_id: str, variation: str, seed: int) -> str:
+    def expand_scenario(
+        self, persona: Persona, dim_id: str, variation: str, seed: int, app_context: str = ""
+    ) -> str:
         """Turn a persona x (dim_id, variation) cell into a multi-turn scenario brief."""
         ...
 
@@ -41,22 +50,30 @@ class MockPromptExpander:
     """Deterministic, network-free expander used by all unit tests.
 
     Output is a pure function of its inputs (no randomness, no I/O), so
-    identical (dim, variation, seed) or (persona, dim_id, variation, seed)
-    tuples always produce byte-identical text.
+    identical (dim, variation, seed, app_context) or
+    (persona, dim_id, variation, seed, app_context) tuples always produce
+    byte-identical text.
     """
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    def expand(self, dim: Dimension, variation: str, seed: int) -> str:
-        self.calls.append(("expand", dim.dim_id, variation, seed))
-        return f"[mock:{dim.dim_id}:{variation}:{seed}] {dim.name} prompt for '{variation}'"
+    def expand(self, dim: Dimension, variation: str, seed: int, app_context: str = "") -> str:
+        self.calls.append(("expand", dim.dim_id, variation, seed, app_context))
+        return (
+            f"[mock:{dim.dim_id}:{variation}:{seed}] {dim.name} prompt for '{variation}' "
+            f"(app_context={app_context!r})"
+        )
 
-    def expand_scenario(self, persona: Persona, dim_id: str, variation: str, seed: int) -> str:
-        self.calls.append(("expand_scenario", persona.persona_id, dim_id, variation, seed))
+    def expand_scenario(
+        self, persona: Persona, dim_id: str, variation: str, seed: int, app_context: str = ""
+    ) -> str:
+        self.calls.append(
+            ("expand_scenario", persona.persona_id, dim_id, variation, seed, app_context)
+        )
         return (
             f"[mock:{persona.persona_id}:{dim_id}:{variation}:{seed}] "
-            f"{persona.name} scenario for '{variation}'"
+            f"{persona.name} scenario for '{variation}' (app_context={app_context!r})"
         )
 
 
@@ -110,30 +127,43 @@ class OpenAIPromptExpander:
             payload = json.loads(response.read())
         return payload["choices"][0]["message"]["content"].strip()
 
-    def expand(self, dim: Dimension, variation: str, seed: int) -> str:
+    @staticmethod
+    def _context_block(app_context: str) -> str:
+        return app_context.strip() or "No further application context was provided."
+
+    def expand(self, dim: Dimension, variation: str, seed: int, app_context: str = "") -> str:
         system = (
-            "You write realistic single-turn user prompts for a product-support "
-            "assistant. Return only the user message text, nothing else."
+            "You generate one realistic single-turn user message for an AI "
+            "application, given a description of that application and a grid "
+            "cell (dimension + variation) it should instantiate. Return only "
+            "the user message text, nothing else."
         )
         user = (
+            f"Application context:\n{self._context_block(app_context)}\n\n"
             f"Dimension: {dim.name} ({dim.kind}).\n"
             f"Variation: {variation}\n"
             f"Seed: {seed}\n"
-            "Write one concrete, natural user message for this grid cell."
+            "Write one concrete, natural user message for this grid cell, "
+            "consistent with the application context above."
         )
         return self._chat(system, user)
 
-    def expand_scenario(self, persona: Persona, dim_id: str, variation: str, seed: int) -> str:
+    def expand_scenario(
+        self, persona: Persona, dim_id: str, variation: str, seed: int, app_context: str = ""
+    ) -> str:
         system = (
-            "You write short scenario briefs describing what a user persona wants "
-            "to accomplish across a multi-turn conversation with a product-support "
-            "assistant. Return only the brief, nothing else."
+            "You write a short scenario brief for a user-simulator persona to "
+            "follow across a multi-turn conversation with an AI application, "
+            "given a description of that application. Return only the brief, "
+            "nothing else."
         )
         user = (
+            f"Application context:\n{self._context_block(app_context)}\n\n"
             f"Persona: {persona.name} — {persona.description}\n"
             f"Goals: {', '.join(persona.goals)}\n"
             f"Scenario dimension: {dim_id} / variation: {variation}\n"
             f"Seed: {seed}\n"
-            "Write a 2-4 sentence scenario brief for a user-simulator to follow."
+            "Write a 2-4 sentence scenario brief for a user-simulator to "
+            "follow, consistent with the application context above."
         )
         return self._chat(system, user)

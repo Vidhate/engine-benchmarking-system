@@ -75,6 +75,29 @@ def test_v0_dim_ids_unique_across_safe_and_adversarial():
     assert len(ids) == len(set(ids))
 
 
+def test_v0_declares_app_context():
+    """The product-support/RAG/ticket domain description lives in the yaml's
+    app_context, not hardcoded in any generator Python source."""
+    cfg = load_v0()
+    assert cfg.app_context.strip()
+    lowered = cfg.app_context.lower()
+    assert "support" in lowered
+    assert "ticket" in lowered
+
+
+def test_v0_app_context_reaches_the_expander(tmp_path):
+    cfg = load_v0()
+    expander = MockPromptExpander()
+    generate_inputs(
+        cfg,
+        expander=expander,
+        cache_dir=tmp_path,
+        now=lambda: datetime(2026, 8, 23, tzinfo=UTC),
+    )
+    assert expander.calls
+    assert all(call[-1] == cfg.app_context for call in expander.calls)
+
+
 def test_v0_generates_full_dataset_via_mock_expander(tmp_path):
     """End-to-end: v0.yaml -> generate_inputs (mocked) matches every count formula."""
     cfg = load_v0()

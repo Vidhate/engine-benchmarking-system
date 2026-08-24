@@ -6,6 +6,11 @@ real expansions against the OpenAI API using benchmark.models.GENERATION_MODEL,
 so you can eyeball that the live expander produces sane text before trusting
 it for a full generation run.
 
+The expander itself is app-agnostic: the target-app description comes
+entirely from configs/generation/v0.yaml's `app_context` field, loaded here
+via load_generation_config — the yaml is the only control surface for what
+app these inputs are being generated for (see benchmark/generation/expander.py).
+
 Usage:
     # requires OPENAI_API_KEY in the environment or a .env file at repo root
     uv run python scripts/generation_smoke.py
@@ -23,8 +28,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from benchmark.generation.config_loader import load_generation_config  # noqa: E402
 from benchmark.generation.expander import OpenAIPromptExpander  # noqa: E402
-from benchmark.schemas.inputs import Dimension, Persona  # noqa: E402
+
+V0_CONFIG_PATH = REPO_ROOT / "configs" / "generation" / "v0.yaml"
 
 
 def _load_dotenv(path: Path) -> None:
@@ -50,36 +57,31 @@ def main() -> int:
         )
         return 0
 
+    # Pull the target-app description and a sample dim/persona straight from
+    # the checked-in yaml config — the expander never hardcodes any of this.
+    cfg = load_generation_config(V0_CONFIG_PATH)
     expander = OpenAIPromptExpander()
 
-    safe_dim = Dimension(
-        dim_id="topic",
-        name="query_topic",
-        kind="safe",
-        variations=["refund_request"],
-    )
-    adversarial_dim = Dimension(
-        dim_id="jailbreak_persona_override",
-        name="jailbreak_persona_override",
-        kind="adversarial",
-        variations=["dan_style_roleplay_request"],
-    )
-    persona = Persona(
-        persona_id="frustrated_billing_customer",
-        name="Frustrated Billing Customer",
-        kind="target",
-        description="A customer upset about a duplicate charge, wants a refund.",
-        goals=["get a refund"],
-    )
+    safe_dim = cfg.safe_dims[0]
+    adversarial_dim = cfg.adversarial_dims[0]
+    persona = cfg.personas[0]
 
     print("=== safe single-turn expansion ===")
-    print(expander.expand(safe_dim, "refund_request", seed=1))
+    print(expander.expand(safe_dim, safe_dim.variations[0], seed=1, app_context=cfg.app_context))
 
     print("\n=== adversarial single-turn expansion ===")
-    print(expander.expand(adversarial_dim, "dan_style_roleplay_request", seed=1))
+    print(
+        expander.expand(
+            adversarial_dim, adversarial_dim.variations[0], seed=1, app_context=cfg.app_context
+        )
+    )
 
     print("\n=== multi-turn scenario brief ===")
-    print(expander.expand_scenario(persona, "topic", "refund_request", seed=1))
+    print(
+        expander.expand_scenario(
+            persona, safe_dim.dim_id, safe_dim.variations[0], seed=1, app_context=cfg.app_context
+        )
+    )
 
     return 0
 

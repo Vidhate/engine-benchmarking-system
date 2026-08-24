@@ -52,3 +52,32 @@ def test_mock_records_calls():
     expander.expand(make_dim(), "refunds", seed=7)
     expander.expand_scenario(make_persona(), "d1", "refunds", seed=7)
     assert len(expander.calls) == 2
+
+
+def test_mock_expand_includes_app_context_when_provided():
+    a = MockPromptExpander().expand(make_dim(), "refunds", seed=7, app_context="A payroll app.")
+    b = MockPromptExpander().expand(make_dim(), "refunds", seed=7, app_context="A travel app.")
+    assert "A payroll app." in a
+    assert "A travel app." in b
+    assert a != b
+
+
+def test_mock_expand_scenario_includes_app_context_when_provided():
+    persona = make_persona()
+    a = MockPromptExpander().expand_scenario(
+        persona, "d1", "refunds", seed=7, app_context="A payroll app."
+    )
+    b = MockPromptExpander().expand_scenario(
+        persona, "d1", "refunds", seed=7, app_context="A travel app."
+    )
+    assert "A payroll app." in a
+    assert "A travel app." in b
+    assert a != b
+
+
+def test_mock_expand_empty_app_context_does_not_crash():
+    dim = make_dim()
+    text = MockPromptExpander().expand(dim, "refunds", seed=7)  # no app_context passed
+    assert isinstance(text, str) and text
+    text2 = MockPromptExpander().expand(dim, "refunds", seed=7, app_context="")
+    assert text2 == text
