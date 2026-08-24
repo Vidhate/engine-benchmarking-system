@@ -25,6 +25,8 @@ Gates, in order:
   5. control  — at least one control input's trace is byte-identical to the one
                 the harness collected.
   6. export   — the Engine-facing file passes the no-leak audit and parses.
+  7. clocks   — on REAL wall clocks, no time threshold separates the ablated
+                traces from the control ones in the export.
 
 Usage:
     uv run python scripts/ablation_smoke.py            # manages the server
@@ -93,21 +95,19 @@ class ModePinnedAgent:
     """The live agent, with `allowed_modes` narrowed per category.
 
     A thin script-local wrapper: it changes nothing about how an error is
-    drafted, only which modes the drafting prompt is allowed to choose from,
-    and it pins `target_count` (which `AblationConfig` has no field for — see
-    the report's schema proposals).
+    drafted, only which modes the drafting prompt is allowed to choose from.
+    The injection rate is no longer pinned here — `AblationConfig.target_count`
+    is authoritative over the agent's own suggestion, and this script sets it.
     """
 
-    def __init__(self, inner, mode_by_category: dict[str, list[str]], target_count: int):
+    def __init__(self, inner, mode_by_category: dict[str, list[str]]):
         self.inner = inner
         self.mode_by_category = mode_by_category
-        self.target_count = target_count
 
     def propose(self, category, n, digest, allowed_modes):
         pinned = self.mode_by_category.get(category.category_id, list(allowed_modes))
         modes = [m for m in pinned if m in allowed_modes] or list(allowed_modes)
-        drafts = self.inner.propose(category, n, digest, modes)
-        return [d.model_copy(update={"target_count": self.target_count}) for d in drafts]
+        return self.inner.propose(category, n, digest, modes)
 
     def revise_corruption(self, proposal, digest, reasons):
         return self.inner.revise_corruption(proposal, digest, reasons)
@@ -278,8 +278,12 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
             # is not a gate.
             min_eligible=3,
             n_per_category=1,
+            # 2, not the design default of 5: an 8-input smoke corpus cannot
+            # feed 5 injections per error, and every Mode-C injection is a real
+            # app run.
+            target_count=TARGET_COUNT,
         )
-        agent = ModePinnedAgent(OpenAIAblationAgent(), MODE_BY_CATEGORY, TARGET_COUNT)
+        agent = ModePinnedAgent(OpenAIAblationAgent(), MODE_BY_CATEGORY)
         engine = AblationEngine(harness, store, ablation_cfg, agent=agent)
         started = time.time()
         result = engine.run(
@@ -301,6 +305,9 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
             print(f"  [{issue.injection_mode:17}] {issue.error_id:28} x{count}  {issue.title}")
         for reason in result.dropped_errors:
             print(f"  DROPPED: {reason}")
+        if result.self_corrected_counts:
+            print(f"  candidates burned by the not-retracted check: "
+                  f"{result.self_corrected_counts}")
 
         by_mode: dict[str, int] = {}
         for issue in result.ground_truth.issues:
@@ -370,6 +377,78 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
         print(f"exported {len(payload)} traces to {Path(result.export_path).name}, "
               f"scanned for {behaviors + ('ablation', 'thread_id', 'checkpoint')}")
         print("PASS — allowlist clean, no fault/ablation token, parses as Trace")
+
+        # -------------------------------------- GATE 7: no wall-clock separator
+        banner("GATE 7 — no time threshold separates ablated traces from control")
+        from datetime import datetime
+
+        control_ids = {t.trace_id for t in result.ablated.traces if t.input_id in control}
+        ablated_ids = {t.trace_id for t in result.ablated.traces if t.ablation_ids}
+
+        def group_of(trace_id: str) -> str:
+            if trace_id in ablated_ids:
+                return "ABLATED"
+            return "control" if trace_id in control_ids else "ablate-set-clean"
+
+        def exported_span_times(item: dict) -> list[datetime]:
+            return [
+                datetime.fromisoformat(span[key])
+                for turn in item["turns"]
+                for span in turn["spans"]
+                for key in ("start_time", "end_time")
+            ]
+
+        def real_span_times(trace) -> list[datetime]:
+            return [
+                value
+                for turn in trace.turns
+                for span in turn.spans
+                for value in (span.start_time, span.end_time)
+            ]
+
+        real_max = {
+            t.trace_id: max(real_span_times(t))
+            for t in result.ablated.traces
+            if real_span_times(t)
+        }
+        print("  BEFORE normalization (the real clocks the collector recorded):")
+        for group in ("control", "ablate-set-clean", "ABLATED"):
+            values = [v for k, v in real_max.items() if group_of(k) == group]
+            if values:
+                print(f"    {group:17} max span time  {min(values).isoformat()}"
+                      f"  ..  {max(values).isoformat()}")
+
+        exported_max: dict[str, datetime] = {}
+        exported_min: dict[str, datetime] = {}
+        for item in payload:
+            times = exported_span_times(item)
+            if not times:
+                continue
+            exported_max[item["trace_id"]] = max(times)
+            exported_min[item["trace_id"]] = min(times)
+        print("  AFTER normalization (what Engine actually receives):")
+        for group in ("control", "ablate-set-clean", "ABLATED"):
+            values = [v for k, v in exported_max.items() if group_of(k) == group]
+            if values:
+                print(f"    {group:17} max span time  {min(values).isoformat()}"
+                      f"  ..  {max(values).isoformat()}")
+
+        origins = {v.isoformat() for v in exported_min.values()}
+        assert len(origins) == 1, f"exported traces start at different clocks: {origins}"
+        ablated_maxes = [v for k, v in exported_max.items() if k in ablated_ids]
+        control_maxes = [v for k, v in exported_max.items() if k in control_ids]
+        assert ablated_maxes and control_maxes, "the gate needs both populations"
+        separated = (
+            max(ablated_maxes) < min(control_maxes) or max(control_maxes) < min(ablated_maxes)
+        )
+        assert not separated, (
+            "a single threshold on max span time separates the two sets: "
+            f"ablated {min(ablated_maxes)}..{max(ablated_maxes)} vs "
+            f"control {min(control_maxes)}..{max(control_maxes)}"
+        )
+        print(f"  every exported trace starts at {origins.pop()}; the ablated and control "
+              "max-time ranges interleave, so no threshold separates them")
+        print("PASS — the measured wall-clock fingerprint is gone from the export")
 
         banner("PHASE 5 SMOKE OK — every gate green")
         print(f"artifacts under {OUT_DIR.relative_to(REPO_ROOT)}")
