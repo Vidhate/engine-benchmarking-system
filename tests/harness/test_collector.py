@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+from langsmith.utils import LangSmithAPIError, LangSmithRateLimitError
 
 from benchmark.harness.collector import (
     SPAN_SELECT,
@@ -302,6 +303,87 @@ def test_a_server_that_ignores_the_metadata_filter_does_not_yield_a_wrong_trace(
 
     with pytest.raises(IngestionTimeout):
         collector.collect("s-abc", input_id="i", mode="single_turn")
+
+
+# ------------------------------------------------------- rate-limit retry
+
+def test_transient_rate_limit_errors_are_retried_until_success():
+    """A 429 that clears up after a few attempts must not fail the collect."""
+    runs = react_agent_runs("s-abc")
+    client = FakeLangSmithClient(runs, rate_limit_calls=3)
+    sleeps: list[float] = []
+    collector = make_collector(
+        client, sleep=sleeps.append, max_retries=6, retry_base_delay_s=1.0
+    )
+
+    trace = collector.collect("s-abc", input_id="i", mode="single_turn")
+
+    assert trace.status == "ok"
+    assert client.rate_limit_raises == 3
+    assert len(sleeps) >= 3, "collector did not back off between retries"
+
+
+def test_transient_5xx_errors_are_retried_the_same_way_as_429():
+    runs = react_agent_runs("s-abc")
+    client = FakeLangSmithClient(
+        runs, rate_limit_calls=2, rate_limit_error=LangSmithAPIError
+    )
+    collector = make_collector(client, max_retries=6, retry_base_delay_s=0.01)
+
+    trace = collector.collect("s-abc", input_id="i", mode="single_turn")
+
+    assert trace.status == "ok"
+    assert client.rate_limit_raises == 2
+
+
+def test_a_persistent_rate_limit_exhausts_retries_and_raises_the_original_error():
+    runs = react_agent_runs("s-abc")
+    client = FakeLangSmithClient(runs, rate_limit_calls=1000)
+    collector = make_collector(client, max_retries=3, retry_base_delay_s=0.01)
+
+    with pytest.raises(LangSmithRateLimitError):
+        collector.collect("s-abc", input_id="i", mode="single_turn")
+
+    # One initial attempt plus `max_retries` retries, then it gives up.
+    assert client.rate_limit_raises == 4
+
+
+def test_retry_backoff_sleeps_are_bounded_by_the_configured_cap():
+    runs = react_agent_runs("s-abc")
+    client = FakeLangSmithClient(runs, rate_limit_calls=5)
+    sleeps: list[float] = []
+    collector = make_collector(
+        client,
+        sleep=sleeps.append,
+        max_retries=6,
+        retry_base_delay_s=10.0,
+        retry_max_delay_s=30.0,
+    )
+
+    collector.collect("s-abc", input_id="i", mode="single_turn")
+
+    assert sleeps, "no backoff sleep recorded"
+    assert all(0 <= s <= 30.0 for s in sleeps), f"unbounded backoff sleep(s): {sleeps}"
+
+
+def test_retries_do_not_mask_loud_failure_semantics():
+    """The retry helper only catches transport errors, never the collector's
+    own loud-failure exceptions — those still raise on the first occurrence."""
+    client = FakeLangSmithClient(react_agent_runs("s-other"))
+    ticks = iter([float(i) for i in range(0, 2000)])
+    collector = make_collector(
+        client, root_timeout_s=5.0, monotonic=lambda: next(ticks), max_retries=6
+    )
+
+    with pytest.raises(IngestionTimeout):
+        collector.collect("s-abc", input_id="i", mode="single_turn")
+
+
+def test_the_default_retry_knobs_are_a_bounded_backoff():
+    collector = LangSmithCollector(project="p", client=FakeLangSmithClient([]))
+    assert collector.max_retries == 6
+    assert collector.retry_base_delay_s == pytest.approx(1.0)
+    assert collector.retry_max_delay_s == pytest.approx(30.0)
 
 
 # ------------------------------------------------------------------ turns

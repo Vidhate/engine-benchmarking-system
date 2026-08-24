@@ -57,8 +57,16 @@ def make_inputs(n_single=3, n_multi=0, max_turns=3) -> InputDataset:
     return stamp_dataset_id(InputDataset(generation_config=cfg, inputs=inputs))
 
 
-def build(tmp_path, inputs, *, simulator_script=None, **app_kwargs):
-    ls = FakeLangSmithClient([])
+def build(
+    tmp_path,
+    inputs,
+    *,
+    simulator_script=None,
+    ls_kwargs=None,
+    collector_kwargs=None,
+    **app_kwargs,
+):
+    ls = FakeLangSmithClient([], **(ls_kwargs or {}))
     app = FakeTargetApp(ls, **app_kwargs)
     collector = LangSmithCollector(
         CFG.langsmith_project,
@@ -69,6 +77,7 @@ def build(tmp_path, inputs, *, simulator_script=None, **app_kwargs):
         root_timeout_s=0.0,
         child_timeout_s=0.0,
         settle_polls=1,
+        **(collector_kwargs or {}),
     )
     store = LocalTraceStore(tmp_path / "traces")
     quarantine = Quarantine(tmp_path / "quarantine")
@@ -224,6 +233,32 @@ def test_uncollectable_traces_are_quarantined_with_a_reason_never_silently_dropp
     assert record["reason"]
     assert record["input_id"] == "safe-1"
     assert harness.stats["quarantined"] == 1
+
+
+def test_a_persistent_rate_limit_on_one_input_quarantines_it_not_the_batch(tmp_path):
+    """Exhausted LangSmith retries must degrade to a per-input quarantine —
+    not kill the whole batch — same as any other collector failure."""
+    inputs = make_inputs(3)
+    failing = session_id_for(inputs.dataset_id, "safe-1")
+    harness, _app, store, quarantine, _ = build(
+        tmp_path,
+        inputs,
+        ls_kwargs={
+            "rate_limit_calls": 1000,
+            "rate_limit_target": failing,
+        },
+        collector_kwargs={"max_retries": 2, "retry_base_delay_s": 0.0},
+    )
+
+    _outputs, traces = harness.run_batch(inputs)
+
+    assert {t.input_id for t in traces.traces} == {"safe-0", "safe-2"}
+    assert not store.exists(trace_id_for(failing))
+    assert quarantine.list_ids() == [failing]
+    record = quarantine.get(failing)
+    assert "LangSmithRateLimitError" in record["reason"]
+    assert harness.stats["quarantined"] == 1
+    assert harness.stats["ran"] == 2
 
 
 def test_a_successful_rerun_clears_the_inputs_stale_quarantine_record(tmp_path):

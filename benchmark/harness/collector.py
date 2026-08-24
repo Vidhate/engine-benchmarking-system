@@ -46,11 +46,14 @@ target app's graph currently collides.
 
 from __future__ import annotations
 
+import random
 import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
+
+from langsmith.utils import LangSmithAPIError, LangSmithRateLimitError
 
 from benchmark.harness.ids import trace_id_for
 from benchmark.harness.scrub import assert_no_leak, leak_tokens
@@ -125,6 +128,31 @@ _OUTPUT_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 _ALLOWED_ATTRIBUTES = ("run_type", "model", "tokens", "error", "duration_ms")
+
+# Transport-level errors LangSmith calls may raise that are worth a bounded
+# retry: 429 (rate limit) and the SDK's mapping of a 500 response. Nothing
+# else — auth/not-found/conflict/user errors are configuration problems a
+# retry cannot fix, and the collector's own loud-failure exceptions
+# (IngestionTimeout, VacuousProjectionError, TurnCoverageError) are never
+# raised by the client call this wraps, so they are never caught here.
+RETRYABLE_LANGSMITH_ERRORS: tuple[type[BaseException], ...] = (
+    LangSmithRateLimitError,  # 429 — the reason this retry helper exists
+    LangSmithAPIError,  # LangSmith's mapping of a transient 5xx response
+)
+
+_T = TypeVar("_T")
+
+
+def _retry_delay_s(
+    attempt: int, base_delay_s: float, max_delay_s: float, rand: Callable[[], float]
+) -> float:
+    """Full-jitter exponential backoff, bounded above by `max_delay_s`.
+
+    `attempt` is 0-indexed: the delay before the FIRST retry. `rand` is
+    injected so tests can make the jitter deterministic.
+    """
+    cap = min(max_delay_s, base_delay_s * (2**attempt))
+    return rand() * cap
 
 
 class IngestionTimeout(Exception):
@@ -325,8 +353,17 @@ class LangSmithCollector:
         min_llm_spans: int = 1,
         audit_manifests: bool = True,
         span_select: list[str] | None = None,
+        # Bounded exponential backoff with jitter around every LangSmith
+        # call, for 429/5xx transport errors only (see
+        # RETRYABLE_LANGSMITH_ERRORS). With base=1s/cap=30s the six retries
+        # span roughly 1+2+4+8+16+30 =~ 61s of worst-case waiting per call,
+        # comfortably inside root_timeout_s/child_timeout_s.
+        max_retries: int = 6,
+        retry_base_delay_s: float = 1.0,
+        retry_max_delay_s: float = 30.0,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        random_fn: Callable[[], float] = random.random,
     ):
         self.project = project
         self._client = client
@@ -338,8 +375,12 @@ class LangSmithCollector:
         self.min_llm_spans = min_llm_spans
         self.audit_manifests = audit_manifests
         self.span_select = span_select or SPAN_SELECT
+        self.max_retries = max_retries
+        self.retry_base_delay_s = retry_base_delay_s
+        self.retry_max_delay_s = retry_max_delay_s
         self._sleep = sleep
         self._monotonic = monotonic
+        self._random = random_fn
 
     @property
     def client(self) -> Any:
@@ -351,6 +392,30 @@ class LangSmithCollector:
 
     # ---------------------------------------------------------------- fetching
 
+    def _call_with_retry(self, fetch: Callable[[], _T], *, where: str) -> _T:
+        """Bounded exponential backoff with jitter around one LangSmith call.
+
+        Only `RETRYABLE_LANGSMITH_ERRORS` (429 / transient 5xx) are caught
+        here. `fetch` must fully materialize the result (e.g. wrap a lazy
+        `list_runs()` iterator in `list(...)`) since the real SDK raises
+        lazily, while paging through results, not at the call itself. A
+        still-failing call after `max_retries` retries re-raises the
+        original exception unchanged — the retry never becomes the reason a
+        collect() call fails.
+        """
+        attempt = 0
+        while True:
+            try:
+                return fetch()
+            except RETRYABLE_LANGSMITH_ERRORS:
+                attempt += 1
+                if attempt > self.max_retries:
+                    raise
+                delay = _retry_delay_s(
+                    attempt - 1, self.retry_base_delay_s, self.retry_max_delay_s, self._random
+                )
+                self._sleep(delay)
+
     @staticmethod
     def _session_filter(session_id: str) -> str:
         # LangSmith's query language; the JSON blob is single-quoted inside it.
@@ -361,12 +426,17 @@ class LangSmithCollector:
         return (getattr(run, "extra", None) or {}).get("metadata") or {}
 
     def _root_runs(self, session_id: str) -> list[Any]:
-        runs = self.client.list_runs(
-            project_name=self.project,
-            is_root=True,
-            filter=self._session_filter(session_id),
-            select=self.span_select,
-        )
+        def fetch() -> list[Any]:
+            return list(
+                self.client.list_runs(
+                    project_name=self.project,
+                    is_root=True,
+                    filter=self._session_filter(session_id),
+                    select=self.span_select,
+                )
+            )
+
+        runs = self._call_with_retry(fetch, where=f"root runs of session {session_id}")
         # Never trust the server-side filter to have been applied: an
         # unsupported filter that degrades to "return everything" would
         # otherwise hand us somebody else's trace.
@@ -420,11 +490,14 @@ class LangSmithCollector:
         return [by_turn[i] for i in range(expected_turns)]
 
     def _span_runs(self, trace_id: Any) -> list[Any]:
-        return list(
-            self.client.list_runs(
-                project_name=self.project, trace_id=trace_id, select=self.span_select
+        def fetch() -> list[Any]:
+            return list(
+                self.client.list_runs(
+                    project_name=self.project, trace_id=trace_id, select=self.span_select
+                )
             )
-        )
+
+        return self._call_with_retry(fetch, where=f"spans of trace {trace_id}")
 
     def wait_for_spans(self, trace_id: Any, *, require_children: bool = True) -> list[Any]:
         """Poll until the run tree stops GROWING — child ingestion lags the root.
@@ -510,14 +583,20 @@ class LangSmithCollector:
         llm_ids = sorted(str(r.id) for r in span_runs if r.run_type == "llm")
         if not llm_ids:
             return 0
+
+        def fetch() -> list[Any]:
+            return list(
+                self.client.list_runs(
+                    project_name=self.project,
+                    trace_id=trace_id,
+                    run_type="llm",
+                    select=MANIFEST_SELECT,
+                )
+            )
+
         manifests = {
             str(run.id): run.serialized
-            for run in self.client.list_runs(
-                project_name=self.project,
-                trace_id=trace_id,
-                run_type="llm",
-                select=MANIFEST_SELECT,
-            )
+            for run in self._call_with_retry(fetch, where=f"llm manifests of trace {trace_id}")
         }
         populated = sorted(run_id for run_id in llm_ids if manifests.get(run_id))
         if populated != llm_ids:

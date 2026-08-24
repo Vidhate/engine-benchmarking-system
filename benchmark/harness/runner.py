@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from langsmith.utils import LangSmithAPIError, LangSmithRateLimitError
 from pydantic import ValidationError
 
 from benchmark.harness.client import LangGraphAppClient, TargetAppClient
@@ -65,7 +66,19 @@ class AmbiguousCheckpoint(LookupError):
     """Several turns end with the same assistant response — say which one."""
 
 # Collection problems: our bug, so the result is quarantined rather than stored.
-COLLECTION_FAILURES = (IngestionTimeout, LeakDetected, ValidationError, ValueError, KeyError)
+# LangSmithRateLimitError/LangSmithAPIError land here only after the
+# collector's own bounded backoff (benchmark.harness.collector) has already
+# exhausted its retries — a persistent 429/5xx is then this input's problem,
+# not a reason to kill the rest of the batch.
+COLLECTION_FAILURES = (
+    IngestionTimeout,
+    LeakDetected,
+    ValidationError,
+    ValueError,
+    KeyError,
+    LangSmithRateLimitError,
+    LangSmithAPIError,
+)
 
 
 class Quarantine:

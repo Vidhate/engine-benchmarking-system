@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from langsmith.utils import LangSmithRateLimitError
+
 T0 = datetime(2026, 8, 23, 12, 0, 0, tzinfo=UTC)
 
 # Every attribute of langsmith.schemas.Run the harness may ever read.
@@ -88,6 +90,9 @@ class FakeLangSmithClient:
         honor_metadata_filter: bool = True,
         reveal_schedule: list[list[FakeRun]] | None = None,
         drop_serialized: bool = False,
+        rate_limit_calls: int = 0,
+        rate_limit_error: type[Exception] = LangSmithRateLimitError,
+        rate_limit_target: str | None = None,
     ):
         self.runs = list(runs)
         self.honor_metadata_filter = honor_metadata_filter
@@ -97,6 +102,26 @@ class FakeLangSmithClient:
         self.drop_serialized = drop_serialized
         self.calls: list[dict] = []
         self._child_fetches = 0
+        # The first `rate_limit_calls` invocations of `list_runs` (of ANY
+        # kind — root, span or manifest fetch) raise `rate_limit_error`
+        # instead of returning, simulating a LangSmith 429/5xx that clears
+        # up after N attempts. `rate_limit_raises` records how many times
+        # this actually fired, for tests to assert against. When
+        # `rate_limit_target` is set, only calls whose `filter` (root fetch)
+        # or `trace_id` (span/manifest fetch) contains that substring are
+        # affected — e.g. one session_id, to simulate rate-limiting hitting
+        # one input's collection while the rest of a batch is unaffected.
+        self._rate_limit_calls_remaining = rate_limit_calls
+        self.rate_limit_error = rate_limit_error
+        self.rate_limit_target = rate_limit_target
+        self.rate_limit_raises = 0
+
+    def _rate_limit_applies(self, trace_id: Any, filter: str | None) -> bool:  # noqa: A002
+        if self.rate_limit_target is None:
+            return True
+        if filter and self.rate_limit_target in filter:
+            return True
+        return trace_id is not None and self.rate_limit_target in str(trace_id)
 
     def list_runs(
         self,
@@ -120,6 +145,10 @@ class FakeLangSmithClient:
                 "limit": limit,
             }
         )
+        if self._rate_limit_calls_remaining > 0 and self._rate_limit_applies(trace_id, filter):
+            self._rate_limit_calls_remaining -= 1
+            self.rate_limit_raises += 1
+            raise self.rate_limit_error("simulated transient LangSmith error")
         if trace_id is not None and self.reveal_schedule is not None:
             index = min(self._child_fetches, len(self.reveal_schedule) - 1)
             self._child_fetches += 1
