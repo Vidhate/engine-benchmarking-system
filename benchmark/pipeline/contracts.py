@@ -49,9 +49,28 @@ class AblationStageUnavailable(RuntimeError):
     """Phase 5 has not merged yet (or does not export `run_ablation`)."""
 
 
+#: THE canonical statement of the pinned AblationResult shape: attribute name ->
+#: the runtime type(s) it must be. The Protocol below and the seam check both
+#: read from this, so the contract cannot be updated in one place and silently
+#: not the other.
+ABLATION_RESULT_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "ablated": TraceDataset,
+    "ground_truth": Issueboard,
+    "records": list,
+    "split": AblationSplit,
+    "export_path": (str, Path),
+    "dropped_errors": list,
+}
+
+
 @runtime_checkable
 class AblationResult(Protocol):
-    """What Phase 5 hands back. Structural, not nominal — see module docstring."""
+    """What Phase 5 hands back. Structural, not nominal — see module docstring.
+
+    The annotations here are the documentation; `ABLATION_RESULT_FIELDS` above
+    is what the runtime check reads, and `test_contracts.py` asserts the two
+    agree so neither can drift from the other.
+    """
 
     ablated: TraceDataset
     ground_truth: Issueboard
@@ -82,17 +101,6 @@ class AblationStage(Protocol):
     ) -> AblationResult: ...
 
 
-#: (attribute, expected type) — the pinned AblationResult shape.
-_ABLATION_RESULT_FIELDS: tuple[tuple[str, type | tuple[type, ...]], ...] = (
-    ("ablated", TraceDataset),
-    ("ground_truth", Issueboard),
-    ("records", list),
-    ("split", AblationSplit),
-    ("export_path", (str, Path)),
-    ("dropped_errors", list),
-)
-
-
 def assert_ablation_result(result: Any) -> Any:
     """Check a Phase-5 result against the pinned contract, or raise TypeError.
 
@@ -100,12 +108,12 @@ def assert_ablation_result(result: Any) -> Any:
     failure that names the field that drifted, at the moment the object crosses
     into pipeline code.
     """
-    for name, expected in _ABLATION_RESULT_FIELDS:
+    for name, expected in ABLATION_RESULT_FIELDS.items():
         if not hasattr(result, name):
             raise TypeError(
                 f"ablation result {type(result).__name__} has no {name!r} — the pinned "
-                f"Phase-5 contract is AblationResult(ablated, ground_truth, records, "
-                f"split, export_path, dropped_errors)"
+                f"Phase-5 contract is "
+                f"AblationResult({', '.join(ABLATION_RESULT_FIELDS)})"
             )
         value = getattr(result, name)
         if not isinstance(value, expected):

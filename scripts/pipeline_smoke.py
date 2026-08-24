@@ -354,10 +354,16 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     print(f"server-side model     : {run.engine.recorded_models}")
     print(f"raw board_id (engine) : {run.engine.raw_output.get('board_id')}")
     print(f"restamped board_id    : {run.predicted.board_id}")
-    print(f"predicted board       : {len(run.predicted.issues)} issue(s), "
-          f"{len(run.predicted.occurrences)} occurrence(s) over "
-          f"{len({o.trace_id for o in run.predicted.occurrences})} of "
+    print(f"updated board (as returned): {len(run.predicted.issues)} issue(s), "
+          f"{len(run.predicted.occurrences)} occurrence(s)")
+    print(f"scored delta          : {len(run.scored.board.issues)} issue(s), "
+          f"{len(run.scored.board.occurrences)} occurrence(s) over "
+          f"{len({o.trace_id for o in run.scored.board.occurrences})} of "
           f"{len(run.ablated.traces)} traces")
+    print(f"  seed carriers={run.scored.carrier_error_ids} "
+          f"dropped_seed_issues={run.scored.dropped_seed_issues} "
+          f"dropped_seed_pairs={run.scored.dropped_seed_occurrences} "
+          f"phantoms={run.scored.phantom_trace_ids}")
     assert run.predicted.source == "engine_predicted"
     assert run.predicted.board_id == content_hash(run.predicted), "board_id was not re-stamped"
     assert run.predicted.board_id != run.engine.raw_output.get("board_id"), (
@@ -366,18 +372,25 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     seed_ids = {i.error_id for i in run.seed_board.issues}
     assert seed_ids <= {i.error_id for i in run.predicted.issues}, "seed issues were dropped"
     if run.engine.recorded_models:
+        # run_pipeline already hard-fails on a mismatch; this reports the fact.
         assert set(run.engine.recorded_models) == {cfg.engine.model}, run.engine.recorded_models
         print(f"  server-side readback confirms model={cfg.engine.model!r}")
     else:
         print("  WARNING: the server kept no readable record of the run's model")
-    if not run.predicted.occurrences:
+    if not run.scored.board.occurrences:
         print("  WARNING: the Engine returned no occurrences — check its stderr for "
               "per-trace analysis failures (they are stderr-only)")
     print("PASS — schema-valid updated issueboard, re-stamped, seed carried through")
 
     # --------------------------------------------------------------- gate 4
     banner("GATE 4 — report + manifest on disk")
-    for name in ("report.json", "report.md", "manifest.json", "deliverables.json"):
+    for name in (
+        "report.json",
+        "report.md",
+        "manifest.json",
+        "deliverables.json",
+        "scored_issueboard.json",
+    ):
         path = run.run_dir / name
         assert path.exists(), f"{name} was not written"
         print(f"  {name}: {path.stat().st_size} bytes")

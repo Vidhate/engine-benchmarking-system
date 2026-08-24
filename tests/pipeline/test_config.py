@@ -45,6 +45,45 @@ def test_the_checked_in_full_config_parses_and_is_full_scale():
     assert cfg.resolve(cfg.generation_config).name == "v0.yaml"
 
 
+def test_the_full_config_is_scoped_to_the_documented_run_size():
+    """v0.yaml in `mixed` mode yields 1230 inputs — four times the scope the
+    plan describes, and the multi-turn tail is the expensive part (a
+    conversation costs several app invocations, not one)."""
+    from benchmark.generation.config_loader import load_generation_config
+    from benchmark.pipeline.runner import slice_inputs
+    from benchmark.schemas import InputDataset, InputSpec
+
+    cfg = load_pipeline_config(REPO_ROOT / "configs" / "pipeline" / "full.yaml")
+    generation = load_generation_config(cfg.resolve(cfg.generation_config))
+
+    single = sum(len(d.variations) for d in generation.safe_dims)
+    single += sum(len(d.variations) for d in generation.adversarial_dims)
+    single += len(generation.fixed_adversarial)
+    multi = len(generation.personas) * sum(
+        len(d.variations) for d in generation.safe_dims
+    ) + len(generation.adversarial_personas) * (
+        sum(len(d.variations) for d in generation.adversarial_dims)
+        + len(generation.fixed_adversarial)
+    )
+    assert (single, multi) == (310, 920), "v0.yaml changed shape; re-check the slice"
+
+    grid = InputDataset(
+        inputs=[
+            InputSpec(input_id=f"st-{i}", mode="single_turn", dim_id="d", variation="v")
+            for i in range(single)
+        ]
+        + [
+            InputSpec(input_id=f"mt-{i}", mode="multi_turn", dim_id="d", variation="v")
+            for i in range(multi)
+        ]
+    )
+    sliced = slice_inputs(grid, cfg)
+    modes = {m: sum(1 for s in sliced.inputs if s.mode == m) for m in ("single_turn", "multi_turn")}
+    assert modes["single_turn"] == 310, "every single-turn input runs"
+    assert modes["multi_turn"] == 30, "the multi-turn tail is sampled, not run whole"
+    assert len(sliced.inputs) >= cfg.deliverables.min_traces
+
+
 def test_run_dir_is_run_id_under_artifacts_root(tmp_path):
     cfg = PipelineConfig(run_id="r1", generation_config="g.yaml", artifacts_root="data/p")
     cfg = cfg.with_root(tmp_path)

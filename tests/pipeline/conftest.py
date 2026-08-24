@@ -124,6 +124,11 @@ class FakeHarness:
     but the same `(OutputDataset, TraceDataset)` return and the same lineage.
     """
 
+    #: A test double says so out loud: any faked stage makes a run's numbers
+    #: evidence about wiring rather than about the Engine, and the runner
+    #: reports that on every artifact it writes.
+    is_pipeline_fake = True
+
     def __init__(self, cfg=None, store=None, *, app_error_inputs: tuple[str, ...] = ()):
         self.cfg = cfg
         self.store = store
@@ -182,6 +187,8 @@ class FakeEngineInvoker:
     model. It also always adds one unmatched issue, which is what an E_h
     candidate looks like coming back from a real run.
     """
+
+    is_pipeline_fake = True
 
     def __init__(self, ground_truth: Issueboard | None = None, *, recall: float = 1.0):
         self.ground_truth = ground_truth

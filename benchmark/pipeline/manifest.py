@@ -42,7 +42,11 @@ class ArtifactPaths(BaseModel):
     ablation_split: str = "ablation_split.json"
     seed_issueboard: str = "seed_issueboard.json"
     ground_truth_issueboard: str = "ground_truth_issueboard.json"
+    #: The Engine's updated board, verbatim — the assignment's deliverable.
     predicted_issueboard: str = "predicted_issueboard.json"
+    #: What the report's numbers actually describe: the Engine's delta over the
+    #: seed board, restricted to the real trace universe (pipeline/scoring.py).
+    scored_issueboard: str = "scored_issueboard.json"
     engine_raw_output: str = "engine_raw_output.json"
     report: str = "report.json"
     summary: str = "report.md"

@@ -17,6 +17,7 @@ its own run only. Scoring and rendering need no server.
 from __future__ import annotations
 
 import logging
+import random
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,7 +43,11 @@ from benchmark.pipeline.contracts import (
     assert_ablation_result,
 )
 from benchmark.pipeline.deliverables import DeliverableCheck, check_deliverables
-from benchmark.pipeline.engine import LangGraphEngineInvoker
+from benchmark.pipeline.engine import (
+    EngineModelMismatch,
+    EngineRunFailed,
+    LangGraphEngineInvoker,
+)
 from benchmark.pipeline.export import assert_export_file_clean
 from benchmark.pipeline.manifest import (
     ArtifactPaths,
@@ -53,6 +58,7 @@ from benchmark.pipeline.manifest import (
     utcnow,
 )
 from benchmark.pipeline.render import render_markdown
+from benchmark.pipeline.scoring import ScoredBoard, score_engine_delta
 from benchmark.pipeline.servers import ServerLifetime
 from benchmark.schemas import (
     AblationRecord,
@@ -66,11 +72,14 @@ from benchmark.schemas import (
     TraceDataset,
 )
 from benchmark.schemas.io import stamp_dataset_id
-from benchmark.scoring import score
 from benchmark.scoring.scorer_description import DescriptionJudge
 from benchmark.tracing.store import LocalTraceStore, TraceStore
 
 log = logging.getLogger("benchmark.pipeline")
+
+
+class AblationLineageBroken(RuntimeError):
+    """The ablated dataset does not point back at the traces it came from."""
 
 
 @dataclass
@@ -86,7 +95,11 @@ class PipelineRun:
     export_path: Path
     seed_board: Issueboard
     ground_truth: Issueboard
+    #: The Engine's updated board, verbatim — the assignment's deliverable.
     predicted: Issueboard
+    #: What was actually scored: the Engine's delta over the seed, restricted to
+    #: the real trace universe. See benchmark/pipeline/scoring.py.
+    scored: ScoredBoard
     engine: EngineInvocation
     report: BenchmarkReport
     manifest: RunManifest
@@ -103,24 +116,68 @@ def _qualname(obj: Any) -> str:
 def _is_faked(obj: Any) -> bool:
     """Whether a stage (or its result) is a development stand-in.
 
-    Checked on an explicit `is_pipeline_fake` marker rather than on the word
-    "fake" appearing in a name: a wrapper closure around the fake would lose
-    the name, and losing this warning is how a wiring run gets read as a
-    quality result.
+    Checked on an explicit `is_pipeline_fake` marker, plus the module the object
+    comes from, rather than on the word "fake" appearing in a name: a wrapper
+    closure around the fake would lose the name, and losing this warning is how
+    a wiring run gets read as a quality result.
     """
-    return bool(getattr(obj, "is_pipeline_fake", False))
+    if getattr(obj, "is_pipeline_fake", False):
+        return True
+    module = getattr(obj, "__module__", None) or type(obj).__module__ or ""
+    return module.startswith("benchmark.pipeline.fakes")
+
+
+def _faked_stages(stages: dict[str, Any]) -> list[str]:
+    """Every stage running against a stand-in, by name.
+
+    ANY faked stage invalidates the run as evidence about the Engine, not just
+    a faked ablation: a fake harness means the traces are invented, a fake
+    invoker means the board is. They all get the same loud warning.
+    """
+    return sorted(name for name, obj in stages.items() if _is_faked(obj))
+
+
+def _fake_warning(faked: list[str], implementations: dict[str, str]) -> str:
+    named = ", ".join(f"{name} ({implementations.get(name, '?')})" for name in faked)
+    return (
+        f"FAKED stage(s): {named}. This run used development stand-ins, so its numbers "
+        f"are evidence about wiring, not about the Engine."
+    )
 
 
 def slice_inputs(inputs: InputDataset, cfg: PipelineConfig) -> InputDataset:
-    """Apply the config's miniature slice, deterministically.
+    """Apply the config's slice, deterministically.
 
-    A miniature run is the same generation config with fewer of its cells, not
-    a second config that drifts from the real one. Selection is by sorted
-    `input_id`, so it does not depend on grid iteration order.
+    A smaller run is the same generation config with fewer of its cells, not a
+    second config that drifts from the real one. Three knobs, applied in order:
+    `input_modes` filters, `max_inputs_per_mode` samples each mode (seeded, so
+    the sample is reproducible), and `max_inputs` caps the total. Everything is
+    ordered by `input_id` afterwards, so the resulting `dataset_id` does not
+    depend on grid iteration order.
+
+    Note what this does NOT do: it does not avoid the cost of *generating* the
+    cells it drops. `generate_inputs` expands the whole grid before the pipeline
+    sees it — expansion belongs to `benchmark/generation/`, and slicing is a
+    pipeline-layer concern. The expansions are cached on disk, so only the first
+    run pays for the cells it then discards.
     """
     specs = list(inputs.inputs)
     if cfg.input_modes:
         specs = [s for s in specs if s.mode in cfg.input_modes]
+    if cfg.max_inputs_per_mode:
+        rng = random.Random(cfg.slice_seed)
+        kept: list = []
+        by_mode: dict[str, list] = {}
+        for spec in sorted(specs, key=lambda s: s.input_id):
+            by_mode.setdefault(spec.mode, []).append(spec)
+        # Sorted mode order so the RNG draws in a fixed sequence.
+        for mode in sorted(by_mode):
+            group = by_mode[mode]
+            limit = cfg.max_inputs_per_mode.get(mode)
+            if limit is not None and len(group) > limit:
+                group = sorted(rng.sample(group, limit), key=lambda s: s.input_id)
+            kept.extend(group)
+        specs = sorted(kept, key=lambda s: s.input_id)
     if cfg.max_inputs is not None and len(specs) > cfg.max_inputs:
         specs = sorted(specs, key=lambda s: s.input_id)[: cfg.max_inputs]
     if not specs:
@@ -201,7 +258,7 @@ def build_base_rates(
 
 
 def _engine_health_warnings(
-    *, predicted: Issueboard, invocation: EngineInvocation, ablated: TraceDataset
+    *, scored: Issueboard, invocation: EngineInvocation, ablated: TraceDataset
 ) -> list[str]:
     """The only downstream signal of a partially failed Engine run.
 
@@ -209,16 +266,21 @@ def _engine_health_warnings(
     the run still completes, just with a smaller board. Nothing in the output
     says so. So the pipeline says it: counts, side by side, in the log and in
     the manifest.
+
+    Counted on the SCORED board — the Engine's own delta, phantom trace ids and
+    echoed seed occurrences already removed. A board that mostly repeats its
+    input is exactly the case this warning exists to catch, and counting the
+    echo would hide it.
     """
     warnings: list[str] = []
     n_traces = len(ablated.traces)
-    covered = len({o.trace_id for o in predicted.occurrences})
+    covered = len({o.trace_id for o in scored.occurrences})
     log.warning(
-        "ENGINE OUTPUT: %s issue(s), %s occurrence(s) over %s of %s trace(s) analysed "
-        "(the Engine reports per-trace failures on stderr only — a smaller-than-expected "
-        "board is the only signal that reaches here)",
-        len(predicted.issues),
-        len(predicted.occurrences),
+        "ENGINE OUTPUT (its own contribution): %s issue(s), %s occurrence(s) over %s of %s "
+        "trace(s) analysed (the Engine reports per-trace failures on stderr only — a "
+        "smaller-than-expected board is the only signal that reaches here)",
+        len(scored.issues),
+        len(scored.occurrences),
         covered,
         n_traces,
     )
@@ -227,9 +289,9 @@ def _engine_health_warnings(
             f"the Engine was given {invocation.trace_count} traces but the ablated dataset "
             f"has {n_traces} — the export and the dataset have diverged"
         )
-    if not predicted.occurrences:
+    if not scored.occurrences:
         warnings.append(
-            "the Engine returned no occurrences at all — check its stderr for per-trace "
+            "the Engine contributed no occurrences at all — check its stderr for per-trace "
             "analysis failures before reading the scores as a quality signal"
         )
     return warnings
@@ -316,11 +378,6 @@ def run_pipeline(
     ground_truth: Issueboard = stamp_dataset_id(result.ground_truth)
     records: list[AblationRecord] = list(result.records)
     split: AblationSplit = result.split
-    if ablated.parent_dataset_id != traces.dataset_id:
-        warnings.append(
-            f"the ablated dataset's parent is {ablated.parent_dataset_id!r}, not the traces "
-            f"it was built from ({traces.dataset_id!r}) — lineage is broken"
-        )
     artifacts.write_model("ablated_traces", ablated)
     artifacts.write_model("ablation_split", split)
     artifacts.write_json(
@@ -331,6 +388,17 @@ def run_pipeline(
         warnings.append(
             f"the ablation stage dropped {len(result.dropped_errors)} proposed error(s): "
             f"{result.dropped_errors}"
+        )
+
+    # Fail fast, BEFORE the Engine pass: a broken lineage link means the traces
+    # the Engine is about to read for half an hour cannot be tied to the ground
+    # truth they will be scored against. Spending the run to discover that at
+    # the end is the expensive way to learn it.
+    if ablated.parent_dataset_id != traces.dataset_id:
+        raise AblationLineageBroken(
+            f"the ablated dataset's parent is {ablated.parent_dataset_id!r}, not the traces "
+            f"it was built from ({traces.dataset_id!r}) — the run would produce a report "
+            f"whose ground truth cannot be traced to its corpus"
         )
 
     written_export = Path(result.export_path)
@@ -345,22 +413,59 @@ def run_pipeline(
     assert_export_file_clean(written_export)
 
     # ------------------------------------ Stage IV: the Engine's own lifetime
-    with servers.running("engine"), stage_timer("engine", timings):
-        invocation = engine_invoker(
-            trace_file=written_export,
-            seed_board=seed_board,
-            categories=categories,
-            engine=cfg.engine,
-        )
+    try:
+        with servers.running("engine"), stage_timer("engine", timings):
+            invocation = engine_invoker(
+                trace_file=written_export,
+                seed_board=seed_board,
+                categories=categories,
+                engine=cfg.engine,
+            )
+    except EngineRunFailed as exc:
+        # The run is lost; the response must not be. A full-scale pass is
+        # ~25 minutes of model time, and "it did not validate" is unactionable
+        # without the payload that did not validate.
+        if exc.raw_output is not None:
+            path = artifacts.write_json("engine_raw_output", exc.raw_output)
+            log.error("engine run failed; its raw output is at %s", path)
+        raise
+
     # Idempotent re-stamp: the Engine's board_id is its own label, computed over
     # a model that has no `injection_mode` field, and is not byte-compatible
     # with ours. Never compared for equality — replaced.
     predicted = stamp_dataset_id(invocation.board)
     artifacts.write_model("predicted_issueboard", predicted)
     artifacts.write_json("engine_raw_output", invocation.raw_output)
-    warnings += _engine_health_warnings(
-        predicted=predicted, invocation=invocation, ablated=ablated
-    )
+
+    # Comparison integrity: what the SERVER recorded, not what we sent. A run
+    # config LangGraph declined to inject looks exactly like a successful one.
+    requested = cfg.engine.model
+    recorded = set(invocation.recorded_models)
+    if recorded and recorded != {requested}:
+        raise EngineModelMismatch(
+            f"the run asked for model {requested!r} but the server recorded "
+            f"{sorted(recorded)} — the model config did not take effect, and two arms of "
+            f"a comparison would silently be the same model"
+        )
+    if not recorded:
+        warnings.append(
+            f"the server kept no readable record of the run's model, so {requested!r} is "
+            f"what was requested, not what is confirmed to have run"
+        )
+
+    stage_objects = {
+        "ablation": ablation_stage,
+        "engine_invoker": engine_invoker,
+        "harness": harness,
+    }
+    implementations = {name: _qualname(obj) for name, obj in stage_objects.items()}
+    implementations["servers"] = ",".join(sorted(servers.describe())) or "none"
+    faked = _faked_stages(stage_objects)
+    # A stage wrapped in a closure loses its own identity; its RESULT does not.
+    if "ablation" not in faked and _is_faked(result):
+        faked = sorted([*faked, "ablation"])
+    if faked:
+        warnings.insert(0, _fake_warning(faked, implementations))
 
     # ---------------------------------------------------------- Stage V: score
     with stage_timer("scoring", timings):
@@ -371,16 +476,20 @@ def run_pipeline(
             ablated=ablated,
             dropped_errors=list(result.dropped_errors),
         )
-        report = score(
-            ground_truth,
-            predicted,
-            cfg.scoring,
-            base_rates,
+        # The faked-stage fact belongs in the report itself, not only in the
+        # manifest: report.json travels on its own.
+        base_rates["faked_stages"] = faked
+        report, scored = score_engine_delta(
+            ground_truth=ground_truth,
+            predicted=predicted,
+            seed=seed_board,
             # The FULL trace universe, control/clean traces included. Taken
             # from the ablated dataset, never from a union of occurrences:
             # kappa's correction for chance agreement is computed against n,
             # and dropping the clean majority silently inflates it.
             trace_ids=[t.trace_id for t in ablated.traces],
+            cfg=cfg.scoring,
+            base_rates=base_rates,
             engine_config=EngineConfig(
                 model=cfg.engine.model,
                 app=engine_app,
@@ -390,20 +499,15 @@ def run_pipeline(
             judge=judge,
         )
     artifacts.write_model("report", report)
-
-    stages = {
-        "ablation": _qualname(ablation_stage),
-        "engine_invoker": _qualname(engine_invoker),
-        "harness": _qualname(harness),
-        "servers": ",".join(sorted(servers.describe())) or "none",
-    }
-    if _is_faked(ablation_stage) or _is_faked(result):
-        warnings.insert(
-            0,
-            f"the ablation stage was FAKED ({stages['ablation']}): traces were not "
-            f"modified and the ground truth is a synthetic label over unmodified "
-            f"traces. These scores are evidence about wiring, not about the Engine.",
-        )
+    # The Engine's own delta, as scored — the board the numbers describe, kept
+    # next to the verbatim one the assignment asks for.
+    artifacts.write_model("scored_issueboard", scored.board)
+    warnings += scored.warnings()
+    # Health is judged on the SCORED board: coverage counted before phantoms
+    # and seed pairs come out would flatter a run that mostly echoed its input.
+    warnings += _engine_health_warnings(
+        scored=scored.board, invocation=invocation, ablated=ablated
+    )
 
     manifest = RunManifest(
         run_id=cfg.run_id,
@@ -437,14 +541,24 @@ def run_pipeline(
             "ablate_inputs": len(split.ablate_input_ids),
             "known_errors": len(ground_truth.issues),
             "known_occurrences": len(ground_truth.occurrences),
+            # The board as returned (the assignment deliverable) …
             "engine_issues": len(predicted.issues),
             "engine_occurrences": len(predicted.occurrences),
-            "engine_traces_covered": len({o.trace_id for o in predicted.occurrences}),
+            # … and what of it was actually the Engine's own contribution.
+            # Coverage is computed AFTER phantoms and seed pairs come out, so
+            # it counts real traces the Engine really said something about.
+            "scored_issues": len(scored.board.issues),
+            "scored_occurrences": len(scored.board.occurrences),
+            "engine_traces_covered": len({o.trace_id for o in scored.board.occurrences}),
+            "seed_carrier_issues": len(scored.carrier_error_ids),
+            "dropped_seed_issues": len(scored.dropped_seed_issues),
+            "dropped_seed_occurrences": scored.dropped_seed_occurrences,
+            "phantom_occurrences": len(scored.phantom_occurrences),
             "eh_candidates": len(report.eh_candidates),
         },
         timings=timings,
         artifacts=artifacts.paths,
-        stages=stages,
+        stages=implementations,
         harness_stats=dict(getattr(harness, "stats", {}) or {}),
         dropped_errors=list(result.dropped_errors),
         warnings=warnings,
@@ -483,6 +597,7 @@ def run_pipeline(
         seed_board=seed_board,
         ground_truth=ground_truth,
         predicted=predicted,
+        scored=scored,
         engine=invocation,
         report=report,
         manifest=manifest,

@@ -21,6 +21,7 @@ import types
 import pytest
 
 from benchmark.pipeline.contracts import (
+    ABLATION_RESULT_FIELDS,
     AblationResult,
     AblationStageUnavailable,
     assert_ablation_result,
@@ -79,10 +80,12 @@ def test_a_complete_result_passes_the_seam_check():
     assert_ablation_result(_complete_result())
 
 
-@pytest.mark.parametrize(
-    "missing",
-    ["ablated", "ground_truth", "records", "split", "export_path", "dropped_errors"],
-)
+def test_the_protocol_and_the_runtime_check_describe_the_same_contract():
+    """One canonical field list; the Protocol's annotations must not drift."""
+    assert set(AblationResult.__annotations__) == set(ABLATION_RESULT_FIELDS)
+
+
+@pytest.mark.parametrize("missing", list(ABLATION_RESULT_FIELDS))
 def test_every_pinned_field_is_required(missing):
     fields = _complete_result().__dict__
     del fields[missing]

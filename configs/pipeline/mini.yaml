@@ -52,6 +52,10 @@ engine:
   # Always pass this: the LangGraph server's own default of 25 caps a run at
   # ~23 traces (apps/engine/README.md).
   recursion_limit: 10000
+  # `runs.wait` is one blocking request for the whole pass; the SDK's default
+  # read timeout is 300 s. A miniature run is ~1-2 min, but the value is a
+  # property of the corpus, not of the module, so it is named here too.
+  timeout_s: 10800
 
 scoring:
   severity_alpha: 0.5

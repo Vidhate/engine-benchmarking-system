@@ -58,6 +58,11 @@ class EngineStageConfig(BaseModel):
     model: str = ENGINE_MODEL_MINI
     analysis_concurrency: int = DEFAULT_ANALYSIS_CONCURRENCY
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
+    #: HTTP read timeout for the single blocking `runs.wait` request that spans
+    #: the whole Engine pass. The SDK's default is 300 s, which is shorter than
+    #: any full-scale run — see benchmark/pipeline/engine.py. Three hours leaves
+    #: room for a corpus several times the assignment's.
+    timeout_s: float = 3 * 60 * 60
     max_tool_calls_per_trace: int = 50
     seed: int = 0
 
@@ -83,6 +88,15 @@ class PipelineConfig(BaseModel):
     # generation config: same inputs, fewer of them, deterministically chosen.
     max_inputs: int | None = None
     input_modes: list[InputMode] | None = None
+    #: Per-mode caps, applied before `max_inputs`. This exists because the two
+    #: modes cost wildly different amounts: a single-turn input is one app
+    #: invocation, a multi-turn conversation is up to `max_turns` of them plus a
+    #: user-simulator call each. Capping only the expensive tail keeps the whole
+    #: single-turn grid (the assignment's >=300) without a four-hour harness.
+    max_inputs_per_mode: dict[InputMode, int] | None = None
+    #: Seeds the per-mode sample, so a capped run is reproducible and two arms
+    #: of a comparison see the same conversations.
+    slice_seed: int = 0
     harness: HarnessStageConfig = Field(default_factory=HarnessStageConfig)
     ablation: AblationConfig = Field(default_factory=AblationConfig)
     engine: EngineStageConfig = Field(default_factory=EngineStageConfig)

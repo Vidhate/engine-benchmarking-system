@@ -27,8 +27,8 @@ from pydantic import BaseModel
 
 from benchmark.pipeline.export import ExportLeak, assert_export_file_clean
 from benchmark.pipeline.manifest import ArtifactPaths, RunManifest
+from benchmark.pipeline.scoring import score_engine_delta
 from benchmark.schemas import BenchmarkReport, Issueboard, ScoringConfig, TraceDataset
-from benchmark.scoring import score
 from benchmark.scoring.scorer_description import DescriptionJudge
 
 
@@ -63,6 +63,7 @@ def rescore_from_disk(
     paths = paths or ArtifactPaths()
     ground_truth = _load(Issueboard, run_dir / paths.ground_truth_issueboard)
     predicted = _load(Issueboard, run_dir / paths.predicted_issueboard)
+    seed = _load(Issueboard, run_dir / paths.seed_issueboard)
     ablated = _load(TraceDataset, run_dir / paths.ablated_traces)
     report = _load(BenchmarkReport, run_dir / paths.report)
 
@@ -71,15 +72,20 @@ def rescore_from_disk(
     if scoring.description_mode == "judge" and judge is None:
         scoring = scoring.model_copy(update={"description_mode": "similarity"})
 
-    return score(
-        ground_truth,
-        predicted,
-        scoring,
-        report.base_rates,
+    # The same entrypoint the run used, so the seed-delta and phantom
+    # corrections are reproduced rather than being a step only the original
+    # process knew about.
+    rescored, _ = score_engine_delta(
+        ground_truth=ground_truth,
+        predicted=predicted,
+        seed=seed,
         trace_ids=[t.trace_id for t in ablated.traces],
+        cfg=scoring,
+        base_rates=report.base_rates,
         engine_config=report.engine_config,
         judge=judge,
     )
+    return rescored
 
 
 def _check(name: str, fn) -> DeliverableCheck:

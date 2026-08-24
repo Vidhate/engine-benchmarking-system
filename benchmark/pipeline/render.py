@@ -125,6 +125,56 @@ def render_markdown(
         empty="no predicted occurrences",
     )
 
+    # --------------------------------------------------------- what was scored
+    delta = report.base_rates.get("engine_delta") or {}
+    lines.append("## What was scored")
+    lines.append("")
+    lines.append(
+        "The Engine returns the **updated** issueboard, which contains issues it was "
+        "handed. Its predictions are the delta over the seed board, restricted to the "
+        "traces that exist:"
+    )
+    lines.append("")
+    lines.append(
+        "* occurrences the Engine **added** to a seed issue are scored — they are claims "
+        "about where a failure happens, and the exact key resolves them like any other;"
+    )
+    lines.append(
+        "* the seed issue carrying them is a **carrier**: its severity and description "
+        "were written by the benchmark, so it is excluded from severity/description "
+        "pairing and is never reported as an E_h candidate;"
+    )
+    lines.append(
+        "* seed issues the Engine said nothing about, and occurrence pairs it was handed, "
+        "are dropped;"
+    )
+    lines.append(
+        "* occurrences naming a trace that is not in the dataset are dropped rather than "
+        "counted as false positives — there is no trace to be wrong about."
+    )
+    lines.append("")
+    if delta:
+        rows = [
+            ["seed issues kept as carriers", str(len(delta.get("carrier_error_ids", [])))],
+            ["seed issues dropped (Engine added nothing)",
+             str(len(delta.get("dropped_seed_issues", [])))],
+            ["seed occurrence pairs dropped", str(delta.get("dropped_seed_occurrences", 0))],
+            ["phantom occurrences dropped", str(delta.get("phantom_occurrences", 0))],
+        ]
+        lines += _table(["adjustment", "count"], rows, empty="nothing adjusted")
+        if delta.get("phantom_trace_ids"):
+            lines.append(
+                f"Phantom trace ids the Engine named: "
+                f"`{'`, `'.join(delta['phantom_trace_ids'])}`."
+            )
+            lines.append("")
+        if delta.get("carrier_error_ids"):
+            lines.append(f"Carriers: `{'`, `'.join(delta['carrier_error_ids'])}`.")
+            lines.append("")
+    else:
+        lines.append("_no delta recorded_")
+        lines.append("")
+
     # ------------------------------------------------------------ base rates
     lines.append("## Base rates")
     lines.append("")

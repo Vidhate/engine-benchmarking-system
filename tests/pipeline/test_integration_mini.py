@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from benchmark.pipeline.fakes import fake_run_ablation
-from benchmark.pipeline.runner import run_pipeline
+from benchmark.pipeline.runner import AblationLineageBroken, run_pipeline
 from benchmark.schemas import BenchmarkReport, Issueboard, TraceDataset
 from benchmark.schemas.io import content_hash
 from tests.pipeline.conftest import REPO_ROOT, FakeEngineInvoker, FakeExpander
@@ -60,6 +60,71 @@ def test_the_mini_config_slices_to_single_turn_inputs(run):
 
 def test_every_input_produced_a_trace(run):
     assert len(run.traces.traces) == len(run.inputs.inputs)
+
+
+def test_a_per_mode_cap_samples_that_mode_only(cfg):
+    from benchmark.pipeline.runner import slice_inputs
+    from benchmark.schemas import InputDataset, InputSpec
+
+    grid = InputDataset(
+        inputs=[
+            InputSpec(input_id=f"st-{i:03d}", mode="single_turn", dim_id="d", variation="v")
+            for i in range(20)
+        ]
+        + [
+            InputSpec(input_id=f"mt-{i:03d}", mode="multi_turn", dim_id="d", variation="v")
+            for i in range(50)
+        ]
+    )
+    capped = cfg.model_copy(
+        update={"input_modes": None, "max_inputs": None, "max_inputs_per_mode": {"multi_turn": 5}}
+    ).with_root(cfg.root)
+    sliced = slice_inputs(grid, capped)
+    assert sum(1 for s in sliced.inputs if s.mode == "single_turn") == 20
+    assert sum(1 for s in sliced.inputs if s.mode == "multi_turn") == 5
+
+
+def test_the_per_mode_sample_is_seeded(cfg):
+    from benchmark.pipeline.runner import slice_inputs
+    from benchmark.schemas import InputDataset, InputSpec
+
+    grid = InputDataset(
+        inputs=[
+            InputSpec(input_id=f"mt-{i:03d}", mode="multi_turn", dim_id="d", variation="v")
+            for i in range(50)
+        ]
+    )
+
+    def ids(seed):
+        capped = cfg.model_copy(
+            update={
+                "input_modes": None,
+                "max_inputs": None,
+                "max_inputs_per_mode": {"multi_turn": 5},
+                "slice_seed": seed,
+            }
+        ).with_root(cfg.root)
+        return [s.input_id for s in slice_inputs(grid, capped).inputs]
+
+    assert ids(1) == ids(1), "the same seed must pick the same conversations"
+    assert ids(1) != ids(2), "the seed must actually move the sample"
+    assert ids(1) == sorted(ids(1)), "the kept order is stable, so the dataset id is"
+
+
+def test_a_cap_larger_than_the_pool_keeps_everything(cfg):
+    from benchmark.pipeline.runner import slice_inputs
+    from benchmark.schemas import InputDataset, InputSpec
+
+    grid = InputDataset(
+        inputs=[
+            InputSpec(input_id=f"mt-{i}", mode="multi_turn", dim_id="d", variation="v")
+            for i in range(3)
+        ]
+    )
+    capped = cfg.model_copy(
+        update={"input_modes": None, "max_inputs": None, "max_inputs_per_mode": {"multi_turn": 99}}
+    ).with_root(cfg.root)
+    assert len(slice_inputs(grid, capped).inputs) == 3
 
 
 def test_a_slice_that_selects_nothing_is_refused(cfg, fake_harness_factory):
@@ -118,8 +183,9 @@ def test_the_ablated_set_descends_from_the_traces(run):
     assert run.ablated.parent_dataset_id == run.traces.dataset_id
 
 
-def test_broken_ablation_lineage_is_warned_about_not_swallowed(cfg, fake_harness_factory):
-    """The pipeline does not own Phase 5's lineage — it does notice when it breaks."""
+def test_broken_ablation_lineage_stops_the_run_before_the_engine(cfg, fake_harness_factory):
+    """Fail fast: a report whose ground truth cannot be traced to its corpus is
+    not worth the half hour of Engine time it would take to produce."""
     invoker = FakeEngineInvoker()
 
     def orphaning_stage(**kwargs):
@@ -128,15 +194,15 @@ def test_broken_ablation_lineage_is_warned_about_not_swallowed(cfg, fake_harness
         invoker.ground_truth = result.ground_truth
         return result
 
-    run = run_pipeline(
-        cfg,
-        ablation_stage=orphaning_stage,
-        engine_invoker=invoker,
-        harness_factory=fake_harness_factory,
-        expander=FakeExpander(),
-    )
-    assert any("lineage is broken" in w for w in run.manifest.warnings)
-    assert not by_name(run.deliverables)["dataset_lineage"].ok
+    with pytest.raises(AblationLineageBroken, match="cannot be traced"):
+        run_pipeline(
+            cfg,
+            ablation_stage=orphaning_stage,
+            engine_invoker=invoker,
+            harness_factory=fake_harness_factory,
+            expander=FakeExpander(),
+        )
+    assert invoker.calls == [], "the Engine was paid for despite the broken lineage"
 
 
 def by_name(checks):
@@ -278,10 +344,58 @@ def test_a_provided_seed_board_is_carried_through_and_updated(
 
 # ------------------------------------------------------------------ scoring
 
-def test_scoring_sees_the_full_trace_universe_including_clean_traces(run):
-    """Kappa depends on n; dropping control traces would silently break it."""
+def test_the_reported_base_rates_count_the_full_trace_universe(run):
     assert run.report.base_rates["n_traces"] == len(run.ablated.traces)
     assert run.report.base_rates["clean_traces"] >= 1
+
+
+def test_score_is_given_every_trace_id_including_the_controls(
+    cfg, fake_harness_factory, monkeypatch
+):
+    """The regression this guards is the Phase-1 kappa bug's return path.
+
+    `score()` corrects for chance agreement using n = len(trace_ids). Handing it
+    a union of occurrences instead of the trace universe drops the clean
+    majority, and kappa — the statistic that exists precisely because injection
+    prevalence is low — silently inflates. So this asserts on the ARGUMENT, not
+    on a number downstream of it that could look fine for other reasons.
+    """
+    from benchmark.pipeline import scoring as scoring_module
+
+    real_score = scoring_module.score
+    seen: dict = {}
+
+    def spy(*args, **kwargs):
+        seen["trace_ids"] = list(kwargs["trace_ids"])
+        return real_score(*args, **kwargs)
+
+    monkeypatch.setattr(scoring_module, "score", spy)
+
+    invoker = FakeEngineInvoker()
+
+    def stage(**kwargs):
+        result = fake_run_ablation(**kwargs)
+        invoker.ground_truth = result.ground_truth
+        return result
+
+    run = run_pipeline(
+        cfg,
+        ablation_stage=stage,
+        engine_invoker=invoker,
+        harness_factory=fake_harness_factory,
+        expander=FakeExpander(),
+    )
+
+    expected = [t.trace_id for t in run.ablated.traces]
+    assert seen["trace_ids"] == expected, "score() did not get the ablated trace universe"
+
+    # And it is genuinely a superset of the traces anything was flagged on:
+    # controls carry no occurrence in either board and must still be counted.
+    flagged = {o.trace_id for o in run.ground_truth.occurrences} | {
+        o.trace_id for o in run.scored.board.occurrences
+    }
+    assert set(expected) > flagged, "the trace universe collapsed to the occurrence union"
+    assert len(set(expected) - flagged) >= 1, "no clean trace survived into scoring"
 
 
 def test_base_rates_carry_the_control_fraction_and_injection_counts(run):

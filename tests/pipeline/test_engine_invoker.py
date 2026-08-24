@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 from benchmark.pipeline.config import EngineStageConfig
@@ -208,3 +209,95 @@ def test_a_missing_export_file_is_caught_before_the_run(tmp_path):
     with pytest.raises(FileNotFoundError):
         invoke(client, tmp_path / "nope.json")
     assert client.calls == [], "the Engine was invoked against a file that does not exist"
+
+
+# ------------------------------------------------------------------ timeouts
+
+class SpyFactory:
+    def __init__(self, client=None):
+        self.client = client or FakeClient()
+        self.kwargs: dict = {}
+
+    def __call__(self, **kwargs):
+        self.kwargs = kwargs
+        return self.client
+
+
+def test_the_client_is_built_with_an_explicit_read_timeout(trace_file):
+    """`get_sync_client` defaults to a 300 s read timeout, and `runs.wait` holds
+    ONE blocking request for the whole Engine pass — a 300-trace run is ~21 min,
+    so the default kills it five minutes in, after all the money is spent."""
+    factory = SpyFactory()
+    invoker = LangGraphEngineInvoker(APP, client_factory=factory)
+    invoker(
+        trace_file=trace_file,
+        seed_board=Issueboard(source="seed"),
+        categories=[],
+        engine=EngineStageConfig(timeout_s=7200.0),
+    )
+    timeout = factory.kwargs["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 7200.0
+    assert timeout.connect and timeout.connect < 60, "connect stays short — only reads are slow"
+
+
+def test_the_read_timeout_comes_from_the_run_config(trace_file):
+    factory = SpyFactory()
+    LangGraphEngineInvoker(APP, client_factory=factory)(
+        trace_file=trace_file,
+        seed_board=Issueboard(source="seed"),
+        categories=[],
+        engine=EngineStageConfig(timeout_s=60.0),
+    )
+    assert factory.kwargs["timeout"].read == 60.0
+
+
+def test_the_default_timeout_outlasts_a_full_scale_run():
+    """~340 traces at concurrency 16 is ~25 min; the default must not be close."""
+    assert EngineStageConfig().timeout_s >= 3 * 3600
+
+
+def test_an_injected_client_is_used_as_is(trace_file):
+    """Tests inject a client directly; no factory call, no timeout to apply."""
+    factory = SpyFactory()
+    invoker = LangGraphEngineInvoker(APP, client=FakeClient(), client_factory=factory)
+    invoker(
+        trace_file=trace_file,
+        seed_board=Issueboard(source="seed"),
+        categories=[],
+        engine=EngineStageConfig(),
+    )
+    assert factory.kwargs == {}
+
+
+# ------------------------------------------- surviving a bad response (I3)
+
+def test_a_schema_invalid_response_carries_its_raw_payload(trace_file):
+    """Hours of Engine time must never be lost to an unparseable reply: the
+    exception carries the payload so the caller can persist it."""
+    payload = {"issues": "not a list", "occurrences": []}
+    with pytest.raises(EngineRunFailed) as caught:
+        invoke(FakeClient(output=payload), trace_file)
+    assert caught.value.raw_output == payload
+
+
+def test_a_failed_run_carries_the_error_payload(trace_file):
+    payload = {"__error__": {"message": "recursion limit"}}
+    with pytest.raises(EngineRunFailed) as caught:
+        invoke(FakeClient(output=payload), trace_file)
+    assert caught.value.raw_output == payload
+
+
+def test_a_board_that_is_not_engine_predicted_is_refused_at_ingest(trace_file):
+    """Checked here, not only as an exit deliverable: a board claiming to be the
+    seed or the ground truth must not reach scoring wearing a prediction's face."""
+    payload = {**BOARD, "source": "ground_truth"}
+    with pytest.raises(EngineRunFailed, match="engine_predicted"):
+        invoke(FakeClient(output=payload), trace_file)
+
+
+def test_the_refused_board_still_carries_its_payload(trace_file):
+    payload = {**BOARD, "source": "ground_truth"}
+    with pytest.raises(EngineRunFailed) as caught:
+        invoke(FakeClient(output=payload), trace_file)
+    assert caught.value.raw_output == payload

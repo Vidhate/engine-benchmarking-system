@@ -18,6 +18,17 @@ Phase 6 hand-off notes):
    model, which has no `injection_mode` field — so the canonical JSON differs
    and the values do not match on identical content. It is the Engine's label,
    not a benchmark dataset id. Never assert equality between the two.
+4. **The HTTP client needs an explicit read timeout.** `runs.wait` holds ONE
+   blocking request open for the entire Engine pass, and `get_sync_client`
+   defaults to `read=300s`. A full-scale run is ~25 minutes, so the default
+   aborts it five minutes in — after every per-trace analysis has been paid
+   for and with nothing to show. The timeout is a config field
+   (`engine.timeout_s`), not a constant, because it is a property of the corpus
+   size rather than of this module.
+5. **A response that will not parse must not be unrecoverable.** Every failure
+   raised here carries the raw payload on the exception, so the caller can
+   persist it before re-raising. Hours of Engine time must never be lost to a
+   schema surprise.
 """
 
 from __future__ import annotations
@@ -28,6 +39,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from benchmark.pipeline.config import EngineStageConfig
 from benchmark.pipeline.contracts import EngineInvocation
 from benchmark.schemas import EngineAppConfig, ErrorCategory, Issueboard
@@ -35,9 +48,34 @@ from benchmark.schemas.io import stamp_dataset_id
 
 log = logging.getLogger("benchmark.pipeline.engine")
 
+#: Only the read leg is long. A server that will not accept a connection in
+#: five seconds is down, and waiting three hours to learn that helps nobody.
+CONNECT_TIMEOUT_S = 5.0
+WRITE_TIMEOUT_S = 60.0
+POOL_TIMEOUT_S = 5.0
+
 
 class EngineRunFailed(RuntimeError):
-    """The Engine run errored, or returned something that is not an issueboard."""
+    """The Engine run errored, or returned something that is not an issueboard.
+
+    Carries `raw_output`: whatever the server actually returned. The caller is
+    expected to persist it — a 25-minute run that ends in a validation error is
+    exactly the run whose response you need to read.
+    """
+
+    def __init__(self, message: str, raw_output: Any = None):
+        super().__init__(message)
+        self.raw_output = raw_output
+
+
+class EngineModelMismatch(RuntimeError):
+    """The server ran a different model from the one the run asked for.
+
+    A hard failure, not a note. LangGraph silently declines to inject a run
+    config whose node annotation it does not recognise, and the symptom is both
+    arms of a model comparison quietly running the same model — a result that
+    looks like a finding ("the two models score the same") and is not one.
+    """
 
 
 def _seed_payload(board: Issueboard) -> dict[str, Any]:
@@ -56,16 +94,34 @@ def _seed_payload(board: Issueboard) -> dict[str, Any]:
 class LangGraphEngineInvoker:
     """One Engine run, driven exclusively through the LangGraph Server API."""
 
-    def __init__(self, app: EngineAppConfig, *, client: Any = None):
+    def __init__(self, app: EngineAppConfig, *, client: Any = None, client_factory: Any = None):
         self.app = app
         self._client = client
+        self._client_factory = client_factory
+
+    def _build_client(self, engine: EngineStageConfig) -> Any:
+        factory = self._client_factory
+        if factory is None:
+            from langgraph_sdk import get_sync_client  # noqa: PLC0415
+
+            factory = get_sync_client
+        return factory(
+            url=self.app.base_url,
+            timeout=httpx.Timeout(
+                connect=CONNECT_TIMEOUT_S,
+                read=engine.timeout_s,
+                write=WRITE_TIMEOUT_S,
+                pool=POOL_TIMEOUT_S,
+            ),
+        )
 
     @property
     def client(self) -> Any:
         if self._client is None:
-            from langgraph_sdk import get_sync_client  # noqa: PLC0415
-
-            self._client = get_sync_client(url=self.app.base_url)
+            raise RuntimeError(
+                "the client is built on the first call, from the run's engine config "
+                "(it carries the read timeout) — inject one to use this before then"
+            )
         return self._client
 
     def recorded_models(self, thread_id: str) -> list[str]:
@@ -103,6 +159,9 @@ class LangGraphEngineInvoker:
             raise FileNotFoundError(f"engine trace file not found: {trace_file}")
         trace_count = len(json.loads(trace_file.read_text()).get("traces", []))
 
+        if self._client is None:
+            self._client = self._build_client(engine)
+
         config = {
             "configurable": {
                 self.app.model_configurable_key: engine.model,
@@ -133,17 +192,39 @@ class LangGraphEngineInvoker:
         )
         seconds = time.time() - started
 
+        # Every raise below carries `result`: after a run this long, a response
+        # that will not parse must still be readable afterwards.
         if not isinstance(result, dict):
-            raise EngineRunFailed(f"engine returned {type(result).__name__}, not a mapping")
+            raise EngineRunFailed(
+                f"engine returned {type(result).__name__}, not a mapping", raw_output=result
+            )
         if result.get("__error__"):
-            raise EngineRunFailed(f"engine run failed: {result['__error__']}")
+            raise EngineRunFailed(f"engine run failed: {result['__error__']}", raw_output=result)
         if "issues" not in result or "occurrences" not in result:
             raise EngineRunFailed(
-                f"engine did not return an issueboard — keys were {sorted(result)}"
+                f"engine did not return an issueboard — keys were {sorted(result)}",
+                raw_output=result,
+            )
+
+        try:
+            parsed = Issueboard.model_validate(result)
+        except Exception as exc:
+            raise EngineRunFailed(
+                f"engine output does not validate as an Issueboard: {exc}", raw_output=result
+            ) from exc
+        # Checked here rather than only as an exit deliverable: a board claiming
+        # to be the seed or the ground truth must not reach scoring wearing a
+        # prediction's face, and the failure should land next to the run that
+        # produced it.
+        if parsed.source != "engine_predicted":
+            raise EngineRunFailed(
+                f"engine returned a board with source={parsed.source!r}, expected "
+                f"'engine_predicted'",
+                raw_output=result,
             )
 
         # Re-stamp: the Engine's board_id is its own label, not our dataset id.
-        board = stamp_dataset_id(Issueboard.model_validate(result))
+        board = stamp_dataset_id(parsed)
         return EngineInvocation(
             board=board,
             raw_output=result,
