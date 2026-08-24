@@ -310,11 +310,13 @@ class LangSmithCollector:
         *,
         cfg: TargetAppConfig | None = None,
         root_timeout_s: float = 90.0,
-        # Child spans lag the root by up to ~30s and arrive in bursts, so a
-        # plateau is not the same as settled. The stability window is
-        # (settle_polls - 1) * poll_interval_s = 10s by default; the total
-        # bound must comfortably exceed lag + window.
-        child_timeout_s: float = 60.0,
+        # Child spans lag the root by up to ~30s, arrive in bursts, and trickle
+        # for a while on a big tree — so a plateau is not the same as settled.
+        # The stability window is (settle_polls - 1) * poll_interval_s = 10s by
+        # default; the bound must fit lag + trickle + window, because a bound
+        # that is merely tight quarantines the LARGEST healthy traces (measured:
+        # a 24-run tree needed ~60s to stop growing).
+        child_timeout_s: float = 150.0,
         poll_interval_s: float = 2.5,
         settle_polls: int = 5,
         # Structural floor: the app cannot produce an answer without a model
@@ -425,25 +427,39 @@ class LangSmithCollector:
         )
 
     def wait_for_spans(self, trace_id: Any, *, require_children: bool = True) -> list[Any]:
-        """Poll until the run tree stops growing — child ingestion lags the root."""
+        """Poll until the run tree stops GROWING — child ingestion lags the root.
+
+        Stability is tracked against a high-water mark rather than the previous
+        poll. A page that momentarily comes back one run short is eventual
+        consistency, not the tree shrinking; treating it as a change resets the
+        window every time it happens, and a perfectly healthy tree then never
+        settles and gets quarantined for being big.
+        """
         deadline = self._monotonic() + self.child_timeout_s
-        previous = -1
+        high_water = -1
         stable = 0
-        runs: list[Any] = []
+        best: list[Any] = []
         while True:
             runs = self._span_runs(trace_id)
             count = len(runs)
-            stable = stable + 1 if count == previous else 0
-            previous = count
+            if count > high_water:  # genuine growth — the window restarts
+                high_water, stable, best = count, 0, runs
+            elif count == high_water:  # no growth since the high-water mark
+                stable += 1
+                best = runs
+            # count < high_water: a short page. Neither growth nor progress.
+
             settled = stable >= self.settle_polls - 1
-            enough = count >= 2 and any(r.run_type == "llm" for r in runs)
-            if settled and (enough or (not require_children and count >= 1)):
-                return runs
+            enough = high_water >= 2 and any(r.run_type == "llm" for r in best)
+            if settled and (enough or (not require_children and high_water >= 1)):
+                return best
             if self._monotonic() >= deadline:
                 raise IngestionTimeout(
-                    f"LangSmith run tree {trace_id} never settled: {count} runs after "
-                    f"{self.child_timeout_s}s (child spans lag the root by up to ~30s; "
-                    f"llm span present={any(r.run_type == 'llm' for r in runs)})"
+                    f"LangSmith run tree {trace_id} never settled: {high_water} runs, "
+                    f"{stable}/{self.settle_polls - 1} stable polls after "
+                    f"{self.child_timeout_s}s (child spans lag the root by up to ~30s "
+                    f"and trickle in; llm span present="
+                    f"{any(r.run_type == 'llm' for r in best)})"
                 )
             self._sleep(self.poll_interval_s)
 

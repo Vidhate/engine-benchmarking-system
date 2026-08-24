@@ -412,7 +412,32 @@ def test_the_default_stability_window_covers_the_documented_ingestion_lag():
     collector = LangSmithCollector(project="p", client=FakeLangSmithClient([]))
     window_s = (collector.settle_polls - 1) * collector.poll_interval_s
     assert window_s >= 10.0, "a ~2s window is meaningless against a ~30s ingestion lag"
-    assert collector.child_timeout_s > window_s
+    # The bound has to fit the lag AND a slow trickle AND the window on top,
+    # or the largest healthy trees get quarantined for being big.
+    assert collector.child_timeout_s >= 30.0 + window_s + 30.0
+
+
+def test_an_eventual_consistency_dip_does_not_restart_the_stability_window():
+    """A momentarily short page is jitter, not the tree shrinking.
+
+    Treating it as a change resets the counter every time it happens, so a
+    perfectly healthy tree never settles and is quarantined at the bound.
+    """
+    full = react_agent_runs("s-abc")
+    dipped = full[:-1]  # one run missing from a single page
+    # Recurring jitter, as eventual consistency actually behaves: a policy that
+    # resets on any change never accumulates a window and times out.
+    schedule = [full, dipped] * 20
+    ticks = iter([float(i) for i in range(0, 2000)])
+    collector = make_collector(
+        FakeLangSmithClient(full, reveal_schedule=schedule),
+        child_timeout_s=100.0,
+        monotonic=lambda: next(ticks),
+    )
+
+    trace = collector.collect("s-abc", input_id="i", mode="single_turn")
+
+    assert len(trace.turns[0].spans) == 6, "settled on the dipped page, or not at all"
 
 
 def test_a_tree_with_no_llm_run_at_all_never_settles():
