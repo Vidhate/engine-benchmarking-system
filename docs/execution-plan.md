@@ -331,6 +331,10 @@ Deliverables:
   `injection_mode` — which ablation kind yields fairer/more informative benchmarks.
 - 1–2 page writeup answering the assignment's "things to think about", drawing on the
   architecture docs (trace/issueboard structure, eval function, realistic traces, scaling).
+- **LaTeX paper-style presentation** of the full methodology + the single-turn 300-trace
+  submission experiment (`configs/pipeline/submission.yaml`): abstract, method (from the
+  architecture docs), experiment setup, results with CIs, hidden-error bias analysis,
+  limitations/future work. Written after the submission run so every number is real.
 
 **Gate:**
 - [ ] Comparison table with CIs.
