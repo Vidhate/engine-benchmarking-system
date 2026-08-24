@@ -23,10 +23,35 @@ version of this that stays correct as the schema moves.
 | `metadata.ablation_parent_trace_id` | points straight at the original |
 | `metadata.session_id`, `langsmith_*` | collection-side ids; the ablated
   variants hash differently, and none of it is app behavior |
+| absolute wall-clock span times | see "Time normalization" below |
 
 `metadata.app` and `metadata.turn_count` survive: both are properties of the
 conversation an Engine may legitimately read, and both are identical on control
 and ablated traces.
+
+## Time normalization — the measured wall-clock fingerprint
+
+Ablation runs *after* the corpus is collected, so its traces carry later
+clocks. Measured on a live run: control traces sat at 20:27 while Mode-C
+re-runs sat at 20:52+, and Mode-A conversations had ~25-minute gaps **inside a
+single conversation** where the regenerated tail was spliced on. Either one is
+a one-line classifier — no trace reading required.
+
+Every exported trace is therefore re-based:
+
+* **t = 0 at the trace's first span**, against a fixed synthetic origin
+  (`EXPORT_EPOCH`), so absolute time carries no signal for any trace.
+* **intra-turn deltas are preserved exactly** — every span of a turn shifts by
+  the same offset, so ordering, overlap and concurrency all survive.
+* **durations stay real** — `end - start` is untouched, as is
+  `attributes.duration_ms`. Latency is app behavior and Engine may read it.
+* **inter-turn gaps are collapsed to a constant** (`INTER_TURN_GAP`). A real
+  gap is user think-time, which the harness's own simulator fabricates anyway;
+  keeping it would leave the splice visible. Clamping only *implausible* gaps
+  would be worse — the clamp value would then mark exactly the spliced traces.
+
+The constant is applied to control and ablated traces alike. Uniform treatment
+is the point: a field every trace shares cannot separate them.
 
 ## Known limitation, accepted deliberately
 
@@ -34,14 +59,16 @@ Semantic tells survive. A `stale`-armed retrieval span really does return
 documents with old dates, because the app serves an archived revision rather
 than a synthetic placeholder (`apps/target_app/README.md`). That is the error
 being injected; scrubbing it would scrub the thing Engine is supposed to find.
-No structural fingerprint accompanies it — no marker, no flag, no score — so
-an Engine that spots it did so by reading the trace. Documented, not solved.
+No *structural* fingerprint accompanies it — no marker, no flag, no score, and
+since this module's normalization, no clock either — so an Engine that spots it
+did so by reading the trace. Documented, not solved.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +91,13 @@ SPAN_FIELDS: tuple[str, ...] = (
     "attributes",
 )
 METADATA_FIELDS: tuple[str, ...] = ("app", "turn_count")
+
+# The synthetic origin every exported trace starts from, and the constant gap
+# placed between consecutive turns. See "Time normalization" above. The epoch
+# is fixed rather than "now" so an export is reproducible: the same dataset
+# exported twice is byte-identical.
+EXPORT_EPOCH = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+INTER_TURN_GAP = timedelta(seconds=20)
 
 # Ground-truth vocabulary that must never appear anywhere in the export, on top
 # of the harness's structural fault fingerprints.
@@ -91,9 +125,32 @@ def _strip_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return {key: metadata[key] for key in METADATA_FIELDS if key in metadata}
 
 
+def normalize_times(trace: Trace) -> Trace:
+    """Re-base a trace's span clocks onto `EXPORT_EPOCH`. See the module docstring.
+
+    Returns a copy; the source trace is never mutated (the ablated dataset and
+    the store keep their real times — only the Engine-facing copy is re-based).
+    """
+    out = trace.model_copy(deep=True)
+    cursor = EXPORT_EPOCH
+    for turn in out.turns:
+        if not turn.spans:
+            continue
+        # One offset for the whole turn: intra-turn deltas are preserved by
+        # construction, including overlap between concurrent spans.
+        origin = min(span.start_time for span in turn.spans)
+        offset = cursor - origin
+        for span in turn.spans:
+            span.start_time = span.start_time + offset
+            # end is shifted by the same offset, so the duration is untouched.
+            span.end_time = span.end_time + offset
+        cursor = max(span.end_time for span in turn.spans) + INTER_TURN_GAP
+    return out
+
+
 def strip_trace(trace: Trace) -> dict[str, Any]:
     """One `Trace` rebuilt from the allowlist, as plain JSON-able data."""
-    payload = trace.model_dump(mode="json")
+    payload = normalize_times(trace).model_dump(mode="json")
     out = {key: payload[key] for key in TRACE_FIELDS if key in payload}
     out["metadata"] = _strip_metadata(payload.get("metadata") or {})
     out["turns"] = [
