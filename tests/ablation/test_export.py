@@ -128,6 +128,24 @@ def test_normalization_leaves_the_source_trace_untouched(ablated_trace):
     assert ablated_trace.model_dump_json() == before
 
 
+def test_a_naive_timestamp_does_not_blow_up_the_export():
+    """The export runs AFTER every paid-for injection, so a TypeError here
+    throws away a whole live run. A naive timestamp is read as UTC."""
+    from datetime import datetime
+
+    trace = make_trace("t-naive", "safe-00", turns=2)
+    for turn in trace.turns:
+        for span in turn.spans:
+            span.start_time = span.start_time.replace(tzinfo=None)
+            span.end_time = span.end_time.replace(tzinfo=None)
+
+    exported = build_export([trace])[0]
+    times = [datetime.fromisoformat(v) for pair in _span_times(exported) for v in pair]
+    assert times, "the fixture must have spans"
+    assert all(t.tzinfo is not None for t in times), "the export is tz-aware"
+    assert min(times).isoformat() == "2026-01-01T00:00:00+00:00"
+
+
 def test_a_turn_with_no_spans_does_not_break_normalization():
     trace = make_trace("t-1", "safe-00", turns=2)
     trace.turns[0].spans = []

@@ -125,6 +125,11 @@ def _strip_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return {key: metadata[key] for key in METADATA_FIELDS if key in metadata}
 
 
+def _aware(value: datetime) -> datetime:
+    """`value`, read as UTC when it carries no timezone."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def normalize_times(trace: Trace) -> Trace:
     """Re-base a trace's span clocks onto `EXPORT_EPOCH`. See the module docstring.
 
@@ -136,6 +141,13 @@ def normalize_times(trace: Trace) -> Trace:
     for turn in out.turns:
         if not turn.spans:
             continue
+        # A naive timestamp is read as UTC before anything is subtracted. The
+        # collector's are tz-aware, but this runs AFTER every paid-for
+        # injection, so a trace that came from somewhere else must cost a
+        # slightly wrong offset, never the whole run.
+        for span in turn.spans:
+            span.start_time = _aware(span.start_time)
+            span.end_time = _aware(span.end_time)
         # One offset for the whole turn: intra-turn deltas are preserved by
         # construction, including overlap between concurrent spans.
         origin = min(span.start_time for span in turn.spans)
