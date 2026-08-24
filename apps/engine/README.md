@@ -135,13 +135,34 @@ not the run); `$ENGINE_ANALYSIS_CONCURRENCY` sets a global default.
 A trace costs roughly 30 s to analyse, so 300 strictly sequential traces is over
 two hours — the assignment deliverable does not fit. Batching is the fix, and
 the batch is deliberately the unit of **shared context** as well as of
-parallelism:
+parallelism.
 
-| N | cross-trace context | 300-trace wall clock |
+Measured on the six fixture traces (`gpt-5-mini`, three live runs):
+
+| N | batches | wall clock |
 |---|---|---|
-| 1 | maximal — every trace sees every title found before it | ~2.5 h |
-| 8 (default) | each batch sees all titles from **previous** batches | ~20 min |
-| 16 | coarser still; watch for provider rate limits | ~10 min |
+| 1 | 6 | 201.3 s |
+| 3 | 2 | 112.3 s |
+| 8 | 1 | 63.7 s |
+
+Fitting `batches × B + C` gives **B ≈ 49 s per batch** and **C ≈ 15 s** for
+consolidation, with a mean per-trace cost of ~31 s. Note what B says: a batch
+costs its **slowest** trace, not its average — a ~58% straggler tax. So the
+cost model is `ceil(n / N) × B(N) + C(n)`, and wall clock scales with the number
+of *batches*, not the number of traces. Dividing a run's seconds by its trace
+count is meaningless here; `gate2_live_smoke.py` deliberately reports seconds
+per batch instead.
+
+Extrapolating to 300 traces (B grows slowly with N, being a max over a heavy
+tail):
+
+| N | batches | projected |
+|---|---|---|
+| 1 | 300 | ~2.6 h |
+| 8 (default) | 38 | **~35 min** |
+| 16 | 19 | ~21 min |
+
+**The default N=8 does not reach the ≤20 min target — see "Known gap" below.**
 
 **Running titles are shared *between* batches, never *within* one.** Every trace
 in a batch gets the same snapshot, taken before the batch starts, and the titles
@@ -164,6 +185,28 @@ Threads rather than asyncio, deliberately: the node stays a plain sync callable
 that behaves identically whether LangGraph drives it sync or async, and
 `ThreadPoolExecutor.map` yields in input order regardless of who finishes first.
 The work is blocking HTTP, so the GIL is not the constraint.
+
+### Known gap: the straggler tax
+
+At the default N=8 a 300-trace run projects to **~35 min**, not the ≤20 min
+target. The cause is lock-step batching: the pass waits for the slowest trace in
+each batch before starting the next, which measured as a ~58% tax (mean trace
+31 s, batch 49 s).
+
+The three ways out, in order of how much they disturb the contract above:
+
+1. **N=16** — 19 batches, ~21 min. Within the existing clamp, essentially at
+   target, and costs nothing but a wider rate-limit exposure. Set
+   `analysis_concurrency: 16` on the run.
+2. **Raise the clamp** past 16. Straightforwardly faster, bounded by the
+   provider's rate limits rather than by anything here.
+3. **A sliding window** — a fixed pool of N workers pulling from the whole
+   corpus, so a straggler never idles its peers. That is `sum / N` ≈ 19 min at
+   N=8 and comfortably under target, but it dissolves the batch boundary, and
+   with it the guarantee that a trace's running-title context depends only on
+   *which batch* it is in and never on scheduling. Run comparability is the
+   thing being traded, so this is a decision to take deliberately rather than
+   for the wall clock alone.
 
 ## Model selection — the comparison axis
 
@@ -209,11 +252,17 @@ scripts/smoke.sh                    # all three gates, ~10 min, needs a real key
   parses into `EngineAppConfig` and names the assistant `langgraph.json` serves;
   the vocabulary is names + descriptions only with `other` present; a board from
   the real consolidation code validates as `Issueboard`.
-- **Gate 2** (`scripts/gate2_live_smoke.py`) — a live run over the six fixture
-  traces; asserts schema validity, seed-board survival, no duplicate ids, **no
-  issue reported against a clean trace**, and — when a model is named — that the
-  run record the server persisted names that model. Reports which planted errors
-  were found (imperfect recall is acceptable; crashes are not).
+- **Gate 2** (`scripts/gate2_live_smoke.py [model] [concurrency]`) — a live run
+  over the six fixture traces; asserts schema validity, seed-board survival, no
+  duplicate ids, **no issue reported against a clean trace**, and — when a model
+  is named — that the run record the server persisted names that model. Reports
+  which planted errors were found (imperfect recall is acceptable; crashes are
+  not) plus the batch timings above.
+
+  The clean-trace assertion is a real quality signal about a non-deterministic
+  model: it fired once in five development runs. `ENGINE_GATE_MAX_CLEAN_FLAGS`
+  raises the tolerance for a caller who has decided to live with the flake —
+  saying so out loud beats deleting the check.
 - **Gate 3** (`scripts/gate3_model_swap.py`) — the same run twice, differing only
   in `configurable["model"]`. Each arm's model is confirmed by server-side
   readback (`client.runs.list(thread_id)` → the persisted `config.configurable`),

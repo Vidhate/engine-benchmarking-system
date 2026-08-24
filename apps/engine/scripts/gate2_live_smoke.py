@@ -14,6 +14,7 @@ missed finding.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -96,11 +97,16 @@ def run_engine(model: str | None = None, concurrency: int = DEFAULT_CONCURRENCY)
     if isinstance(result, dict) and result.get("__error__"):
         raise SystemExit(f"run failed: {result['__error__']}")
     seconds = time.time() - started
-    projected = seconds / trace_count * 300 / 60
+    # Batched work does NOT scale per-trace: a batch costs roughly its SLOWEST
+    # trace, so dividing by trace_count flatters a wide batch badly (six traces
+    # at N=8 is one batch, and "10s/trace" would be an artefact of the batch
+    # never being full). Report the batch facts and let the reader extrapolate
+    # on ceil(n / N) batches.
+    batches = -(-trace_count // concurrency)
     print(
-        f"  run finished in {seconds:.1f}s for {trace_count} traces at "
-        f"concurrency={concurrency} (~{seconds / trace_count:.1f}s/trace, "
-        f"projecting ~{projected:.0f} min for 300)"
+        f"  run finished in {seconds:.1f}s — {trace_count} traces at "
+        f"concurrency={concurrency} = {batches} batch(es), "
+        f"{seconds / batches:.1f}s per batch (incl. consolidation)"
     )
 
     try:
@@ -113,6 +119,8 @@ def run_engine(model: str | None = None, concurrency: int = DEFAULT_CONCURRENCY)
         "thread_id": thread["thread_id"],
         "recorded_models": seen,
         "seconds": seconds,
+        "seconds_per_batch": seconds / batches,
+        "batches": batches,
         "trace_count": trace_count,
         "concurrency": concurrency,
     }
@@ -189,10 +197,22 @@ def smoke(model: str | None = None, concurrency: int = DEFAULT_CONCURRENCY) -> d
     # A hand-crafted clean trace has nothing to find. Anything reported against
     # one is a false positive, and false positives are the half of the scoring
     # picture that recall alone hides.
-    assert not recall["clean_traces_flagged"], (
-        f"issues reported against traces with nothing planted in them: "
-        f"{recall['clean_traces_flagged']}"
+    #
+    # This is a real quality signal, but it is a signal about a NON-DETERMINISTIC
+    # model: it fired once in five live runs during development (an over-eager
+    # reading of a clean trace at concurrency=1, where every trace sees the full
+    # running-title list and the model goes looking for known modes everywhere).
+    # The default stays 0 so a regression is loud; ENGINE_GATE_MAX_CLEAN_FLAGS
+    # lets a caller who has decided to tolerate the flake say so out loud rather
+    # than delete the check.
+    tolerated = int(os.environ.get("ENGINE_GATE_MAX_CLEAN_FLAGS", "0"))
+    flagged = recall["clean_traces_flagged"]
+    assert len(flagged) <= tolerated, (
+        f"issues reported against {len(flagged)} trace(s) with nothing planted in "
+        f"them (tolerating {tolerated}): {flagged}"
     )
+    if flagged:
+        print(f"  WARNING: tolerated false positives on clean traces: {flagged}")
 
     if model:
         assert run["recorded_models"], "server kept no record of the run's model"
@@ -208,9 +228,8 @@ def smoke(model: str | None = None, concurrency: int = DEFAULT_CONCURRENCY) -> d
                 "recorded_models": run["recorded_models"],
                 "concurrency": run["concurrency"],
                 "seconds": round(run["seconds"], 1),
-                "projected_300_trace_minutes": round(
-                    run["seconds"] / run["trace_count"] * 300 / 60, 1
-                ),
+                "batches": run["batches"],
+                "seconds_per_batch": round(run["seconds_per_batch"], 1),
                 "board": payload,
                 "recall": recall,
             },
@@ -223,6 +242,8 @@ def smoke(model: str | None = None, concurrency: int = DEFAULT_CONCURRENCY) -> d
         "recall": recall,
         "recorded_models": run["recorded_models"],
         "seconds": run["seconds"],
+        "seconds_per_batch": run["seconds_per_batch"],
+        "batches": run["batches"],
     }
 
 
