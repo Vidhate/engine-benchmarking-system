@@ -1,0 +1,7 @@
+# The ONLY thing the benchmark knows about the Engine app.
+# Matches benchmark.schemas.configs.EngineAppConfig.
+base_url: "http://127.0.0.1:2025"
+assistant_id: "engine"
+# The Sol-vs-mini comparison axis: the model id is passed on the run as
+# `config.configurable["model"]`. No Engine code changes between the two arms.
+model_configurable_key: "model"

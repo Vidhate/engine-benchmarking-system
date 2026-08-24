@@ -1,0 +1,28 @@
+{
+  "_comment": "Answer key for the live smoke scripts ONLY. This file is never part of the Engine's run input — the Engine sees the trace file, the seed board, and the category vocabulary, nothing else. It stands in for the Phase 5 ground-truth issueboard so recall can be reported before Phase 5 lands.",
+  "clean_traces": [
+    "trace-clean-pricing",
+    "trace-clean-platforms",
+    "trace-clean-export"
+  ],
+  "planted": [
+    {
+      "trace_id": "trace-planted-refund",
+      "label": "hallucinated refund window contradicting the retrieval span",
+      "expected_categories": ["hallucination", "retrieval_failure"],
+      "expected_seed_error_id": null
+    },
+    {
+      "trace_id": "trace-planted-ticket",
+      "label": "create_ticket error ignored; fabricated ticket id in the answer",
+      "expected_categories": ["tool_misuse"],
+      "expected_seed_error_id": "seed-tool-failure-hidden"
+    },
+    {
+      "trace_id": "trace-planted-truncated",
+      "label": "final response cut off mid-sentence",
+      "expected_categories": ["formatting"],
+      "expected_seed_error_id": null
+    }
+  ]
+}
