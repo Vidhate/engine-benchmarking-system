@@ -28,6 +28,7 @@ from benchmark.pipeline.config import find_root, load_pipeline_config
 from benchmark.pipeline.contracts import AblationStageUnavailable, load_ablation_stage
 from benchmark.pipeline.deliverables import check_deliverables, rescore_from_disk
 from benchmark.pipeline.fakes import fake_run_ablation
+from benchmark.pipeline.progress import Progress
 from benchmark.pipeline.runner import run_pipeline
 from benchmark.pipeline.servers import ServerLifetime
 
@@ -64,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fake-ablation",
         action="store_true",
         help="use the Phase-5 stand-in (benchmark.pipeline.fakes.fake_run_ablation)",
+    )
+    run.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress stage-progress lines on stderr (banners, heartbeats, per-item counts)",
     )
 
     score = sub.add_parser("score", help="re-score a finished run from its artifacts")
@@ -106,7 +112,8 @@ def _cmd_run(args) -> int:
             return 3
 
     servers = ServerLifetime(cfg.root, cfg.servers, enabled=not args.no_serve)
-    run = run_pipeline(cfg, ablation_stage=stage, servers=servers)
+    progress = Progress(quiet=args.quiet)
+    run = run_pipeline(cfg, ablation_stage=stage, servers=servers, progress=progress)
 
     print(run.markdown)
     print(f"artifacts: {run.run_dir}")
