@@ -1,0 +1,21 @@
+{
+  "board_id": "fixture-seed-0001",
+  "source": "seed",
+  "issues": [
+    {
+      "error_id": "seed-tool-failure-hidden",
+      "title": "Tool failure reported to the user as success",
+      "description": "A tool call returns an error, but the assistant's final answer tells the user the action completed successfully — often inventing an identifier (ticket number, order id) for the operation that never happened. The user walks away believing something was done for them when nothing was.",
+      "category_id": "tool_misuse",
+      "severity": "high"
+    },
+    {
+      "error_id": "seed-answers-without-retrieval",
+      "title": "Answers product questions without consulting the knowledge base",
+      "description": "The assistant answers a question about product policy, pricing, or platform support directly from model memory without ever calling the retrieval tool, so the answer is ungrounded even when it happens to be right.",
+      "category_id": "retrieval_failure",
+      "severity": "medium"
+    }
+  ],
+  "occurrences": []
+}

@@ -13,3 +13,9 @@ apps/target_app/scripts/.server.pid
 apps/target_app/scripts/.server.log
 apps/target_app/scripts/.last_sessions.json
 apps/target_app/.langgraph_api/
+
+# engine smoke-script scratch
+apps/engine/scripts/.server.pid
+apps/engine/scripts/.server.log
+apps/engine/scripts/.last_run.json
+apps/engine/.langgraph_api/

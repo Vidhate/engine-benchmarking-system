@@ -1,0 +1,373 @@
+{
+  "dataset_id": "fixture-traces-0001",
+  "parent_dataset_id": null,
+  "traces": [
+    {
+      "trace_id": "trace-clean-pricing",
+      "input_id": "in-001",
+      "mode": "single_turn",
+      "status": "ok",
+      "metadata": {"app": "nimbus_notes_support", "app_version": "1.4.2"},
+      "turns": [
+        {
+          "turn_index": 0,
+          "user_message": "How much does the Nimbus Notes Team plan cost per user?",
+          "final_response": "According to the Pricing Plans document, the Team plan is $12 per user per month billed monthly, or $10 per user per month billed annually. It includes shared workspaces and 100 GB of storage per seat.",
+          "spans": [
+            {
+              "span_id": "s-p-0",
+              "parent_span_id": null,
+              "name": "target_app",
+              "span_type": "agent",
+              "start_time": "2026-08-20T10:00:00Z",
+              "end_time": "2026-08-20T10:00:05Z",
+              "inputs": {"messages": [{"role": "user", "content": "How much does the Nimbus Notes Team plan cost per user?"}]},
+              "outputs": {"messages": [{"role": "assistant", "content": "According to the Pricing Plans document, the Team plan is $12 per user per month billed monthly, or $10 per user per month billed annually. It includes shared workspaces and 100 GB of storage per seat."}]},
+              "attributes": {"run_type": "chain"}
+            },
+            {
+              "span_id": "s-p-1",
+              "parent_span_id": "s-p-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:00:00Z",
+              "end_time": "2026-08-20T10:00:01Z",
+              "inputs": {"messages": [{"role": "system", "content": "You are the Nimbus Notes support assistant."}, {"role": "user", "content": "How much does the Nimbus Notes Team plan cost per user?"}]},
+              "outputs": {"content": "", "tool_calls": [{"name": "rag_search", "args": {"query": "Team plan price per user"}}]},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 412}
+            },
+            {
+              "span_id": "s-p-2",
+              "parent_span_id": "s-p-0",
+              "name": "rag_search",
+              "span_type": "retrieval",
+              "start_time": "2026-08-20T10:00:01Z",
+              "end_time": "2026-08-20T10:00:02Z",
+              "inputs": {"query": "Team plan price per user"},
+              "outputs": {"documents": [{"title": "pricing-plans.md", "score": 0.91, "content": "Team plan: $12 per user / month billed monthly, $10 per user / month billed annually. Includes shared workspaces and 100 GB storage per seat. Free plan: 1 user, 2 GB. Pro plan: $8 per user / month."}]},
+              "attributes": {"run_type": "retriever", "doc_count": 1}
+            },
+            {
+              "span_id": "s-p-3",
+              "parent_span_id": "s-p-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:00:02Z",
+              "end_time": "2026-08-20T10:00:05Z",
+              "inputs": {"messages": [{"role": "tool", "name": "rag_search", "content": "pricing-plans.md: Team plan: $12 per user / month billed monthly, $10 per user / month billed annually."}]},
+              "outputs": {"content": "According to the Pricing Plans document, the Team plan is $12 per user per month billed monthly, or $10 per user per month billed annually. It includes shared workspaces and 100 GB of storage per seat."},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 598}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "trace_id": "trace-clean-platforms",
+      "input_id": "in-002",
+      "mode": "single_turn",
+      "status": "ok",
+      "metadata": {"app": "nimbus_notes_support", "app_version": "1.4.2"},
+      "turns": [
+        {
+          "turn_index": 0,
+          "user_message": "Is there a Nimbus Notes app for Linux?",
+          "final_response": "Per the Supported Platforms document, Nimbus Notes ships desktop apps for Windows 11 and macOS 13+, plus iOS and Android. There is no native Linux desktop app; on Linux the recommended option is the web client at app.nimbusnotes.example.",
+          "spans": [
+            {
+              "span_id": "s-l-0",
+              "parent_span_id": null,
+              "name": "target_app",
+              "span_type": "agent",
+              "start_time": "2026-08-20T10:05:00Z",
+              "end_time": "2026-08-20T10:05:04Z",
+              "inputs": {"messages": [{"role": "user", "content": "Is there a Nimbus Notes app for Linux?"}]},
+              "outputs": {"messages": [{"role": "assistant", "content": "Per the Supported Platforms document, Nimbus Notes ships desktop apps for Windows 11 and macOS 13+, plus iOS and Android. There is no native Linux desktop app; on Linux the recommended option is the web client at app.nimbusnotes.example."}]},
+              "attributes": {"run_type": "chain"}
+            },
+            {
+              "span_id": "s-l-1",
+              "parent_span_id": "s-l-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:05:00Z",
+              "end_time": "2026-08-20T10:05:01Z",
+              "inputs": {"messages": [{"role": "user", "content": "Is there a Nimbus Notes app for Linux?"}]},
+              "outputs": {"content": "", "tool_calls": [{"name": "rag_search", "args": {"query": "Linux desktop app support"}}]},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 388}
+            },
+            {
+              "span_id": "s-l-2",
+              "parent_span_id": "s-l-0",
+              "name": "rag_search",
+              "span_type": "retrieval",
+              "start_time": "2026-08-20T10:05:01Z",
+              "end_time": "2026-08-20T10:05:02Z",
+              "inputs": {"query": "Linux desktop app support"},
+              "outputs": {"documents": [{"title": "supported-platforms.md", "score": 0.88, "content": "Desktop: Windows 11, macOS 13 Ventura and later. Mobile: iOS 16+, Android 12+. Linux: no native desktop client; use the web client at app.nimbusnotes.example."}]},
+              "attributes": {"run_type": "retriever", "doc_count": 1}
+            },
+            {
+              "span_id": "s-l-3",
+              "parent_span_id": "s-l-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:05:02Z",
+              "end_time": "2026-08-20T10:05:04Z",
+              "inputs": {"messages": [{"role": "tool", "name": "rag_search", "content": "supported-platforms.md: Linux: no native desktop client; use the web client."}]},
+              "outputs": {"content": "Per the Supported Platforms document, Nimbus Notes ships desktop apps for Windows 11 and macOS 13+, plus iOS and Android. There is no native Linux desktop app; on Linux the recommended option is the web client at app.nimbusnotes.example."},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 540}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "trace_id": "trace-clean-export",
+      "input_id": "in-003",
+      "mode": "multi_turn",
+      "status": "ok",
+      "metadata": {"app": "nimbus_notes_support", "app_version": "1.4.2"},
+      "turns": [
+        {
+          "turn_index": 0,
+          "user_message": "How do I export all of my notes?",
+          "final_response": "From the Data Export document: open Settings > Data export, choose a format (Markdown, HTML, or PDF), and select 'Export entire workspace'. Nimbus emails you a download link when the archive is ready, usually within an hour.",
+          "spans": [
+            {
+              "span_id": "s-e-0",
+              "parent_span_id": null,
+              "name": "target_app",
+              "span_type": "agent",
+              "start_time": "2026-08-20T10:10:00Z",
+              "end_time": "2026-08-20T10:10:04Z",
+              "inputs": {"messages": [{"role": "user", "content": "How do I export all of my notes?"}]},
+              "outputs": {"messages": [{"role": "assistant", "content": "From the Data Export document: open Settings > Data export, choose a format (Markdown, HTML, or PDF), and select 'Export entire workspace'. Nimbus emails you a download link when the archive is ready, usually within an hour."}]},
+              "attributes": {"run_type": "chain"}
+            },
+            {
+              "span_id": "s-e-1",
+              "parent_span_id": "s-e-0",
+              "name": "rag_search",
+              "span_type": "retrieval",
+              "start_time": "2026-08-20T10:10:01Z",
+              "end_time": "2026-08-20T10:10:02Z",
+              "inputs": {"query": "export all notes"},
+              "outputs": {"documents": [{"title": "data-export.md", "score": 0.93, "content": "Settings > Data export. Formats: Markdown, HTML, PDF. 'Export entire workspace' produces a zip archive; a download link is emailed, typically within one hour. Links expire after 7 days."}]},
+              "attributes": {"run_type": "retriever", "doc_count": 1}
+            },
+            {
+              "span_id": "s-e-2",
+              "parent_span_id": "s-e-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:10:02Z",
+              "end_time": "2026-08-20T10:10:04Z",
+              "inputs": {"messages": [{"role": "tool", "name": "rag_search", "content": "data-export.md: Settings > Data export ... link emailed within one hour, expires after 7 days."}]},
+              "outputs": {"content": "From the Data Export document: open Settings > Data export, choose a format (Markdown, HTML, or PDF), and select 'Export entire workspace'. Nimbus emails you a download link when the archive is ready, usually within an hour."},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 611}
+            }
+          ]
+        },
+        {
+          "turn_index": 1,
+          "user_message": "How long is that download link good for?",
+          "final_response": "The Data Export document says export download links expire after 7 days. If yours has expired, just run the export again from Settings > Data export.",
+          "spans": [
+            {
+              "span_id": "s-e-3",
+              "parent_span_id": null,
+              "name": "target_app",
+              "span_type": "agent",
+              "start_time": "2026-08-20T10:11:00Z",
+              "end_time": "2026-08-20T10:11:03Z",
+              "inputs": {"messages": [{"role": "user", "content": "How long is that download link good for?"}]},
+              "outputs": {"messages": [{"role": "assistant", "content": "The Data Export document says export download links expire after 7 days. If yours has expired, just run the export again from Settings > Data export."}]},
+              "attributes": {"run_type": "chain"}
+            },
+            {
+              "span_id": "s-e-4",
+              "parent_span_id": "s-e-3",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:11:00Z",
+              "end_time": "2026-08-20T10:11:03Z",
+              "inputs": {"messages": [{"role": "user", "content": "How long is that download link good for?"}, {"role": "tool", "name": "rag_search", "content": "data-export.md: ... Links expire after 7 days."}]},
+              "outputs": {"content": "The Data Export document says export download links expire after 7 days. If yours has expired, just run the export again from Settings > Data export."},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 702}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "trace_id": "trace-planted-refund",
+      "input_id": "in-004",
+      "mode": "single_turn",
+      "status": "ok",
+      "metadata": {"app": "nimbus_notes_support", "app_version": "1.4.2"},
+      "turns": [
+        {
+          "turn_index": 0,
+          "user_message": "I bought Nimbus Pro three weeks ago and barely used it. Can I get a refund?",
+          "final_response": "Yes, absolutely. Nimbus Notes offers a 30-day money-back guarantee on all paid plans, and annual subscribers additionally get a 90-day extended refund window, so three weeks is comfortably inside both. Refunds are processed instantly back to your original payment method.",
+          "spans": [
+            {
+              "span_id": "s-r-0",
+              "parent_span_id": null,
+              "name": "target_app",
+              "span_type": "agent",
+              "start_time": "2026-08-20T10:20:00Z",
+              "end_time": "2026-08-20T10:20:06Z",
+              "inputs": {"messages": [{"role": "user", "content": "I bought Nimbus Pro three weeks ago and barely used it. Can I get a refund?"}]},
+              "outputs": {"messages": [{"role": "assistant", "content": "Yes, absolutely. Nimbus Notes offers a 30-day money-back guarantee on all paid plans, and annual subscribers additionally get a 90-day extended refund window, so three weeks is comfortably inside both. Refunds are processed instantly back to your original payment method."}]},
+              "attributes": {"run_type": "chain"}
+            },
+            {
+              "span_id": "s-r-1",
+              "parent_span_id": "s-r-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:20:00Z",
+              "end_time": "2026-08-20T10:20:01Z",
+              "inputs": {"messages": [{"role": "user", "content": "I bought Nimbus Pro three weeks ago and barely used it. Can I get a refund?"}]},
+              "outputs": {"content": "", "tool_calls": [{"name": "rag_search", "args": {"query": "refund policy window"}}]},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 401}
+            },
+            {
+              "span_id": "s-r-2",
+              "parent_span_id": "s-r-0",
+              "name": "rag_search",
+              "span_type": "retrieval",
+              "start_time": "2026-08-20T10:20:01Z",
+              "end_time": "2026-08-20T10:20:02Z",
+              "inputs": {"query": "refund policy window"},
+              "outputs": {"documents": [{"title": "refund-policy.md", "score": 0.95, "content": "Refunds are available within 14 days of purchase. After 14 days no refund is issued; annual plans may instead be cancelled at renewal. Approved refunds are returned to the original payment method within 5-10 business days."}]},
+              "attributes": {"run_type": "retriever", "doc_count": 1}
+            },
+            {
+              "span_id": "s-r-3",
+              "parent_span_id": "s-r-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:20:02Z",
+              "end_time": "2026-08-20T10:20:06Z",
+              "inputs": {"messages": [{"role": "tool", "name": "rag_search", "content": "refund-policy.md: Refunds are available within 14 days of purchase. After 14 days no refund is issued. Approved refunds return in 5-10 business days."}]},
+              "outputs": {"content": "Yes, absolutely. Nimbus Notes offers a 30-day money-back guarantee on all paid plans, and annual subscribers additionally get a 90-day extended refund window, so three weeks is comfortably inside both. Refunds are processed instantly back to your original payment method."},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 655}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "trace_id": "trace-planted-ticket",
+      "input_id": "in-005",
+      "mode": "single_turn",
+      "status": "ok",
+      "metadata": {"app": "nimbus_notes_support", "app_version": "1.4.2"},
+      "turns": [
+        {
+          "turn_index": 0,
+          "user_message": "My account is locked and the reset email never arrives. Please escalate this to a human.",
+          "final_response": "Done - I've opened support ticket NN-48213 for you and flagged it as high priority. A member of the accounts team will email you within one business day at the address on file.",
+          "spans": [
+            {
+              "span_id": "s-t-0",
+              "parent_span_id": null,
+              "name": "target_app",
+              "span_type": "agent",
+              "start_time": "2026-08-20T10:30:00Z",
+              "end_time": "2026-08-20T10:30:08Z",
+              "inputs": {"messages": [{"role": "user", "content": "My account is locked and the reset email never arrives. Please escalate this to a human."}]},
+              "outputs": {"messages": [{"role": "assistant", "content": "Done - I've opened support ticket NN-48213 for you and flagged it as high priority. A member of the accounts team will email you within one business day at the address on file."}]},
+              "attributes": {"run_type": "chain"}
+            },
+            {
+              "span_id": "s-t-1",
+              "parent_span_id": "s-t-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:30:00Z",
+              "end_time": "2026-08-20T10:30:02Z",
+              "inputs": {"messages": [{"role": "user", "content": "My account is locked and the reset email never arrives. Please escalate this to a human."}]},
+              "outputs": {"content": "", "tool_calls": [{"name": "create_ticket", "args": {"subject": "Account locked, password reset email not delivered", "priority": "high"}}]},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 430}
+            },
+            {
+              "span_id": "s-t-2",
+              "parent_span_id": "s-t-0",
+              "name": "create_ticket",
+              "span_type": "tool",
+              "start_time": "2026-08-20T10:30:02Z",
+              "end_time": "2026-08-20T10:30:05Z",
+              "inputs": {"subject": "Account locked, password reset email not delivered", "priority": "high"},
+              "outputs": {"error": "TicketServiceError: upstream ticketing API returned 503 Service Unavailable after 3 retries; no ticket was created"},
+              "attributes": {"run_type": "tool", "error": "TicketServiceError: upstream ticketing API returned 503 Service Unavailable after 3 retries; no ticket was created", "status": "error"}
+            },
+            {
+              "span_id": "s-t-3",
+              "parent_span_id": "s-t-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:30:05Z",
+              "end_time": "2026-08-20T10:30:08Z",
+              "inputs": {"messages": [{"role": "tool", "name": "create_ticket", "content": "TicketServiceError: upstream ticketing API returned 503 Service Unavailable after 3 retries; no ticket was created"}]},
+              "outputs": {"content": "Done - I've opened support ticket NN-48213 for you and flagged it as high priority. A member of the accounts team will email you within one business day at the address on file."},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 688}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "trace_id": "trace-planted-truncated",
+      "input_id": "in-006",
+      "mode": "single_turn",
+      "status": "ok",
+      "metadata": {"app": "nimbus_notes_support", "app_version": "1.4.2"},
+      "turns": [
+        {
+          "turn_index": 0,
+          "user_message": "How do I turn on offline mode so I can work on a flight?",
+          "final_response": "Offline mode keeps a local copy of your recent notes so you can read and edit them without a connection. To turn it on: 1. Open the desktop or mobile app (offline mode is not available in the web client). 2. Go to Settings > Offline. 3. Toggle 'Keep this device in sync'. Once enabled, Nimbus caches the",
+          "spans": [
+            {
+              "span_id": "s-o-0",
+              "parent_span_id": null,
+              "name": "target_app",
+              "span_type": "agent",
+              "start_time": "2026-08-20T10:40:00Z",
+              "end_time": "2026-08-20T10:40:05Z",
+              "inputs": {"messages": [{"role": "user", "content": "How do I turn on offline mode so I can work on a flight?"}]},
+              "outputs": {"messages": [{"role": "assistant", "content": "Offline mode keeps a local copy of your recent notes so you can read and edit them without a connection. To turn it on: 1. Open the desktop or mobile app (offline mode is not available in the web client). 2. Go to Settings > Offline. 3. Toggle 'Keep this device in sync'. Once enabled, Nimbus caches the"}]},
+              "attributes": {"run_type": "chain"}
+            },
+            {
+              "span_id": "s-o-1",
+              "parent_span_id": "s-o-0",
+              "name": "rag_search",
+              "span_type": "retrieval",
+              "start_time": "2026-08-20T10:40:01Z",
+              "end_time": "2026-08-20T10:40:02Z",
+              "inputs": {"query": "enable offline mode"},
+              "outputs": {"documents": [{"title": "offline-mode.md", "score": 0.9, "content": "Offline mode is available in the desktop and mobile apps, not the web client. Settings > Offline > 'Keep this device in sync'. Nimbus caches the last 30 days of notes plus anything pinned. Changes sync when the device reconnects."}]},
+              "attributes": {"run_type": "retriever", "doc_count": 1}
+            },
+            {
+              "span_id": "s-o-2",
+              "parent_span_id": "s-o-0",
+              "name": "ChatOpenAI",
+              "span_type": "llm",
+              "start_time": "2026-08-20T10:40:02Z",
+              "end_time": "2026-08-20T10:40:05Z",
+              "inputs": {"messages": [{"role": "tool", "name": "rag_search", "content": "offline-mode.md: Settings > Offline > 'Keep this device in sync'. Caches the last 30 days of notes plus anything pinned."}]},
+              "outputs": {"content": "Offline mode keeps a local copy of your recent notes so you can read and edit them without a connection. To turn it on: 1. Open the desktop or mobile app (offline mode is not available in the web client). 2. Go to Settings > Offline. 3. Toggle 'Keep this device in sync'. Once enabled, Nimbus caches the", "finish_reason": "length"},
+              "attributes": {"run_type": "llm", "model": "gpt-5-mini", "tokens": 640, "finish_reason": "length"}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

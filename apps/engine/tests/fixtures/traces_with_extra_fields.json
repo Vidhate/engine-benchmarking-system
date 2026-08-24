@@ -1,0 +1,41 @@
+{
+  "dataset_id": "fixture-extra-0001",
+  "parent_dataset_id": "fixture-traces-0001",
+  "leftover_dataset_field": "should be ignored",
+  "traces": [
+    {
+      "trace_id": "trace-extra-1",
+      "input_id": "in-x1",
+      "mode": "single_turn",
+      "status": "ok",
+      "metadata": {"app": "nimbus_notes_support", "provenance": {"dim_id": "d1"}},
+      "ablation_ids": ["abl-001", "abl-002"],
+      "injection_mode": "replay_edit",
+      "ablation_record": {"ablation_id": "abl-001", "error_id": "ek-007", "mode": "dependency_fault"},
+      "split": "ablate",
+      "turns": [
+        {
+          "turn_index": 0,
+          "user_message": "Does Nimbus Notes support two-factor authentication?",
+          "final_response": "Yes — Settings > Security > Two-factor authentication, using an authenticator app or SMS.",
+          "ablation_ids": ["abl-001"],
+          "spans": [
+            {
+              "span_id": "s-x-0",
+              "parent_span_id": null,
+              "name": "target_app",
+              "span_type": "agent",
+              "start_time": "2026-08-20T11:00:00Z",
+              "end_time": "2026-08-20T11:00:03Z",
+              "inputs": {"messages": [{"role": "user", "content": "Does Nimbus Notes support two-factor authentication?"}]},
+              "outputs": {"messages": [{"role": "assistant", "content": "Yes — Settings > Security > Two-factor authentication, using an authenticator app or SMS."}]},
+              "attributes": {"run_type": "chain"},
+              "ablation_id": "abl-001",
+              "injected": true
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
