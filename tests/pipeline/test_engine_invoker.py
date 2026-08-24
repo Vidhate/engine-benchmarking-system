@@ -66,8 +66,13 @@ class FakeClient:
         )
         return self.output
 
+    #: What the SERVER says it ran. Deliberately NOT derived from what `wait`
+    #: was sent: a readback that echoes the request proves nothing, and the
+    #: failure this guard exists for is exactly a request the server ignored.
+    recorded = [{"kwargs": {"config": {"configurable": {"model": "server-side-model"}}}}]
+
     def list(self, thread_id):
-        return [{"kwargs": {"config": {"configurable": {"model": "gpt-5.1-mini"}}}}]
+        return self.recorded
 
 
 @pytest.fixture
@@ -188,20 +193,46 @@ def test_the_seed_board_is_sent_without_injection_mode(trace_file):
     assert payload["issues"][0]["error_id"] == "S1"
 
 
-def test_the_server_side_model_readback_is_recorded(trace_file):
+def test_the_readback_reports_the_server_not_the_request(trace_file):
     """Trusting the request we sent proves nothing — LangGraph can drop a
-    config silently (apps/engine/README.md footgun)."""
-    assert invoke(FakeClient(), trace_file).recorded_models == ["gpt-5.1-mini"]
+    config silently (apps/engine/README.md footgun). The fake's run records are
+    fixed and unrelated to what `wait` received, so a readback that merely
+    echoed the request would fail this."""
+    result = invoke(
+        FakeClient(), trace_file, engine=EngineStageConfig(model="what-we-asked-for")
+    )
+    assert result.recorded_models == ["server-side-model"]
 
 
-def test_a_readback_failure_does_not_fail_the_run(trace_file):
+def test_an_unreadable_run_record_is_None_not_empty(trace_file):
+    """Absent evidence and evidence-of-absence are different answers, and the
+    caller acts differently on them — so they must not share a value."""
+
     class NoList(FakeClient):
         def list(self, thread_id):
             raise RuntimeError("no runs endpoint")
 
     result = invoke(NoList(), trace_file)
-    assert result.recorded_models == []
+    assert result.recorded_models is None
     assert result.board.issues
+
+
+def test_records_without_the_model_key_read_back_as_empty(trace_file):
+    """THE silent-config-drop signature: the server persisted the run, and the
+    model key is simply not in the config it kept. Readable, and empty."""
+
+    class Dropped(FakeClient):
+        recorded = [{"kwargs": {"config": {"configurable": {"analysis_concurrency": 8}}}}]
+
+    result = invoke(Dropped(), trace_file)
+    assert result.recorded_models == []
+
+
+def test_a_thread_with_no_runs_at_all_also_reads_back_as_empty(trace_file):
+    class NoRuns(FakeClient):
+        recorded: list = []
+
+    assert invoke(NoRuns(), trace_file).recorded_models == []
 
 
 def test_a_missing_export_file_is_caught_before_the_run(tmp_path):
@@ -301,3 +332,27 @@ def test_the_refused_board_still_carries_its_payload(trace_file):
     with pytest.raises(EngineRunFailed) as caught:
         invoke(FakeClient(output=payload), trace_file)
     assert caught.value.raw_output == payload
+
+
+def test_duplicate_error_ids_are_refused_at_ingest(trace_file):
+    """`error_id` is a key downstream, not a label: the seed-delta logic groups
+    by it, the exact-key matcher resolves through it, and two issues sharing one
+    would be silently conflated wherever it is used."""
+    payload = {**BOARD, "issues": [BOARD["issues"][0], {**BOARD["issues"][0], "title": "again"}]}
+    with pytest.raises(EngineRunFailed, match="duplicate error_id"):
+        invoke(FakeClient(output=payload), trace_file)
+
+
+def test_the_duplicate_id_failure_names_the_offenders(trace_file):
+    payload = {**BOARD, "issues": [BOARD["issues"][0], BOARD["issues"][0]]}
+    with pytest.raises(EngineRunFailed, match="P1") as caught:
+        invoke(FakeClient(output=payload), trace_file)
+    assert caught.value.raw_output == payload
+
+
+def test_distinct_error_ids_pass(trace_file):
+    payload = {
+        **BOARD,
+        "issues": [BOARD["issues"][0], {**BOARD["issues"][0], "error_id": "P2"}],
+    }
+    assert len(invoke(FakeClient(output=payload), trace_file).board.issues) == 2

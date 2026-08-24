@@ -160,6 +160,14 @@ def slice_inputs(inputs: InputDataset, cfg: PipelineConfig) -> InputDataset:
     sees it — expansion belongs to `benchmark/generation/`, and slicing is a
     pipeline-layer concern. The expansions are cached on disk, so only the first
     run pays for the cells it then discards.
+
+    Ordering caveat: `max_inputs` is applied AFTER `max_inputs_per_mode`, and it
+    takes the first N by sorted `input_id` across whatever the per-mode sample
+    left. Because `input_id` is a content hash, that cut is effectively
+    arbitrary with respect to mode — a `max_inputs` small enough to bite can
+    therefore undo the per-mode balance the sample just established. Set one or
+    the other when the mode mix matters; `configs/pipeline/full.yaml` uses only
+    the per-mode caps for exactly this reason.
     """
     specs = list(inputs.inputs)
     if cfg.input_modes:
@@ -182,9 +190,10 @@ def slice_inputs(inputs: InputDataset, cfg: PipelineConfig) -> InputDataset:
         specs = sorted(specs, key=lambda s: s.input_id)[: cfg.max_inputs]
     if not specs:
         raise ValueError(
-            f"the slice (input_modes={cfg.input_modes}, max_inputs={cfg.max_inputs}) left "
-            f"none of the {len(inputs.inputs)} generated input(s) — a benchmark over zero "
-            f"inputs would run to completion and report nothing"
+            f"the slice (input_modes={cfg.input_modes}, "
+            f"max_inputs_per_mode={cfg.max_inputs_per_mode}, max_inputs={cfg.max_inputs}) "
+            f"left none of the {len(inputs.inputs)} generated input(s) — a benchmark over "
+            f"zero inputs would run to completion and report nothing"
         )
     if len(specs) == len(inputs.inputs):
         return inputs
@@ -440,18 +449,31 @@ def run_pipeline(
     # Comparison integrity: what the SERVER recorded, not what we sent. A run
     # config LangGraph declined to inject looks exactly like a successful one.
     requested = cfg.engine.model
-    recorded = set(invocation.recorded_models)
-    if recorded and recorded != {requested}:
-        raise EngineModelMismatch(
-            f"the run asked for model {requested!r} but the server recorded "
-            f"{sorted(recorded)} — the model config did not take effect, and two arms of "
-            f"a comparison would silently be the same model"
-        )
-    if not recorded:
+    if invocation.recorded_models is None:
+        # Unreadable records: a server/SDK capability gap, not evidence of a
+        # swap. The run stands, but the report must not claim a confirmation
+        # it does not have.
         warnings.append(
-            f"the server kept no readable record of the run's model, so {requested!r} is "
-            f"what was requested, not what is confirmed to have run"
+            f"the server's run records could not be read, so {requested!r} is what was "
+            f"requested, not what is confirmed to have run"
         )
+    else:
+        recorded = set(invocation.recorded_models)
+        if not recorded:
+            raise EngineModelMismatch(
+                f"the server's run records are readable and none of them carries the "
+                f"{engine_app.model_configurable_key!r} key, so the run asked for "
+                f"{requested!r} and the server recorded no model at all. That is the "
+                f"signature of a `configurable` entry LangGraph declined to inject: the "
+                f"Engine fell back to its own default, and a model comparison built on "
+                f"this would be two arms of the same model."
+            )
+        if recorded != {requested}:
+            raise EngineModelMismatch(
+                f"the run asked for model {requested!r} but the server recorded "
+                f"{sorted(recorded)} — the model config did not take effect, and two arms "
+                f"of a comparison would silently be the same model"
+            )
 
     stage_objects = {
         "ablation": ablation_stage,
@@ -531,7 +553,13 @@ def run_pipeline(
         },
         models={
             "engine": cfg.engine.model,
-            "engine_recorded": ",".join(invocation.recorded_models),
+            # "unreadable" rather than "" so the manifest distinguishes a
+            # readback that could not happen from one that came back empty.
+            "engine_recorded": (
+                "unreadable"
+                if invocation.recorded_models is None
+                else ",".join(invocation.recorded_models)
+            ),
         },
         counts={
             "inputs": len(inputs.inputs),
@@ -564,8 +592,10 @@ def run_pipeline(
         warnings=warnings,
     )
 
+    # The SCORED board, not the verbatim one: the prose describes the numbers,
+    # and the numbers describe the Engine's delta.
     markdown = render_markdown(
-        report, ground_truth=ground_truth, predicted=predicted, manifest=manifest
+        report, ground_truth=ground_truth, scored_board=scored.board, manifest=manifest
     )
     artifacts.write_text("summary", markdown)
 

@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -124,20 +125,30 @@ class LangGraphEngineInvoker:
             )
         return self._client
 
-    def recorded_models(self, thread_id: str) -> list[str]:
+    def recorded_models(self, thread_id: str) -> list[str] | None:
         """Which model the SERVER recorded for each run on this thread.
 
         Read back rather than assumed: LangGraph silently declines to inject a
         run config whose node annotation it does not recognise, and the symptom
         is both arms of a model comparison quietly running the same model.
-        Best-effort — a missing readback endpoint does not fail the run.
+
+        Three outcomes, and the caller acts differently on each, so they must
+        not share a value:
+
+        * `None` — the run records could not be read at all. Absent evidence:
+          a server or SDK capability gap, and no reason to doubt the run.
+        * `[]` — the records ARE readable and none of them carries the model
+          key. That is not absent evidence, it is evidence of absence: the
+          exact signature of a `configurable` entry the server declined to
+          accept. The caller treats it as a failure.
+        * a non-empty list — what actually ran.
         """
         models: list[str] = []
         try:
             runs = list(self.client.runs.list(thread_id))
-        except Exception as exc:  # noqa: BLE001 - provenance is best-effort
+        except Exception as exc:  # noqa: BLE001 - unreadable is a capability gap
             log.warning("could not read the run config back: %s: %s", type(exc).__name__, exc)
-            return []
+            return None
         for run in runs:
             record = run if isinstance(run, dict) else getattr(run, "__dict__", {})
             config = (record.get("kwargs") or {}).get("config") or record.get("config") or {}
@@ -220,6 +231,22 @@ class LangGraphEngineInvoker:
             raise EngineRunFailed(
                 f"engine returned a board with source={parsed.source!r}, expected "
                 f"'engine_predicted'",
+                raw_output=result,
+            )
+        # `error_id` is a key, not a label. The seed-delta transform groups by
+        # it, the exact-key matcher resolves through it, and occurrences point
+        # at it — two issues sharing one would be silently conflated at every
+        # one of those points, most visibly by appearing twice in the carrier
+        # list. Checked at ingest, where the raw payload is still to hand.
+        # (`benchmark/schemas` deliberately stays permissive: it models the
+        # shape, and this is a property of one producer's output.)
+        counts = Counter(i.error_id for i in parsed.issues)
+        duplicates = sorted(error_id for error_id, n in counts.items() if n > 1)
+        if duplicates:
+            raise EngineRunFailed(
+                f"engine returned duplicate error_id(s) {duplicates} on one board — "
+                f"error_id is the key occurrences and the matcher resolve through, so "
+                f"two issues sharing one cannot be told apart downstream",
                 raw_output=result,
             )
 

@@ -26,14 +26,24 @@ SEVERITIES = ("low", "medium", "high")
 
 
 def severity_confusion(
-    matches: list[ErrorMatch], gt: Issueboard, pred: Issueboard
+    matches: list[ErrorMatch],
+    gt: Issueboard,
+    pred: Issueboard,
+    exclude: set[str] | None = None,
 ) -> Counter[tuple[str, str]]:
-    """(ground-truth severity, predicted severity) counts over matched pairs."""
+    """(ground-truth severity, predicted severity) counts over matched pairs.
+
+    `exclude` drops predicted issues whose severity is not the Engine's to be
+    graded on — the seed carriers. It has to be the same set `score_severity`
+    was given, or this table and the `severity_loss` printed above it describe
+    different populations, and the report contradicts itself.
+    """
+    exclude = exclude or set()
     gt_by_id = {i.error_id: i for i in gt.issues}
     pred_by_id = {i.error_id: i for i in pred.issues}
     counts: Counter[tuple[str, str]] = Counter()
     for match in matches:
-        if match.matched_error_id is None:
+        if match.matched_error_id is None or match.predicted_error_id in exclude:
             continue
         gt_issue = gt_by_id.get(match.matched_error_id)
         pred_issue = pred_by_id.get(match.predicted_error_id)
@@ -64,11 +74,21 @@ def render_markdown(
     report: BenchmarkReport,
     *,
     ground_truth: Issueboard,
-    predicted: Issueboard,
+    scored_board: Issueboard,
     manifest: RunManifest | None = None,
 ) -> str:
+    """Render the report.
+
+    `scored_board` is the board the numbers describe — the Engine's delta over
+    the seed, restricted to the real trace universe — NOT the verbatim updated
+    board. Everything here that counts or looks up a prediction reads from it,
+    so the prose cannot disagree with the JSON beside it.
+    """
     run_id = manifest.run_id if manifest else "benchmark run"
     model = report.engine_config.model
+    # The same exclusions `score_engine_delta` applied, read back off the
+    # report rather than recomputed, so the two cannot drift.
+    carriers = set((report.base_rates.get("engine_delta") or {}).get("carrier_error_ids") or [])
     lines: list[str] = [f"# Benchmark report — {run_id}", ""]
 
     lines.append(f"**Engine model**: `{model}`  ")
@@ -240,7 +260,7 @@ def render_markdown(
     lines.append("")
     lines.append("### Severity confusion (matched pairs)")
     lines.append("")
-    confusion = severity_confusion(report.matches, ground_truth, predicted)
+    confusion = severity_confusion(report.matches, ground_truth, scored_board, exclude=carriers)
     if confusion:
         header = ["ground truth \\ predicted", *SEVERITIES]
         rows = [
@@ -297,8 +317,11 @@ def render_markdown(
         "counted against precision."
     )
     lines.append("")
-    pred_by_id = {i.error_id: i for i in predicted.issues}
-    occurrences_by_error: Counter[str] = Counter(o.error_id for o in predicted.occurrences)
+    pred_by_id = {i.error_id: i for i in scored_board.issues}
+    # Post-intersection: an occurrence against a trace that does not exist was
+    # dropped before scoring, and counting it here would describe a prediction
+    # the numbers never saw.
+    occurrences_by_error: Counter[str] = Counter(o.error_id for o in scored_board.occurrences)
     lines += _table(
         ["predicted id", "title", "category", "severity", "occurrences", "description"],
         [

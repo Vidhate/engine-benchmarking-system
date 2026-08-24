@@ -117,15 +117,20 @@ def prepare_scored_board(
     contributed = {o.error_id for o in delta_occurrences}
 
     kept_issues = []
-    dropped_seed_issues = []
-    carriers = []
+    dropped_seed_issues: list[str] = []
+    carriers: list[str] = []
     for item in predicted.issues:
         if item.error_id not in seed_issue_ids:
             kept_issues.append(item)
         elif item.error_id in contributed:
             kept_issues.append(item)
-            carriers.append(item.error_id)
-        else:
+            # Guarded rather than assumed unique: the Engine's board is checked
+            # for duplicate error_ids at ingest, but this function is reachable
+            # from `rescore_from_disk` over an artifact somebody may have
+            # edited, and a doubled carrier would silently double-exclude.
+            if item.error_id not in carriers:
+                carriers.append(item.error_id)
+        elif item.error_id not in dropped_seed_issues:
             dropped_seed_issues.append(item.error_id)
 
     board = stamp_dataset_id(

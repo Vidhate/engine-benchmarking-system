@@ -183,7 +183,10 @@ class EngineInvocation:
     raw_output: dict[str, Any] = field(default_factory=dict)
     seconds: float = 0.0
     thread_id: str = ""
-    recorded_models: list[str] = field(default_factory=list)
+    #: What the SERVER recorded. `None` = the run records were unreadable
+    #: (absent evidence); `[]` = readable but carrying no model key (evidence
+    #: the config was dropped). See LangGraphEngineInvoker.recorded_models.
+    recorded_models: list[str] | None = field(default_factory=list)
     trace_count: int = 0
 
 
