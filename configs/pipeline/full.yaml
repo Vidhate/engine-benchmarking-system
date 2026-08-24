@@ -1,0 +1,58 @@
+# full — the assignment-scale benchmark run (>=300 traces).
+#
+# MANUALLY RUN, NEVER IN CI. It spends a few hours of real model time across
+# three LLM-driven stages (input expansion, the target-app batch, the Engine
+# pass) and drives two live LangGraph servers.
+#
+#     uv run python -m benchmark.pipeline run --config configs/pipeline/full.yaml
+#
+# configs/generation/v0.yaml is sized for the assignment's >=300 single-turn
+# inputs, so no slicing here: `max_inputs` is unset on purpose.
+run_id: full
+generation_config: configs/generation/v0.yaml
+taxonomy: configs/taxonomy.yaml
+target_app_config: configs/target_app.yaml
+engine_app_config: configs/engine.yaml
+seed_issueboard: null
+artifacts_root: data/pipeline
+expansion_cache: data/expansion_cache
+
+# No max_inputs / input_modes: the whole generated grid runs.
+
+harness:
+  # The target app is a two-tool react agent on a small model; 8 concurrent
+  # conversations keeps it busy without tripping provider rate limits.
+  concurrency: 8
+
+ablation:
+  seed: 20260824
+  control_fraction: 0.3
+  min_eligible: 5
+  n_per_category: 2
+
+engine:
+  model: gpt-5.1-mini
+  # RULED full-scale setting. A 300-trace run costs ceil(n/N) batches, and a
+  # batch costs its slowest trace: N=8 projects to ~35 min, N=16 to ~21 min
+  # (apps/engine/README.md, "Analysis concurrency"). 16 is the clamp ceiling.
+  analysis_concurrency: 16
+  # MUST be passed explicitly: the server default of 25 caps a run at ~23
+  # traces, and the failure mode is a recursion error mid-corpus.
+  recursion_limit: 10000
+
+scoring:
+  severity_alpha: 0.5
+  description_mode: similarity
+  text_fallback_threshold: 0.5
+
+deliverables:
+  # The assignment's own number.
+  min_traces: 300
+
+servers:
+  target_app:
+    script: apps/target_app/scripts/serve.sh
+    label: "target app (:2024)"
+  engine:
+    script: apps/engine/scripts/serve.sh
+    label: "engine (:2025)"

@@ -1,0 +1,70 @@
+# mini — the miniature end-to-end benchmark run (Phase 7).
+#
+# Same code path as full.yaml, three orders of magnitude smaller: it exists so
+# every integration seam (generation -> harness -> ablation -> Engine ->
+# scoring -> report) can be exercised in minutes rather than an afternoon.
+#
+# Used by:
+#   * tests/pipeline/test_integration_mini.py — with fake harness / fake
+#     ablation / fake Engine invoker: zero network, zero servers, full wiring.
+#   * scripts/pipeline_smoke.py — live, with both real servers and the real
+#     Engine on the mini model (the ablation stage stays faked until Phase 5
+#     merges; see that script's header).
+#
+# configs/generation/mini.yaml yields 7 single-turn + 7 multi-turn inputs;
+# `input_modes` + `max_inputs` slice that to the 7 single-turn ones so the
+# smoke does not spend a persona-simulator conversation per input.
+run_id: mini
+generation_config: configs/generation/mini.yaml
+taxonomy: configs/taxonomy.yaml
+target_app_config: configs/target_app.yaml
+engine_app_config: configs/engine.yaml
+# seed_issueboard: null -> the Engine starts from an empty board. Point this at
+# a JSON Issueboard to exercise the "board in, updated board out" half.
+seed_issueboard: null
+artifacts_root: data/pipeline
+expansion_cache: data/expansion_cache
+
+input_modes: [single_turn]
+max_inputs: 8
+
+harness:
+  concurrency: 4
+
+ablation:
+  seed: 20260824
+  control_fraction: 0.3
+  min_eligible: 2
+  n_per_category: 1
+
+engine:
+  # The mini arm of the comparison axis (benchmark/models.py ENGINE_MODEL_MINI).
+  model: gpt-5.1-mini
+  # Small corpus, so the batch never fills; kept explicit rather than defaulted
+  # because the value is a run-identity fact recorded in the manifest.
+  analysis_concurrency: 8
+  # Always pass this: the LangGraph server's own default of 25 caps a run at
+  # ~23 traces (apps/engine/README.md).
+  recursion_limit: 10000
+
+scoring:
+  severity_alpha: 0.5
+  # "similarity" (TF-IDF), not "judge": the judge is an LLM call per matched
+  # pair and OpenAIDescriptionJudge is still a skeleton. run_pipeline(judge=...)
+  # injects a real one when there is one.
+  description_mode: similarity
+  text_fallback_threshold: 0.5
+
+deliverables:
+  # The miniature's stand-in for the assignment's >=300. Same check, small N.
+  min_traces: 6
+
+# Both apps' own serve scripts, run as subprocesses. The pipeline never imports
+# from apps/ — this path is the entire mechanism.
+servers:
+  target_app:
+    script: apps/target_app/scripts/serve.sh
+    label: "target app (:2024)"
+  engine:
+    script: apps/engine/scripts/serve.sh
+    label: "engine (:2025)"
