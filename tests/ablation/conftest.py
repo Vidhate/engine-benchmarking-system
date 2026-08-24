@@ -262,6 +262,9 @@ class FakeHarness:
         *,
         live_threads: set[str] | None = None,
         self_corrects: bool = False,
+        # Replays 1..N stay clean and only the ones after self-correct. Lets a
+        # test keep the step-3 dry run green while step 4's candidates burn.
+        self_corrects_after: int = 0,
         fault_activates: bool = True,
         replay_fails_for: set[str] | None = None,
     ):
@@ -270,10 +273,14 @@ class FakeHarness:
         self.activation_evidence: dict[str, str] = {}
         self.live_threads = live_threads
         self.self_corrects = self_corrects
+        self.self_corrects_after = self_corrects_after
         self.fault_activates = fault_activates
         self.replay_fails_for = replay_fails_for or set()
         self.replays: list[dict] = []
         self.fault_runs: list[dict] = []
+        # Every liveness probe, in order — a probe is a real round trip to the
+        # LangGraph server, so "was it probed at all" is a testable property.
+        self.boundary_probes: list[str] = []
         self._counter = 0
 
     # -- thread liveness ---------------------------------------------------
@@ -281,6 +288,7 @@ class FakeHarness:
         return self.live_threads is None or thread_id in self.live_threads
 
     def turn_boundaries(self, thread_id: str):
+        self.boundary_probes.append(thread_id)
         if not self._alive(thread_id):
             return []
         return [(f"ckpt-{thread_id}-{i}", f"msg-{thread_id}-{i}", f"answer {i}") for i in range(4)]
@@ -317,9 +325,14 @@ class FakeHarness:
             }
         )
         self._counter += 1
-        trace_id = f"replayed-{self._counter}"
+        # NOT "replayed-N": `make_turn` embeds the trace id in every span id,
+        # and "replayed" is one of the export audit's ground-truth tokens — the
+        # fixture would fail the audit on its own naming rather than on
+        # anything the code under test did. (That it DID fail is the audit
+        # working; see test_the_audit_catches_a_token_inside_a_span_id.)
+        trace_id = f"regen-{self._counter}"
         answer = "Understood — anything else?"
-        if self.self_corrects:
+        if self.self_corrects and self._counter > self.self_corrects_after:
             answer = "Correction: I made an error earlier; that reference does not exist."
         turns = [
             make_turn(
@@ -428,7 +441,8 @@ def make_proposal(
     mode: str = "replay_edit",
     marker: str = MARKER,
     replacement: str = CORRUPT_TEXT,
-    turn_index: int = 0,
+    # None = unpinned, so k is drawn per trace (inject.choose_turn_index).
+    turn_index: int | None = None,
     filter_steps: list | None = None,
     fault: FaultConfig | None = None,
     target_count: int = 3,

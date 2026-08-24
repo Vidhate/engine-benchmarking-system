@@ -31,6 +31,35 @@ references and fabricated specifics absent from the doc store (see
 correction. A retraction means the injection did not survive into `T*`'s
 downstream and the error must be re-planned, not recorded as ground truth.
 
+The check covers *all* regenerated content, not just the tail's final
+responses: each regenerated turn's answer **and** every span output under it,
+because the app can contradict an injected claim inside a retrieval or tool
+span while the answer itself says nothing about it.
+
+### Residual risk of the not-retracted check (accepted for v1)
+
+It is a phrase matcher, so it is neither complete nor free:
+
+* **False negatives it cannot see.** A paraphrased contradiction ("the record
+  I'm looking at shows something different"), a span-level contradiction
+  phrased in none of these words, and *silent supersession* — the app simply
+  answers as if the injected claim was never made — all pass. Consequence: an
+  `E_K` entry survives on a trace that no longer really carries the error.
+  The bias is one-way and benign for scoring: it **understates** Engine's
+  precision, and never invents an error Engine is punished for missing. It is
+  the same direction as the `E_h` bias already documented in
+  `docs/architecture/04-ablation-engine.md` ("precision as a lower bound").
+* **False positives cost real corpus.** A phrase that fires on healthy English
+  burns a validated spec's candidate and can drop an error the corpus could
+  have carried. That is why the unconditional patterns are all first-person
+  and self-referential, and the ambiguous ones ("no such", "does not exist")
+  only count within `ANCHOR_WINDOW` characters of the injected marker's own
+  distinctive terms (see `agent.py`).
+* **It is measured, not guessed.** Every burned candidate is counted per error
+  and reported out as `ApplyOutcome.self_corrected` ->
+  `AblationResult.self_corrected_counts`, so the size of the surface this check
+  consumes is a number in the run report rather than an unknown.
+
 ## Threads are server-lifetime state
 
 Replay forks a thread that must still exist in the LangGraph server's store.
@@ -55,10 +84,16 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import random
+import re
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from benchmark.ablation.agent import DEFAULT_RETRACTION_PATTERNS
+from benchmark.ablation.agent import (
+    ANCHOR_WINDOW,
+    ANCHORED_RETRACTION_PATTERNS,
+    DEFAULT_RETRACTION_PATTERNS,
+)
 from benchmark.harness.ids import session_id_for, trace_id_for
 from benchmark.schemas.ablation import AblationRecord, AblationSpec
 from benchmark.schemas.inputs import InputSpec, Persona
@@ -142,8 +177,70 @@ def assert_threads_alive(traces: Sequence[Trace], harness: Any) -> set[str]:
 # ------------------------------------------------------- turn-k consistency
 
 def _last_llm_span(turn: Turn):
+    """The llm span whose output IS the turn's final response.
+
+    **Assumption**: the last-finishing llm call is the one that produced the
+    answer. That holds for the target app (a `create_react_agent` loop, where
+    tool calls are earlier llm spans and the answer is the final one) and for
+    any agent whose last model call emits the reply. It would NOT hold for an
+    architecture that runs a post-hoc critic/guardrail model after the answer,
+    or that generates the answer and then summarizes it — there the true
+    producing span is the second-to-last. Ordering is by `(end_time, span_id)`,
+    so the span_id tiebreak keeps the choice deterministic when two llm spans
+    share an end time (equal timestamps are common at collector resolution).
+    """
     llm = [s for s in turn.spans if s.span_type == "llm"]
     return max(llm, key=lambda s: (s.end_time, s.span_id)) if llm else None
+
+
+def _root_span(turn: Turn):
+    """The turn's root agent span — the one with no surviving parent.
+
+    Only the ROOT is rewritten for consistency. A nested agent-type span is a
+    sub-agent's own record, and its output legitimately differs from the final
+    answer; rewriting all of them would manufacture agreement the app never
+    produced, which is its own tell.
+    """
+    agents = [s for s in turn.spans if s.span_type == "agent"]
+    if not agents:
+        return None
+    ids = {s.span_id for s in turn.spans}
+    roots = [s for s in agents if s.parent_span_id is None or s.parent_span_id not in ids]
+    return min(roots or agents, key=lambda s: (s.start_time, s.span_id))
+
+
+def valid_turn_indices(trace: Trace) -> list[int]:
+    """Turns that can carry a Mode-A corruption (they have an llm span)."""
+    return [i for i, turn in enumerate(trace.turns) if any(
+        s.span_type == "llm" for s in turn.spans
+    )]
+
+
+def choose_turn_index(
+    trace: Trace, requested: int | None, rng: random.Random
+) -> int:
+    """Which turn k to corrupt.
+
+    An agent-supplied `requested` wins if it names a turn that can actually
+    carry the corruption; otherwise k is drawn seeded-randomly from the valid
+    turns. Always corrupting turn 0 would make "the injected turn" a constant
+    across the whole ablated corpus — a positional tell, and a much weaker test
+    of Engine (early-turn errors are the easiest kind to spot).
+    """
+    valid = valid_turn_indices(trace)
+    if not valid:
+        raise ConsistencyError(
+            f"trace {trace.trace_id} has no turn with an llm span, so no turn can be "
+            f"corrupted consistently"
+        )
+    if requested is not None:
+        if requested not in valid:
+            raise InjectionError(
+                f"turn_index {requested} is not a corruptible turn of trace "
+                f"{trace.trace_id} (valid: {valid})"
+            )
+        return requested
+    return rng.choice(valid)
 
 
 def _rewrite_llm_output(outputs: dict[str, Any], replacement: str) -> dict[str, Any]:
@@ -224,24 +321,110 @@ def corrupt_turn(turn: Turn, replacement: str) -> tuple[Turn, list[str], str]:
         )
     original_llm_text = json.dumps(llm_span.outputs, sort_keys=True, default=str)
     llm_span.outputs = _rewrite_llm_output(llm_span.outputs, replacement)
+    llm_span.attributes = _rescale_attributes(llm_span.attributes, original_llm_text, replacement)
     rewritten = [llm_span.span_id]
 
-    for span in corrupted.spans:
-        if span.span_type == "agent":
-            span.outputs = _rewrite_agent_output(span.outputs, replacement)
-            rewritten.append(span.span_id)
+    root = _root_span(corrupted)
+    if root is not None:
+        root.outputs = _rewrite_agent_output(root.outputs, replacement)
+        rewritten.append(root.span_id)
     return corrupted, rewritten, original_llm_text
+
+
+def _rescale_attributes(
+    attributes: dict[str, Any], before: str, after: str
+) -> dict[str, Any]:
+    """Keep the rewritten llm span's `tokens` consistent with its new output.
+
+    A span whose completion was replaced but whose token count still describes
+    the *original* text is a statistical tell: an Engine (or a reviewer) can
+    regress token count on output length and find every ablated span as an
+    outlier. The count is scaled by the length ratio rather than dropped —
+    dropping it would make "no token count" the tell instead, since every
+    organic llm span has one.
+
+    `duration_ms` is deliberately left alone: it measures how long the model
+    call took, which really did happen, and the corruption does not claim
+    otherwise.
+    """
+    tokens = attributes.get("tokens")
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or not before:
+        return attributes
+    ratio = len(after) / max(len(before), 1)
+    out = dict(attributes)
+    out["tokens"] = max(1, round(tokens * ratio))
+    return out
 
 
 # ------------------------------------------------------ self-correction check
 
-def retraction_in(turns: Iterable[Turn], patterns: Sequence[str]) -> str | None:
-    """The first retraction phrase found in these turns' responses, or None."""
-    haystacks = [turn.final_response.lower() for turn in turns]
+# Words too common to anchor on. A marker like "case NBX-4471" anchors on
+# "nbx-4471", not on "case".
+_STOPWORDS = frozenset(
+    "the a an and or of to in on for is are was were be been this that with case "
+    "ref reference id number your our you we it its as at by from".split()
+)
+
+
+def marker_terms(marker: str) -> list[str]:
+    """The distinctive tokens of a marker, for anchoring a retraction phrase."""
+    tokens = re.findall(r"[a-z0-9][a-z0-9\-_/]*", marker.lower())
+    return [t for t in tokens if t not in _STOPWORDS and len(t) > 2] or [marker.lower()]
+
+
+def regenerated_text(turns: Iterable[Turn]) -> list[str]:
+    """Every piece of app-authored text in the regenerated tail.
+
+    Widened after review from "final responses only". The app can retract an
+    injected claim without saying so in the answer — it re-searches the corpus
+    and the contradiction shows up in a retrieval or tool span, or a later llm
+    span reasons about it — so the scan covers each turn's final response AND
+    its spans' outputs.
+    """
+    out: list[str] = []
+    for turn in turns:
+        out.append(turn.final_response)
+        for span in turn.spans:
+            if span.outputs:
+                out.append(json.dumps(span.outputs, default=str))
+    return [text.lower() for text in out if text]
+
+
+def retraction_in(
+    turns: Iterable[Turn], patterns: Sequence[str], marker: str = ""
+) -> str | None:
+    """The first retraction phrase in the regenerated content, or None.
+
+    Two families (see `agent.py`): unconditional first-person phrases, and
+    phrases that only count within `ANCHOR_WINDOW` characters of one of the
+    marker's own distinctive terms.
+
+    **Known false negatives, accepted for v1** (see the module docstring's
+    "Residual risk"): a paraphrased contradiction, a span-level contradiction
+    that uses none of these words, and silent supersession (the app simply
+    answers differently and never mentions the injected claim) all pass this
+    check. The bias direction is one-way and benign for scoring: a missed
+    retraction means an `E_K` entry whose trace no longer really carries the
+    error, which *understates* Engine's precision. It never invents an error
+    Engine is then punished for missing.
+    """
+    haystacks = regenerated_text(turns)
     for pattern in (*DEFAULT_RETRACTION_PATTERNS, *(p.lower() for p in patterns)):
         needle = pattern.lower().strip()
         if needle and any(needle in text for text in haystacks):
             return pattern
+
+    terms = marker_terms(marker) if marker else []
+    if not terms:
+        return None
+    for pattern in ANCHORED_RETRACTION_PATTERNS:
+        for text in haystacks:
+            for match in re.finditer(re.escape(pattern), text):
+                window = text[
+                    max(0, match.start() - ANCHOR_WINDOW) : match.end() + ANCHOR_WINDOW
+                ]
+                if any(term in window for term in terms):
+                    return pattern
     return None
 
 
@@ -250,6 +433,29 @@ def retraction_in(turns: Iterable[Turn], patterns: Sequence[str]) -> str | None:
 def _renumber(turns: Sequence[Turn], start: int) -> list[Turn]:
     return [turn.model_copy(deep=True, update={"turn_index": start + i}) for i, turn in
             enumerate(turns)]
+
+
+def _marker_present(turn: Turn, marker: str) -> bool:
+    """Is `marker` in this turn's own content, comparing real strings?
+
+    Span payloads are walked as decoded values rather than serialized, so the
+    comparison is against the text the app would actually show — a marker with
+    a quote in it matches itself instead of its JSON escape.
+    """
+    needle = marker.lower()
+
+    def walk(node: Any) -> bool:
+        if isinstance(node, str):
+            return needle in node.lower()
+        if isinstance(node, dict):
+            return any(walk(v) for v in node.values())
+        if isinstance(node, (list, tuple)):
+            return any(walk(v) for v in node)
+        return False
+
+    if needle in turn.final_response.lower():
+        return True
+    return any(walk(span.outputs) for span in turn.spans)
 
 
 def ablated_trace_id(dataset_id: str, input_id: str, ablation_id: str) -> str:
@@ -271,6 +477,7 @@ def apply_replay_edit(
     ablation_id: str,
     dataset_id: str = "",
     store_result: bool = True,
+    seed: int = 0,
 ) -> tuple[Trace, AblationRecord]:
     """Corrupt turn k, make its spans consistent, regenerate `k+1 … M` organically."""
     if not spec.ablation_actions:
@@ -279,15 +486,17 @@ def apply_replay_edit(
     params = action.params
     replacement = str(params.get("replacement") or "")
     marker = str(params.get("marker") or "")
-    turn_index = int(params.get("turn_index") or 0)
     patterns = [str(p) for p in (params.get("retraction_patterns") or [])]
     if not replacement:
         raise InjectionError(f"{spec.error_id}: replay_edit action has no replacement text")
-    if not 0 <= turn_index < len(trace.turns):
-        raise InjectionError(
-            f"{spec.error_id}: turn_index {turn_index} is outside trace {trace.trace_id}'s "
-            f"{len(trace.turns)} turn(s)"
-        )
+
+    requested = params.get("turn_index")
+    # Seeded per (trace, ablation): the same trace always draws the same k, so
+    # a rerun is reproducible, but k varies across the corpus.
+    rng = random.Random(f"{seed}\x1f{trace.trace_id}\x1f{ablation_id}")
+    turn_index = choose_turn_index(
+        trace, int(requested) if isinstance(requested, int) else None, rng
+    )
 
     source_turn = trace.turns[turn_index]
     original_response = source_turn.final_response
@@ -339,12 +548,17 @@ def apply_replay_edit(
         ablation_ids=[*trace.ablation_ids, ablation_id],
     )
 
-    if marker and marker.lower() not in ablated.model_dump_json().lower():
+    # Scoped to turn k, and matched against UNESCAPED strings. Searching the
+    # whole trace's raw JSON would pass on a marker that merely echoed in a
+    # regenerated tail turn while turn k itself lost it, and a marker
+    # containing a quote or a backslash would be JSON-escaped in the dump and
+    # never match its own literal.
+    if marker and not _marker_present(ablated.turns[turn_index], marker):
         raise CorruptionLost(
-            f"{spec.error_id}: marker {marker!r} is not present in the assembled T* for "
-            f"{trace.trace_id} — the corruption did not survive the splice"
+            f"{spec.error_id}: marker {marker!r} is not present in turn {turn_index} of the "
+            f"assembled T* for {trace.trace_id} — the corruption did not survive the splice"
         )
-    retraction = retraction_in(tail, patterns)
+    retraction = retraction_in(tail, patterns, marker)
     if retraction is not None:
         raise SelfCorrected(
             f"{spec.error_id}: the app retracted the injected content downstream of turn "
@@ -356,12 +570,17 @@ def apply_replay_edit(
         ablation_id=ablation_id,
         error_id=spec.error_id,
         trace_id=ablated.trace_id,
+        mode="replay_edit",
         actions_applied=[
             action.model_copy(
                 deep=True,
                 update={
                     "params": {
                         **params,
+                        # The turn actually corrupted, which for an unpinned
+                        # corruption is drawn per trace — callers read k back
+                        # from here rather than from the spec.
+                        "turn_index": turn_index,
                         "rewritten_span_ids": rewritten_spans,
                         "regenerated_turns": len(tail),
                         "source_trace_id": trace.trace_id,
@@ -424,6 +643,7 @@ def apply_dependency_fault(
         ablation_id=ablation_id,
         error_id=spec.error_id,
         trace_id=trace.trace_id,
+        mode="dependency_fault",
         actions_applied=[],
         # ("", evidence) is the documented shape for dependency_fault: there is
         # no "before" to diff in the record, the fault config IS the action.

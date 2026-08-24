@@ -75,14 +75,17 @@ def replay_actions(proposal: ProposedError) -> list[AblationAction]:
     corruption = proposal.corruption
     if corruption is None:
         raise ValueError(f"{proposal.issue.error_id}: replay_edit plan without a corruption")
+    where = "turns[k]" if corruption.turn_index is None else f"turns[{corruption.turn_index}]"
     return [
         AblationAction(
-            target=f"turns[{corruption.turn_index}].final_response",
+            target=f"{where}.final_response",
             transform="replace",
             params={
                 "replacement": corruption.replacement,
                 "marker": corruption.marker,
                 "retraction_patterns": list(corruption.retraction_patterns),
+                # None = "choose per trace, seeded". The record written at
+                # injection time carries the k actually used.
                 "turn_index": corruption.turn_index,
             },
         )

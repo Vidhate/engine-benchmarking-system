@@ -21,7 +21,14 @@ from benchmark.ablation.inject import (
 from benchmark.ablation.plan import plan_ablation
 from benchmark.schemas.traces import Trace
 
-from .conftest import MARKER, FakeHarness, make_proposal, make_trace, make_turn
+from .conftest import (
+    MARKER,
+    FakeHarness,
+    make_proposal,
+    make_span,
+    make_trace,
+    make_turn,
+)
 
 
 def _spec(**kwargs):
@@ -45,6 +52,79 @@ def test_corrupting_a_turn_also_fixes_the_agent_spans_message_list():
     agent = [s for s in corrupted.spans if s.span_type == "agent"][0]
     assert agent.outputs["messages"][-1]["content"] == "brand new answer, case NBX-1"
     assert agent.span_id in rewritten
+
+
+def test_only_the_root_agent_span_is_rewritten():
+    """A nested agent span is a sub-agent's own record; forcing it to agree
+    with the final answer manufactures consistency the app never produced."""
+    turn = make_turn("t", 0)
+    nested = make_span(
+        "t-t0-subagent",
+        "agent",
+        "sub_agent",
+        parent="t-t0-agent",
+        outputs={"messages": [{"type": "ai", "content": "sub-agent said this"}]},
+        offset_ms=50,
+    )
+    turn.spans.append(nested)
+    corrupted, rewritten, _ = corrupt_turn(turn, "brand new answer")
+    assert "t-t0-agent" in rewritten, "the root must be rewritten"
+    assert nested.span_id not in rewritten
+    survivor = next(s for s in corrupted.spans if s.span_id == nested.span_id)
+    assert survivor.outputs["messages"][-1]["content"] == "sub-agent said this"
+
+
+def test_the_rewritten_llm_spans_token_count_tracks_its_new_output():
+    """A span whose completion changed but whose token count still describes
+    the original text is a statistical outlier an Engine could learn."""
+    turn = make_turn("t", 0, final_response="short")
+    llm = [s for s in turn.spans if s.span_type == "llm"][0]
+    llm.attributes["tokens"] = 100
+    before_len = len(json.dumps(llm.outputs, sort_keys=True, default=str))
+
+    long_answer = "x" * (before_len * 3)
+    corrupted, _, _ = corrupt_turn(turn, long_answer)
+    after = [s for s in corrupted.spans if s.span_type == "llm"][0]
+    assert after.attributes["tokens"] > 100, after.attributes
+    # duration is untouched: the model call really did take that long
+    assert after.attributes.get("duration_ms") == llm.attributes.get("duration_ms")
+
+
+def test_a_span_with_no_token_count_gains_none():
+    turn = make_turn("t", 0)
+    llm = [s for s in turn.spans if s.span_type == "llm"][0]
+    llm.attributes.pop("tokens", None)
+    corrupted, _, _ = corrupt_turn(turn, "replacement")
+    after = [s for s in corrupted.spans if s.span_type == "llm"][0]
+    assert "tokens" not in after.attributes, "inventing one is its own tell"
+
+
+def test_the_marker_check_is_escape_safe_and_scoped_to_turn_k(harness, store):
+    """A marker containing a quote is JSON-escaped in a raw dump and would
+    never match its own literal."""
+    trace = store.get("trace-safe-00")
+    marker = 'case "NBX-99"'
+    spec = plan_ablation(
+        make_proposal(marker=marker, replacement=f"I filed {marker} for you.")
+    )
+    ablated, _ = apply_replay_edit(
+        trace, spec, harness, ablation_id="abl-q", dataset_id="ds", store_result=False
+    )
+    assert marker in ablated.turns[0].final_response
+
+
+def test_a_marker_that_only_appears_in_the_tail_does_not_count(target_cfg, store):
+    """Scoped to turn k: an echo downstream is not the corruption surviving."""
+    harness = FakeHarness(target_cfg, store)
+    trace = store.get("trace-mt-00")
+    spec = plan_ablation(make_proposal(turn_index=0))
+    # The replacement loses its marker, but the fake tail happens to contain it.
+    spec.ablation_actions[0].params["replacement"] = "an ordinary answer"
+    spec.ablation_actions[0].params["marker"] = "Understood"
+    with pytest.raises(CorruptionLost, match="turn 0"):
+        apply_replay_edit(
+            trace, spec, harness, ablation_id="abl-e", dataset_id="ds", store_result=False
+        )
 
 
 def test_the_original_turn_is_not_mutated():
@@ -140,16 +220,105 @@ def test_a_marker_that_does_not_survive_the_splice_is_refused(harness, store):
 def test_a_turn_index_past_the_end_of_the_trace_is_refused(harness, store):
     trace = store.get("trace-safe-00")
     spec = plan_ablation(make_proposal(turn_index=4))
-    with pytest.raises(InjectionError, match="outside"):
+    with pytest.raises(InjectionError, match="not a corruptible turn"):
         apply_replay_edit(trace, spec, harness, ablation_id="abl-6", dataset_id="ds")
 
 
-def test_retraction_detection_uses_defaults_plus_the_authored_patterns():
-    turns = [make_turn("t", 0, final_response="There is no such case on file.")]
-    assert retraction_in(turns, []) == "no such"
+def test_an_unpinned_corruption_draws_its_turn_seeded_across_the_conversation(
+    harness, store
+):
+    """Always corrupting turn 0 makes the injected position a constant."""
+    trace = store.get("trace-mt-00")
+    spec = plan_ablation(make_proposal())
+    assert spec.ablation_actions[0].params["turn_index"] is None
+    chosen = set()
+    for seed in range(12):
+        _, record = apply_replay_edit(
+            trace, spec, harness, ablation_id="abl-k", dataset_id="ds",
+            store_result=False, seed=seed,
+        )
+        chosen.add(record.actions_applied[0].params["turn_index"])
+    assert len(chosen) > 1, f"k never varied: {chosen}"
+    assert chosen <= {0, 1, 2}
+
+
+def test_the_drawn_turn_is_stable_for_one_seed(harness, store):
+    trace = store.get("trace-mt-00")
+    spec = plan_ablation(make_proposal())
+    picks = {
+        apply_replay_edit(
+            trace, spec, harness, ablation_id="abl-k", dataset_id="ds",
+            store_result=False, seed=5,
+        )[1].actions_applied[0].params["turn_index"]
+        for _ in range(4)
+    }
+    assert len(picks) == 1, picks
+
+
+def test_an_agent_pinned_turn_wins_over_the_draw(harness, store):
+    trace = store.get("trace-mt-00")
+    spec = plan_ablation(make_proposal(turn_index=1))
+    for seed in range(6):
+        _, record = apply_replay_edit(
+            trace, spec, harness, ablation_id="abl-k", dataset_id="ds",
+            store_result=False, seed=seed,
+        )
+        assert record.actions_applied[0].params["turn_index"] == 1
+
+
+def test_only_turns_that_can_be_made_consistent_are_drawable(harness, store):
+    from benchmark.ablation.inject import valid_turn_indices
+
+    trace = store.get("trace-mt-00")
+    trace.turns[0].spans = [s for s in trace.turns[0].spans if s.span_type != "llm"]
+    assert valid_turn_indices(trace) == [1, 2]
+    spec = plan_ablation(make_proposal())
+    for seed in range(10):
+        _, record = apply_replay_edit(
+            trace, spec, harness, ablation_id="abl-k", dataset_id="ds",
+            store_result=False, seed=seed,
+        )
+        assert record.actions_applied[0].params["turn_index"] != 0
+
+
+def test_an_unconditional_first_person_retraction_is_caught():
+    turns = [make_turn("t", 0, final_response="I apologise — I made an error earlier.")]
+    assert retraction_in(turns, []) in ("i apologi", "i made an error")
     quiet = [make_turn("t", 0, final_response="Sure, happy to help.")]
     assert retraction_in(quiet, []) is None
     assert retraction_in(quiet, ["happy to help"]) == "happy to help"
+
+
+def test_an_anchored_phrase_only_counts_near_the_markers_own_terms():
+    """"no such" is a retraction of the fabricated id, and ordinary English
+    everywhere else. The bare phrase used to fire on both."""
+    retracts = [make_turn("t", 0, final_response="There is no such case as NBX-4471 on file.")]
+    assert retraction_in(retracts, [], MARKER) == "no such"
+    # Same phrase, nothing to do with the injected marker.
+    innocent = [
+        make_turn("t", 0, final_response="There's no such setting in the mobile app yet.")
+    ]
+    assert retraction_in(innocent, [], MARKER) is None
+
+
+def test_the_previously_false_positive_prone_phrases_no_longer_fire_alone():
+    for text in (
+        "I've filed a correction request with billing.",
+        "There is no such option on the free plan.",
+        "That does not exist in the current release.",
+    ):
+        turns = [make_turn("t", 0, final_response=text)]
+        assert retraction_in(turns, [], MARKER) is None, text
+
+
+def test_the_scan_covers_span_output_not_just_the_final_response():
+    """The app can contradict an injected claim in a retrieval span while the
+    answer says nothing about it."""
+    turn = make_turn("t", 0, final_response="Here's what I found.")
+    turn.spans[-1].outputs = {
+        "generations": [[{"text": "I made an error in my previous message."}]]
+    }
+    assert retraction_in([turn], []) == "i made an error"
 
 
 # ------------------------------------------------------- thread liveness

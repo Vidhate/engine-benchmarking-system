@@ -96,6 +96,7 @@ def dry_run(
     dataset_id: str = "",
     personas: Mapping[str, Persona] | None = None,
     max_turns: int = 1,
+    seed: int = 0,
 ) -> tuple[Stage, str] | None:
     """Inject into ONE sample and report the first failure, or None if clean."""
     sample = _sample_for(spec, candidates)
@@ -108,6 +109,7 @@ def dry_run(
                 ablation_id=f"dryrun-{spec.error_id}",
                 dataset_id=dataset_id,
                 store_result=False,
+                seed=seed,
             )
         else:
             input_spec = inputs_by_id.get(sample.input_id)
@@ -199,6 +201,8 @@ def validate_specs(
     personas: Mapping[str, Persona] | None = None,
     max_turns: int = 1,
     max_replans: int = MAX_REPLANS,
+    target_count: int | None = None,
+    seed: int = 0,
 ) -> ValidationOutcome:
     """Validate every proposal, re-planning up to `max_replans` times each."""
     outcome = ValidationOutcome()
@@ -209,7 +213,7 @@ def validate_specs(
         drop_reason: str | None = None
 
         for attempt in range(max_replans + 1):
-            spec = plan_ablation(current, attempt=attempt)
+            spec = plan_ablation(current, attempt=attempt, target_count=target_count)
             try:
                 candidates = filters.eligible(traces, spec.filter, ablate_input_ids)
             except filters.UnknownFilterField as exc:
@@ -252,6 +256,7 @@ def validate_specs(
                 dataset_id=dataset_id,
                 personas=personas,
                 max_turns=max_turns,
+                seed=seed,
             )
             if failure is None:
                 outcome.specs.append(spec)

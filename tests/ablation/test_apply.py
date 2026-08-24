@@ -170,6 +170,31 @@ def test_disjointness_holds_over_many_seeded_configurations(traces, inputs, targ
         assert len(keys) == len(set(keys)), f"run {run}: duplicate exact key in {keys}"
 
 
+def test_one_mode_c_and_one_mode_a_of_the_SAME_category_never_share_a_trace(
+    traces, inputs, harness
+):
+    """The deterministic companion to the property test.
+
+    The two modes are the one path that could sneak a second same-category
+    injection onto a trace, because Mode C runs first and the trace it leaves
+    behind is a fresh, fully eligible candidate for Mode A.
+    """
+    split = _all_split(inputs)
+    proposals = [
+        make_proposal("E-rf-fault", "retrieval_failure",
+                      mode="dependency_fault", target_count=99),
+        make_proposal("E-rf-content", "retrieval_failure", target_count=99),
+    ]
+    outcome = _apply(proposals, traces, inputs, harness, split)
+    per_trace = Counter(o.trace_id for o in outcome.ground_truth.occurrences)
+    assert per_trace, "the fixture should inject something"
+    assert max(per_trace.values()) == 1, (
+        f"a trace carries two retrieval_failure injections: {per_trace}"
+    )
+    # and each error still landed somewhere
+    assert outcome.injected["E-rf-fault"] > 0
+
+
 def test_a_trace_may_carry_compound_errors_from_different_categories(
     traces, inputs, harness
 ):
@@ -203,9 +228,16 @@ def test_a_mechanism_fault_is_applied_before_a_content_corruption(traces, inputs
         if len(trace.ablation_ids) == 2
     ]
     assert compound, "the fixture corpus should produce at least one compound trace"
+    replay_k = {
+        record.trace_id: record.actions_applied[0].params["turn_index"]
+        for record in outcome.records
+        if record.mode == "replay_edit"
+    }
     for trace in compound:
-        # a replay_edit ran last, so the shipped trace is the spliced one
-        assert trace.turns[0].final_response.startswith("I have escalated")
+        # a replay_edit ran last, so the shipped trace is the spliced one —
+        # at whichever turn that injection actually drew.
+        k = replay_k[trace.trace_id]
+        assert trace.turns[k].final_response.startswith("I have escalated")
 
 
 def test_at_most_one_injection_per_mode_per_input(traces, inputs, harness):
@@ -235,6 +267,53 @@ def test_an_injection_that_blows_up_moves_on_to_the_next_candidate(
     }
     assert "mt-00" not in injected_inputs
     assert outcome.injected["E-hallucination-00"] >= len(traces.traces) - 2
+
+
+def test_two_traces_for_one_input_fail_loudly(traces, inputs, harness):
+    """Step 4 keys everything on input_id; a duplicate would silently lose an
+    injection and mislabel the survivor's ground truth."""
+    import pytest
+
+    split = _all_split(inputs)
+    doubled = traces.model_copy(deep=True)
+    clone = doubled.traces[0].model_copy(deep=True, update={"trace_id": "trace-dup"})
+    doubled.traces.append(clone)
+    with pytest.raises(ValueError, match="duplicate input_id"):
+        _apply([make_proposal()], doubled, inputs, harness, split)
+
+
+def test_records_carry_their_injection_mode(traces, inputs, harness):
+    split = _all_split(inputs)
+    proposals = [
+        make_proposal("E-a", "hallucination", target_count=2),
+        make_proposal("E-b", "retrieval_failure", mode="dependency_fault", target_count=2),
+    ]
+    outcome = _apply(proposals, traces, inputs, harness, split)
+    by_error = {r.error_id: r.mode for r in outcome.records}
+    assert by_error == {"E-a": "replay_edit", "E-b": "dependency_fault"}
+
+
+def test_a_self_corrected_candidate_is_counted_not_silently_skipped(
+    traces, inputs, target_cfg, store
+):
+    """The not-retracted check burns candidates, and how many it burned bounds
+    the residual risk documented in `inject.retraction_in`. Counting it is what
+    turns that risk into a number in the report."""
+    from benchmark.schemas.ablation import FilterStep
+
+    harness = FakeHarness(target_cfg, store, self_corrects=True)
+    split = _all_split(inputs)
+    # Pinned to turn 0 of the conversations: only a trace with a regenerated
+    # tail can self-correct at all.
+    proposal = make_proposal(
+        turn_index=0,
+        target_count=3,
+        filter_steps=[FilterStep(field="mode", op="eq", value="multi_turn")],
+    )
+    outcome = _apply([proposal], traces, inputs, harness, split)
+    assert outcome.injected.get("E-hallucination-00", 0) == 0
+    assert outcome.self_corrected == {"E-hallucination-00": 2}
+    assert "E-hallucination-00" in outcome.dropped
 
 
 def test_an_error_that_injects_nowhere_is_reported_not_silently_forgotten(

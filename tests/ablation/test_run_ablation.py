@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
@@ -153,6 +154,111 @@ def test_a_dropped_error_is_reported_with_its_reason(
     assert result.dropped_errors
     assert "min_eligible=99" in result.dropped_errors[0]
     assert result.ground_truth.issues == []
+
+
+def test_a_failing_agent_costs_its_category_not_the_paid_for_corpus(
+    traces, inputs, categories, ablation_cfg, harness, store, tmp_path
+):
+    """By step 1 the whole corpus is already collected; one bad draw must not
+    discard it."""
+    from benchmark.ablation.agent import AgentResponseError
+
+    class _HalfBroken:
+        def propose(self, category, n, digest, allowed_modes):
+            if category.category_id == "hallucination":
+                raise AgentResponseError("the model's reply was not JSON")
+            return [make_proposal(f"ok-{category.category_id}", category.category_id)]
+
+        def revise_corruption(self, proposal, digest, reasons):  # pragma: no cover
+            raise AssertionError("not reached")
+
+    engine = AblationEngine(harness, store, ablation_cfg, agent=_HalfBroken())
+    result = engine.run(traces, inputs, categories, tmp_path / "engine_traces.json")
+    assert any("hallucination" in reason for reason in result.dropped_errors)
+    assert result.ground_truth.issues, "the other categories still produced errors"
+    assert Path(result.export_path).exists()
+
+
+def test_the_config_knobs_reach_the_stages_that_use_them(
+    traces, inputs, categories, harness, store, tmp_path, agent
+):
+    cfg = AblationConfig(
+        seed=7, control_fraction=0.3, min_eligible=2, n_per_category=1,
+        target_count=1, max_replans=0,
+    )
+    result = AblationEngine(harness, store, cfg, agent=agent).run(
+        traces, inputs, categories, tmp_path / "engine_traces.json"
+    )
+    assert all(count <= 1 for count in result.injected_counts.values()), (
+        f"target_count=1 was not honoured: {result.injected_counts}"
+    )
+    assert all(f.attempt == 0 for f in result.validation.failures), (
+        "max_replans=0 must leave no second attempt"
+    )
+
+
+def test_the_not_retracted_checks_burn_rate_reaches_the_result(
+    traces, inputs, categories, target_cfg, store, tmp_path
+):
+    """`retraction_in` has a documented residual false-negative surface. What
+    bounds it is how many candidates it burned, so that number has to leave the
+    engine rather than stay in a log line."""
+    from benchmark.schemas.ablation import FilterStep
+
+    # The dry run stays clean; every step-4 candidate after it self-corrects.
+    harness = FakeHarness(target_cfg, store, self_corrects=True, self_corrects_after=1)
+    proposal = make_proposal(
+        "h0",
+        "hallucination",
+        turn_index=0,  # only a trace with a regenerated tail can retract at all
+        filter_steps=[FilterStep(field="mode", op="eq", value="multi_turn")],
+    )
+    agent = ScriptedAblationAgent({"hallucination": [proposal]})
+    cfg = AblationConfig(
+        seed=7, control_fraction=0.0, min_eligible=1, n_per_category=1, max_replans=0
+    )
+    result = AblationEngine(harness, store, cfg, agent=agent).run(
+        traces, inputs, categories, tmp_path / "engine_traces.json"
+    )
+    # step 1 re-stamps error ids per category, so the id here is the stamped one
+    assert result.self_corrected_counts == {"E-hallucination-00": 2}
+    assert result.injected_counts.get("E-hallucination-00", 0) == 0
+
+
+def test_a_mode_c_only_run_never_probes_thread_liveness(
+    traces, inputs, categories, ablation_cfg, target_cfg, store, tmp_path
+):
+    """A probe is a real round trip per thread, and `assert_threads_alive` would
+    abort a valid dependency-fault run over threads it never intended to fork."""
+    harness = FakeHarness(target_cfg, store)
+    agent = ScriptedAblationAgent(
+        {
+            "retrieval_failure": [
+                make_proposal("r0", "retrieval_failure", mode="dependency_fault",
+                              target_count=2)
+            ]
+        }
+    )
+    result = AblationEngine(harness, store, ablation_cfg, agent=agent).run(
+        traces, inputs, categories, tmp_path / "engine_traces.json"
+    )
+    assert harness.boundary_probes == [], harness.boundary_probes
+    assert result.injected_counts.get("E-retrieval_failure-00", 0) > 0, (
+        "the Mode-C run still did its work"
+    )
+
+
+def test_a_run_with_a_replay_edit_does_probe_up_front(
+    traces, inputs, categories, ablation_cfg, target_cfg, store, tmp_path
+):
+    harness = FakeHarness(target_cfg, store)
+    agent = ScriptedAblationAgent(
+        {"hallucination": [make_proposal("h0", "hallucination", target_count=2)]}
+    )
+    AblationEngine(harness, store, ablation_cfg, agent=agent).run(
+        traces, inputs, categories, tmp_path / "engine_traces.json"
+    )
+    assert harness.boundary_probes, "Mode A must fail loudly on a dead-thread corpus"
 
 
 def test_the_run_is_reproducible_for_a_seed(

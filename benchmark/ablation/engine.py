@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from benchmark.ablation.agent import AblationAgent, CorpusDigest, OpenAIAblationAgent
 from benchmark.ablation.apply import apply_ablations
 from benchmark.ablation.export import write_engine_export
-from benchmark.ablation.inject import assert_threads_alive, live_threads
+from benchmark.ablation.inject import assert_threads_alive
 from benchmark.ablation.propose import build_digest, propose_errors
 from benchmark.ablation.split import make_split
 from benchmark.ablation.validate import ValidationOutcome, validate_specs
@@ -64,6 +64,11 @@ class AblationResult(BaseModel):
     # injection counts to be recoverable so precision/recall are interpretable
     # against known base rates.
     injected_counts: dict[str, int] = Field(default_factory=dict)
+    # Candidates burned by the not-retracted check, per error — the app
+    # defending itself against an injection. Report-visible so the residual
+    # false-negative surface documented in `inject.retraction_in` is bounded by
+    # a number rather than by a guess.
+    self_corrected_counts: dict[str, int] = Field(default_factory=dict)
     validation: ValidationOutcome = Field(default_factory=ValidationOutcome)
     digest: CorpusDigest = Field(default_factory=CorpusDigest)
 
@@ -146,7 +151,7 @@ class AblationEngine:
             self.harness.cfg,
             app_context=inputs.generation_config.app_context,
         )
-        proposals, digest = propose_errors(
+        proposals, digest, dropped_categories = propose_errors(
             _StoreWithFallback(self.store, traces.traces),
             [t.trace_id for t in ablate_traces],
             list(categories),
@@ -162,11 +167,15 @@ class AblationEngine:
         )
 
         # ------------------------- thread liveness (only if Mode A is in play)
+        # A Mode-C-only run never forks a thread, so probing is pure cost —
+        # one `get_history` per distinct thread against a live server — and
+        # `assert_threads_alive` would abort a perfectly valid dependency-fault
+        # run over threads it was never going to use.
         replayable: set[str] | None = None
         if any(p.issue.injection_mode == "replay_edit" for p in proposals):
             replayable = assert_threads_alive(ablate_traces, self.harness)
         else:
-            replayable = live_threads(ablate_traces, self.harness)
+            log.info("no replay_edit error proposed — skipping the thread-liveness probe")
 
         # ------------------------------------- steps 2 + 3: plan and validate
         inputs_by_id = {i.input_id: i for i in inputs.inputs}
@@ -190,6 +199,9 @@ class AblationEngine:
             replayable_trace_ids=replayable,
             personas=personas,
             max_turns=inputs.generation_config.max_turns,
+            max_replans=self.cfg.max_replans,
+            target_count=self.cfg.target_count,
+            seed=self.cfg.seed,
         )
         log.info(
             "validated %d/%d spec(s); dropped %s",
@@ -221,7 +233,11 @@ class AblationEngine:
             applied.ablated, export_path, self.harness.cfg, extra_tokens=behaviors
         )
 
-        dropped = [*outcome.dropped.values(), *applied.dropped.values()]
+        dropped = [
+            *dropped_categories.values(),
+            *outcome.dropped.values(),
+            *applied.dropped.values(),
+        ]
         return AblationResult(
             ablated=applied.ablated,
             ground_truth=applied.ground_truth,
@@ -230,6 +246,7 @@ class AblationEngine:
             export_path=str(path),
             dropped_errors=sorted(dropped),
             injected_counts=applied.injected,
+            self_corrected_counts=applied.self_corrected,
             validation=outcome,
             digest=digest,
         )
