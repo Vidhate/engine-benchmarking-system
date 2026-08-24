@@ -218,10 +218,16 @@ Return STRICT JSON only:
 any user-visible text you author — that text ships inside the trace, and
 naming the machinery would hand the answer away.
 
-Filter fields you may use: status, mode, turn_count, span_count, span_types,
-span_names, final_responses, user_messages, metadata.<key>,
-turns[*].final_response, turns[*].user_message, turns[*].spans[*].span_type,
-turns[*].spans[*].name.
+Filter fields are a CLOSED list. Use only these:
+  status, mode, turn_count, span_count, span_types, span_names,
+  final_responses, user_messages, metadata.<key>,
+  turns[*].final_response, turns[*].user_message,
+  turns[*].spans[*].span_type, turns[*].spans[*].name,
+  turns[*].spans[*].inputs.<key>, turns[*].spans[*].outputs.<key>
+The digest's own keys (`retrieved_doc_ids`, `tool_names`, `sample_exchanges`,
+…) describe the corpus — they are NOT filter fields and there is no field of
+that name on a trace. A step naming anything outside the list above is dropped,
+which silently makes your filter looser than you intended.
 """
 
 _REVISE_SYSTEM = """\
