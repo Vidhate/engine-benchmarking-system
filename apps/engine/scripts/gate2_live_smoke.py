@@ -4,7 +4,7 @@ Drives the app exactly the way the benchmark will: `langgraph_sdk` against the
 `base_url` / `assistant_id` in `configs/engine.yaml`, model chosen through
 `config.configurable[model_configurable_key]`. No imports from `engine`.
 
-    uv run python scripts/gate2_live_smoke.py [model_id]
+    uv run python scripts/gate2_live_smoke.py [model_id] [analysis_concurrency]
 
 Reports which planted errors the Engine found. Imperfect recall is acceptable —
 this gate fails on crashes, schema violations, and a lost seed board, not on a
@@ -31,6 +31,9 @@ from _contract import (  # noqa: E402
 )
 
 TRACES_FILE = FIXTURES / "traces.json"
+# Mirrors engine.graph.DEFAULT_ANALYSIS_CONCURRENCY. Named here rather than
+# imported: these scripts stand in for the benchmark and must not import the app.
+DEFAULT_CONCURRENCY = 8
 ANSWER_KEY = FIXTURES / "planted_errors.json"
 LAST_RUN = Path(__file__).resolve().parent / ".last_run.json"
 
@@ -54,11 +57,13 @@ def recorded_models(client, thread_id: str) -> list[str]:
     return models
 
 
-def run_engine(model: str | None = None) -> dict:
+def run_engine(model: str | None = None, concurrency: int = DEFAULT_CONCURRENCY) -> dict:
     """One Engine run through the LangGraph Server API.
 
-    Returns {output, thread_id, recorded_models} — the last so callers can
-    verify server-side which model the run actually received.
+    Returns {output, thread_id, recorded_models, seconds} — `recorded_models` so
+    callers can verify server-side which model the run actually received, and
+    `seconds` because the assignment's 300-trace deliverable lives or dies on
+    the per-trace cost.
     """
     from langgraph_sdk import get_sync_client  # noqa: PLC0415
 
@@ -66,13 +71,15 @@ def run_engine(model: str | None = None) -> dict:
     client = get_sync_client(url=contract["base_url"])
 
     trace_count = len(json.loads(TRACES_FILE.read_text())["traces"])
+    configurable: dict = {"analysis_concurrency": concurrency}
+    if model:
+        configurable[contract["model_configurable_key"]] = model
     config: dict = {
-        # 2 supersteps + 1 per trace. The graph raises its own default, but a
-        # caller driving a large corpus should set this explicitly.
+        "configurable": configurable,
+        # 2 supersteps + ceil(n / concurrency). The graph raises its own
+        # default, but a caller driving a large corpus should set this.
         "recursion_limit": 2 * trace_count + 10,
     }
-    if model:
-        config["configurable"] = {contract["model_configurable_key"]: model}
 
     started = time.time()
     thread = client.threads.create()
@@ -88,14 +95,27 @@ def run_engine(model: str | None = None) -> dict:
     )
     if isinstance(result, dict) and result.get("__error__"):
         raise SystemExit(f"run failed: {result['__error__']}")
-    print(f"  run finished in {time.time() - started:.1f}s")
+    seconds = time.time() - started
+    projected = seconds / trace_count * 300 / 60
+    print(
+        f"  run finished in {seconds:.1f}s for {trace_count} traces at "
+        f"concurrency={concurrency} (~{seconds / trace_count:.1f}s/trace, "
+        f"projecting ~{projected:.0f} min for 300)"
+    )
 
     try:
         seen = recorded_models(client, thread["thread_id"])
     except Exception as exc:  # readback is best-effort; the run itself stands
         print(f"  (could not read the run config back: {type(exc).__name__}: {exc})")
         seen = []
-    return {"output": result, "thread_id": thread["thread_id"], "recorded_models": seen}
+    return {
+        "output": result,
+        "thread_id": thread["thread_id"],
+        "recorded_models": seen,
+        "seconds": seconds,
+        "trace_count": trace_count,
+        "concurrency": concurrency,
+    }
 
 
 def report_recall(board, model: str) -> dict:
@@ -142,10 +162,13 @@ def report_recall(board, model: str) -> dict:
     return summary
 
 
-def smoke(model: str | None = None) -> dict:
+def smoke(model: str | None = None, concurrency: int = DEFAULT_CONCURRENCY) -> dict:
     label = model or "(default)"
-    banner(f"GATE 2 — live Engine run over the fixture traces  [model={label}]")
-    run = run_engine(model)
+    banner(
+        f"GATE 2 — live Engine run over the fixture traces  "
+        f"[model={label} concurrency={concurrency}]"
+    )
+    run = run_engine(model, concurrency)
     payload = run["output"]
 
     assert "issues" in payload and "occurrences" in payload, f"unexpected output: {sorted(payload)}"
@@ -180,17 +203,33 @@ def smoke(model: str | None = None) -> dict:
 
     LAST_RUN.write_text(
         json.dumps(
-            {"model": model, "recorded_models": run["recorded_models"],
-             "board": payload, "recall": recall},
+            {
+                "model": model,
+                "recorded_models": run["recorded_models"],
+                "concurrency": run["concurrency"],
+                "seconds": round(run["seconds"], 1),
+                "projected_300_trace_minutes": round(
+                    run["seconds"] / run["trace_count"] * 300 / 60, 1
+                ),
+                "board": payload,
+                "recall": recall,
+            },
             indent=2,
         )
     )
     print(f"\nOK — schema-valid Issueboard(source='engine_predicted'); board written to {LAST_RUN}")
-    return {"board": board, "recall": recall, "recorded_models": run["recorded_models"]}
+    return {
+        "board": board,
+        "recall": recall,
+        "recorded_models": run["recorded_models"],
+        "seconds": run["seconds"],
+    }
 
 
 def main() -> int:
-    smoke(sys.argv[1] if len(sys.argv) > 1 else None)
+    model = sys.argv[1] if len(sys.argv) > 1 else None
+    concurrency = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_CONCURRENCY
+    smoke(model, concurrency)
     banner("GATE 2 PASSED")
     return 0
 

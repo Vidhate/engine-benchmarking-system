@@ -41,6 +41,7 @@ def main() -> int:
         )
         results[model] = {
             "recorded_models": outcome["recorded_models"],
+            "seconds": round(outcome["seconds"], 1),
             "board_id": board.board_id,
             "issue_count": len(board.issues),
             "occurrence_count": len(board.occurrences),
@@ -74,11 +75,11 @@ def main() -> int:
         )
 
     print("\nside by side")
-    print(f"{'model':<16} {'issues':>7} {'occurrences':>12} {'planted found':>14}")
+    print(f"{'model':<16} {'issues':>7} {'occurrences':>12} {'seconds':>9} {'planted':>9}")
     for model, row in results.items():
         print(
             f"{model:<16} {row['issue_count']:>7} {row['occurrence_count']:>12} "
-            f"{row['planted_found']}/3".rjust(0)
+            f"{row['seconds']:>9} {row['planted_found']:>7}/3"
         )
 
     banner("GATE 3 PASSED — no code changed between the two runs")

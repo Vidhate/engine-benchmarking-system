@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -48,14 +50,26 @@ def script_for(fake, per_trace_findings: dict[str, list[RawFinding]], plan=None,
         fake.structured.append(plan)
 
 
-def run(traces_file, seed=None, categories=None, config=None):
+def run(traces_file, seed=None, categories=None, config=None, concurrency=1):
+    """Invoke the graph.
+
+    `concurrency` defaults to 1 so tests driving a *scripted* fake model stay
+    deterministic — a queue of scripted responses has no meaning when eight
+    workers pop from it at once. Concurrency itself is covered by the tests
+    below, which instrument `analyze_trace` instead of scripting a model.
+    """
+    config = dict(config or {})
+    if concurrency is not None:
+        configurable = dict(config.get("configurable") or {})
+        configurable.setdefault("analysis_concurrency", concurrency)
+        config["configurable"] = configurable
     return graph_module.graph.invoke(
         {
             "trace_file": str(traces_file),
             "seed_issueboard": seed or {},
             "categories": [c.model_dump() for c in (categories or [])],
         },
-        config=config or {},
+        config=config,
     )
 
 
@@ -296,3 +310,198 @@ def test_the_index_cache_survives_being_cleared_between_calls(traces_file, monke
     graph_module._INDEX_CACHE.clear()
     monkeypatch.setattr(graph_module.TraceIndex, "from_file", staticmethod(clear_after_load))
     assert graph_module.trace_index(str(traces_file)).trace_ids == ALL_TRACE_IDS
+
+
+# -- batched-parallel analysis --------------------------------------------
+
+
+class Instrumented:
+    """Stands in for `analyze_trace`, recording concurrency and inputs.
+
+    Instrumenting the orchestration rather than scripting a model is the only
+    way to observe in-flight counts and completion order; a scripted queue
+    cannot tell you which worker popped what.
+    """
+
+    def __init__(self, delay=0.01, failing=(), delays=None):
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.delay = delay
+        self.delays = delays or {}
+        self.failing = set(failing)
+        self.titles_seen: dict[str, list[str]] = {}
+        self.started: list[str] = []
+        self.finished: list[str] = []
+
+    def __call__(self, model, index, trace_id, running_titles, categories, max_tool_calls):
+        with self.lock:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            self.titles_seen[trace_id] = list(running_titles)
+            self.started.append(trace_id)
+        try:
+            time.sleep(self.delays.get(trace_id, self.delay))
+            if trace_id in self.failing:
+                raise RuntimeError("401 Unauthorized")
+            # One distinct title per trace: colliding titles would be folded
+            # into one cluster and the ordering signal would vanish.
+            return [TICKET_FINDING.model_copy(update={"trace_id": trace_id, "title": trace_id})]
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+                self.finished.append(trace_id)
+
+
+def instrument(monkeypatch, probe: Instrumented):
+    monkeypatch.setattr(graph_module, "build_model", lambda name: FakeChatModel())
+    monkeypatch.setattr(graph_module, "analyze_trace", probe)
+    monkeypatch.setattr(graph_module, "consolidate", lambda m, f, s, c: _board_from(f))
+    return probe
+
+
+@pytest.mark.parametrize("concurrency,expected_max", [(1, 1), (2, 2), (8, 6)])
+def test_max_in_flight_tracks_the_configured_batch_size(
+    traces_file, monkeypatch, categories, concurrency, expected_max
+):
+    """N=1 stays strictly sequential; N>1 really overlaps. With N=8 and only six
+    fixture traces the ceiling is the corpus, not the knob."""
+    probe = instrument(monkeypatch, Instrumented(delay=0.05))
+    run(traces_file, categories=categories, concurrency=concurrency)
+    assert probe.max_in_flight == expected_max
+
+
+def test_findings_follow_input_order_not_completion_order(
+    traces_file, monkeypatch, categories
+):
+    """Randomised durations make completion order the reverse of input order;
+    the board must not notice."""
+    delays = {trace_id: 0.02 * (len(ALL_TRACE_IDS) - i)
+              for i, trace_id in enumerate(ALL_TRACE_IDS)}
+    probe = instrument(monkeypatch, Instrumented(delay=0.02, delays=delays))
+    result = run(traces_file, categories=categories, concurrency=8)
+
+    assert probe.finished != ALL_TRACE_IDS, "completion order was not shuffled; test is vacuous"
+    assert [o["trace_id"] for o in result["occurrences"]] == ALL_TRACE_IDS
+
+
+def test_the_same_corpus_gives_the_same_board_at_any_batch_size(
+    traces_file, monkeypatch, categories
+):
+    boards = []
+    for concurrency in (1, 3, 8):
+        instrument(monkeypatch, Instrumented(delay=0))
+        boards.append(run(traces_file, categories=categories, concurrency=concurrency))
+    assert boards[0]["board_id"] == boards[1]["board_id"] == boards[2]["board_id"]
+
+
+def test_running_titles_are_shared_between_batches_not_within(
+    traces_file, monkeypatch, categories
+):
+    """Every trace in a batch sees the same list — otherwise what a trace sees
+    would depend on which worker happened to finish first."""
+    probe = instrument(monkeypatch, Instrumented(delay=0))
+    run(traces_file, categories=categories, concurrency=3)
+
+    first_batch = ALL_TRACE_IDS[:3]
+    second_batch = ALL_TRACE_IDS[3:]
+    assert all(probe.titles_seen[t] == [] for t in first_batch)
+    # The second batch inherits every title the first one discovered.
+    inherited = probe.titles_seen[second_batch[0]]
+    assert len(inherited) == 3
+    assert all(probe.titles_seen[t] == inherited for t in second_batch)
+
+
+def test_at_n_equals_one_every_trace_sees_all_its_predecessors(
+    traces_file, monkeypatch, categories
+):
+    probe = instrument(monkeypatch, Instrumented(delay=0))
+    run(traces_file, categories=categories, concurrency=1)
+    seen = [len(probe.titles_seen[t]) for t in ALL_TRACE_IDS]
+    assert seen == [0, 1, 2, 3, 4, 5]
+
+
+def test_a_worker_exception_does_not_kill_its_batchmates(
+    traces_file, monkeypatch, categories
+):
+    """One failure inside a batch of eight costs that trace only."""
+    probe = instrument(monkeypatch, Instrumented(delay=0, failing={"trace-planted-refund"}))
+    result = run(traces_file, categories=categories, concurrency=8)
+
+    assert set(probe.started) == set(ALL_TRACE_IDS), "every trace was still attempted"
+    survivors = [t for t in ALL_TRACE_IDS if t != "trace-planted-refund"]
+    assert [o["trace_id"] for o in result["occurrences"]] == survivors
+
+
+def test_the_failure_rate_threshold_counts_across_workers(
+    traces_file, monkeypatch, categories
+):
+    """Two concurrent failures out of six is still 33%, and still fatal."""
+    instrument(
+        monkeypatch,
+        Instrumented(delay=0, failing={"trace-clean-pricing", "trace-planted-refund"}),
+    )
+    with pytest.raises(Exception, match="analysis failed on 2 of 6 traces"):
+        run(traces_file, categories=categories, concurrency=8)
+
+
+def test_the_batch_is_the_superstep_so_a_big_corpus_needs_few(
+    traces_file, monkeypatch, categories
+):
+    """2 + ceil(n/N) supersteps: the reason the recursion limit stops being the
+    binding constraint on a 300-trace run."""
+    probe = instrument(monkeypatch, Instrumented(delay=0.05))
+    run(traces_file, categories=categories, concurrency=8)
+    assert probe.max_in_flight > 1
+    assert graph_module.RECURSION_LIMIT >= 2 + -(-300 // 8)
+
+
+# -- the concurrency knob --------------------------------------------------
+
+
+def test_resolve_concurrency_precedence_and_clamping(monkeypatch):
+    monkeypatch.delenv("ENGINE_ANALYSIS_CONCURRENCY", raising=False)
+    resolve = graph_module.resolve_concurrency
+    assert resolve(None) == graph_module.DEFAULT_ANALYSIS_CONCURRENCY
+    assert resolve({"configurable": {}}) == graph_module.DEFAULT_ANALYSIS_CONCURRENCY
+    assert resolve({"configurable": {"analysis_concurrency": 4}}) == 4
+    assert resolve({"configurable": {"analysis_concurrency": "4"}}) == 4
+    # Clamped, not refused: a typo should cost speed, not the whole run.
+    assert resolve({"configurable": {"analysis_concurrency": 0}}) == 1
+    assert resolve({"configurable": {"analysis_concurrency": -5}}) == 1
+    assert resolve({"configurable": {"analysis_concurrency": 999}}) == 16
+    assert resolve({"configurable": {"analysis_concurrency": "nope"}}) == 8
+    assert resolve({"configurable": {"analysis_concurrency": None}}) == 8
+
+    monkeypatch.setenv("ENGINE_ANALYSIS_CONCURRENCY", "2")
+    assert resolve(None) == 2
+    assert resolve({"configurable": {"analysis_concurrency": 5}}) == 5
+
+
+def test_the_default_batch_size_is_what_the_readme_documents():
+    assert graph_module.DEFAULT_ANALYSIS_CONCURRENCY == 8
+    assert (graph_module.MIN_ANALYSIS_CONCURRENCY, graph_module.MAX_ANALYSIS_CONCURRENCY) == (1, 16)
+
+
+def test_a_real_analysis_pass_runs_concurrently_end_to_end(
+    traces_file, monkeypatch, categories
+):
+    """The genuine `analyze_trace` (tool loop + structured emit) under a
+    content-addressed fake model, eight at a time."""
+    seen: list[str] = []
+    seen_lock = threading.Lock()
+
+    def router(messages):
+        text = str(messages[-1].content)
+        trace_id = next(t for t in ALL_TRACE_IDS if t in text)
+        with seen_lock:
+            seen.append(trace_id)
+        return RawFindingList(findings=[TICKET_FINDING.model_copy(update={"title": "Shared"})])
+
+    fake = FakeChatModel(responses=[], structured=[], router=router)
+    monkeypatch.setattr(graph_module, "build_model", lambda name: fake)
+    monkeypatch.setattr(graph_module, "consolidate", lambda m, f, s, c: _board_from(f))
+
+    result = run(traces_file, categories=categories, concurrency=8)
+    assert sorted(seen) == sorted(ALL_TRACE_IDS)
+    assert [o["trace_id"] for o in result["occurrences"]] == ALL_TRACE_IDS

@@ -14,18 +14,18 @@ LangGraph Server API (`langgraph_sdk`).
 A **deterministic LangGraph loop**, not an agent scaffold:
 
 ```
-load ──▶ analyze (once per trace, sequential) ──▶ consolidate ──▶ END
-            ▲            │
-            └────────────┘
+load ──▶ analyze (one batch of N traces, concurrently) ──▶ consolidate ──▶ END
+            ▲                     │
+            └─────────────────────┘
 ```
 
-- **`analyze`** — one superstep per trace. The analysis LLM gets the four
-  trace-inspection tools plus the running list of issue titles found so far in
-  this run, and emits raw findings `{trace_id, title, description, category_id,
-  severity, evidence}`. The tool loop is bounded
-  (`ENGINE_MAX_TOOL_CALLS_PER_TRACE`, default 16); the structured emit step that
-  follows is **tool-free**, so a reported finding is one the investigation log
-  supports.
+- **`analyze`** — one superstep per *batch* of N traces (default 8, see
+  "Analysis concurrency"). The analysis LLM gets the four trace-inspection tools
+  plus the running list of issue titles found so far in this run, and emits raw
+  findings `{trace_id, title, description, category_id, severity, evidence}`.
+  The tool loop is bounded (`ENGINE_MAX_TOOL_CALLS_PER_TRACE`, default 16); the
+  structured emit step that follows is **tool-free**, so a reported finding is
+  one the investigation log supports.
 - **`consolidate`** — the meta pass. The LLM decides only the *clustering*:
   which findings are the same failure mode, and which of them the seed board
   already names. `engine/consolidate.py:assemble_board` then does the merge in
@@ -83,7 +83,10 @@ board = client.runs.wait(
         "categories": [{"category_id", "name", "description"}, ...],
     },
     config={
-        "configurable": {"model": "gpt-5.1"},       # the comparison axis
+        "configurable": {
+            "model": "gpt-5.1",                     # the comparison axis
+            "analysis_concurrency": 8,              # traces analysed at once
+        },
         "recursion_limit": 2 * n_traces + 10,       # see below
     },
 )
@@ -104,10 +107,11 @@ Four things worth knowing:
 2. **`trace_file` is a path the server can read.** The corpus is not sent
    through the API and is never put into graph state — a 300-trace corpus in a
    checkpointed state would be re-serialized on every superstep.
-3. **Set `recursion_limit`.** The loop runs `2 + n_traces` supersteps, and
-   LangGraph's default of 25 caps a run at ~23 traces. The compiled graph raises
-   its own default to 10 000, but pass it explicitly on the run for anything
-   large.
+3. **Set `recursion_limit`.** The loop runs `2 + ceil(n_traces / N)` supersteps.
+   At the default N=8 that is ~40 for 300 traces, comfortably over LangGraph's
+   default of 25 — and N is a run-time knob, so do not rely on the arithmetic.
+   The compiled graph raises its own default to 10 000; pass it explicitly on
+   the run for anything large.
 4. **Partial failure is reported, not hidden.** A trace whose analysis throws is
    logged to stderr and skipped, and the failure count is printed on every run
    that has one. Past `MAX_TRACE_FAILURE_RATE` (20% of traces) the consolidate
@@ -121,6 +125,45 @@ Four things worth knowing:
    time consolidation runs every per-trace pass has already been paid for — and
    one arm of a model comparison losing consolidation while the other completes
    would read as a quality difference rather than an outage.
+
+## Analysis concurrency — the speed/context knob
+
+`config.configurable["analysis_concurrency"]` sets how many traces are analysed
+at once. Default **8**, clamped to **1–16** (an out-of-range value costs speed,
+not the run); `$ENGINE_ANALYSIS_CONCURRENCY` sets a global default.
+
+A trace costs roughly 30 s to analyse, so 300 strictly sequential traces is over
+two hours — the assignment deliverable does not fit. Batching is the fix, and
+the batch is deliberately the unit of **shared context** as well as of
+parallelism:
+
+| N | cross-trace context | 300-trace wall clock |
+|---|---|---|
+| 1 | maximal — every trace sees every title found before it | ~2.5 h |
+| 8 (default) | each batch sees all titles from **previous** batches | ~20 min |
+| 16 | coarser still; watch for provider rate limits | ~10 min |
+
+**Running titles are shared *between* batches, never *within* one.** Every trace
+in a batch gets the same snapshot, taken before the batch starts, and the titles
+the batch discovers are merged in before the next one begins. The alternative —
+letting a trace see whatever its batchmates had finished by then — would make
+the analysis depend on thread scheduling, and two runs over the same corpus
+would stop being comparable.
+
+For the same reason findings are assembled in **input trace order**, not
+completion order, and the run's board is byte-identical at N=1, 3 and 8 given
+the same per-trace results. N=1 reproduces the fully sequential behaviour
+exactly.
+
+Failure isolation composes with the threshold above: an exception inside one
+worker is caught in that worker, so it costs its own trace and neither its
+batchmates nor the run — and those failures still count toward
+`MAX_TRACE_FAILURE_RATE` across the whole corpus.
+
+Threads rather than asyncio, deliberately: the node stays a plain sync callable
+that behaves identically whether LangGraph drives it sync or async, and
+`ThreadPoolExecutor.map` yields in input order regardless of who finishes first.
+The work is blocking HTTP, so the GIL is not the constraint.
 
 ## Model selection — the comparison axis
 

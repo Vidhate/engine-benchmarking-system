@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, Any, NotRequired, TypedDict
 
@@ -49,10 +50,38 @@ MAX_TOOL_CALLS_ENV_VAR = "ENGINE_MAX_TOOL_CALLS_PER_TRACE"
 # wearing the shape of "the Engine found almost nothing".
 MAX_TRACE_FAILURE_RATE = 0.2
 
-# Supersteps per run are 2 + one per trace, so the LangGraph default recursion
-# limit of 25 caps a run at ~23 traces. Raised on the compiled graph; callers
-# driving large sets should still pass an explicit `recursion_limit` on the run
-# config (see README, "Invoking the Engine").
+# Traces analysed concurrently within one batch. Batches themselves stay
+# sequential, because the running title list is what lets a later trace
+# recognise a failure mode an earlier one already named.
+ANALYSIS_CONCURRENCY_KEY = "analysis_concurrency"
+ANALYSIS_CONCURRENCY_ENV_VAR = "ENGINE_ANALYSIS_CONCURRENCY"
+DEFAULT_ANALYSIS_CONCURRENCY = 8
+MIN_ANALYSIS_CONCURRENCY = 1
+MAX_ANALYSIS_CONCURRENCY = 16
+
+
+def resolve_concurrency(config: RunnableConfig | None = None) -> int:
+    """Batch size for the analysis pass: run config, then env, then the default.
+
+    Clamped rather than validated: an out-of-range value is a caller's typo, and
+    refusing the whole run over it would be a worse outcome than running at a
+    sane speed. 1 restores strictly sequential analysis.
+    """
+    configurable = (config or {}).get("configurable") or {}
+    raw = configurable.get(ANALYSIS_CONCURRENCY_KEY)
+    if raw is None:
+        raw = os.environ.get(ANALYSIS_CONCURRENCY_ENV_VAR)
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_ANALYSIS_CONCURRENCY
+    return max(MIN_ANALYSIS_CONCURRENCY, min(MAX_ANALYSIS_CONCURRENCY, value))
+
+# Supersteps per run are 2 + ceil(n_traces / analysis_concurrency), so at the
+# default batch size the LangGraph default limit of 25 caps a run at ~184
+# traces — comfortable, but not comfortable enough to rely on when the batch
+# size is a run-time knob. Raised on the compiled graph; callers driving large
+# sets should still pass an explicit `recursion_limit` (see README).
 RECURSION_LIMIT = 10_000
 
 
@@ -136,39 +165,76 @@ def load_node(state: EngineState) -> dict[str, Any]:
 
 
 def analyze_node(state: EngineState, config: RunnableConfig) -> dict[str, Any]:
-    """One superstep = one trace, so a long run checkpoints as it goes."""
+    """One superstep = one batch of traces, analysed concurrently.
+
+    Batching is what makes the assignment's scale affordable: a trace takes
+    ~30s to analyse, so 300 strictly sequential traces is over two hours. The
+    batch is the unit of *shared context* as well as of parallelism — every
+    trace in a batch sees the same running title list, and the titles the batch
+    discovers are merged in before the next one starts. Cross-trace context is
+    therefore traded for throughput in exactly one place, and `N=1` gives back
+    the fully sequential behaviour where every trace sees all its predecessors.
+    """
     index = trace_index(state["trace_file"])
     cursor = state.get("cursor", 0)
-    trace_id = state["trace_ids"][cursor]
+    concurrency = resolve_concurrency(config)
+    batch = state["trace_ids"][cursor : cursor + concurrency]
+
     model = build_model(resolve_model_name(config))
+    # Snapshotted before the batch runs: titles are shared BETWEEN batches, not
+    # within one, or the analysis would depend on which worker finished first.
+    running_titles = list(state.get("running_titles") or [])
+    categories = _categories(state)
+    max_tool_calls = _max_tool_calls()
 
-    try:
-        findings = analyze_trace(
-            model=model,
-            index=index,
-            trace_id=trace_id,
-            running_titles=list(state.get("running_titles") or []),
-            categories=_categories(state),
-            max_tool_calls=_max_tool_calls(),
-        )
-    except Exception as exc:
-        # One unhappy trace must not abandon the other N-1. A systemic failure
-        # (bad key, unknown model) fails every trace and is re-raised at
-        # consolidation rather than being reported as "no issues found".
-        message = f"{trace_id}: {type(exc).__name__}: {exc}"
-        print(f"[engine] analysis failed for {message}", file=sys.stderr)
-        return {"cursor": cursor + 1, "errors": [message]}
+    def analyse(trace_id: str) -> tuple[str, list, str | None]:
+        try:
+            findings = analyze_trace(
+                model=model,
+                index=index,
+                trace_id=trace_id,
+                running_titles=running_titles,
+                categories=categories,
+                max_tool_calls=max_tool_calls,
+            )
+            return trace_id, findings, None
+        except Exception as exc:
+            # Caught inside the worker so one unhappy trace costs neither its
+            # batchmates nor the rest of the run. A systemic failure fails every
+            # trace and is re-raised at consolidation by the rate check.
+            message = f"{trace_id}: {type(exc).__name__}: {exc}"
+            print(f"[engine] analysis failed for {message}", file=sys.stderr)
+            return trace_id, [], message
 
-    known = set(state.get("running_titles") or [])
-    new_titles = []
-    for finding in findings:
-        if finding.title not in known:
-            known.add(finding.title)
-            new_titles.append(finding.title)
+    if concurrency == 1:
+        results = [analyse(trace_id) for trace_id in batch]
+    else:
+        # Threads, not asyncio: the node stays a plain sync callable that
+        # behaves the same whether LangGraph drives it sync or async, and
+        # `map` yields in input order regardless of completion order — run
+        # comparability depends on the findings list not being a race result.
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="engine") as pool:
+            results = list(pool.map(analyse, batch))
+
+    known = set(running_titles)
+    new_titles: list[str] = []
+    findings: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for _, trace_findings, error in results:
+        if error:
+            errors.append(error)
+            continue
+        for finding in trace_findings:
+            findings.append(finding.model_dump(mode="json"))
+            if finding.title not in known:
+                known.add(finding.title)
+                new_titles.append(finding.title)
+
     return {
-        "cursor": cursor + 1,
-        "findings": [f.model_dump(mode="json") for f in findings],
+        "cursor": cursor + len(batch),
+        "findings": findings,
         "running_titles": new_titles,
+        "errors": errors,
     }
 
 
