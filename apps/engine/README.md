@@ -35,7 +35,26 @@ load ──▶ analyze (one batch of N traces, concurrently) ──▶ consolida
   that pair being what scoring consumes — and seed issues gaining occurrences
   rather than duplicates.
 
-  Findings are clustered **in batches of 80**, then merged across batches: a
+    **No scored field carries a default.** `category_id` and `severity` are
+  required on both LLM-facing schemas (`FindingExtraction` and `Cluster`), so
+  the provider's structured output forces the model to predict them. A default
+  there would make silence a scoreable answer, and the benchmark would be
+  grading the default's luck against the ground-truth distribution rather than
+  the model's judgement. `trace_id` is kept off the extraction schema entirely —
+  the orchestrator knows which trace it asked about and stamps it, so a
+  mis-attributed finding is not expressible. Only unscored localization hints
+  (`evidence`, `span_id`, `turn_index`) stay optional. A response missing a
+  required field fails validation into the counted failure path; it never
+  becomes a defaulted finding. Guarded by
+  `tests/test_no_defaulted_predictions.py`, which asserts on the generated JSON
+  schema itself.
+
+  An *invented* category (something outside the vocabulary) is different from an
+  absent one: it is a real prediction we cannot map, so it is still coerced to
+  `other` — and now counted, with a stderr line, because the coercion rate is a
+  per-model quality signal.
+
+Findings are clustered **in batches of 80**, then merged across batches: a
   single call over 300 traces' findings would carry tens of thousands of tokens,
   and the failure that produces arrives at the one point in the run where
   everything else is already paid for. `fold_clusters` reunites identically
@@ -243,7 +262,7 @@ Two guards, in `tests/test_no_leak.py`:
 ## Tests and gates
 
 ```bash
-uv run pytest                       # 146 unit tests, no network
+uv run pytest                       # 170 unit tests, no network
 uv run ruff check engine tests scripts
 scripts/smoke.sh                    # all three gates, ~10 min, needs a real key
 ```

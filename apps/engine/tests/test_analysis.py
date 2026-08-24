@@ -9,13 +9,14 @@ from engine.analysis import analyze_trace, consolidate
 from engine.models import (
     Cluster,
     ConsolidationPlan,
+    FindingExtraction,
+    FindingExtractionList,
     RawFinding,
-    RawFindingList,
     SeedIssueboard,
 )
 from tests.fakes import FakeChatModel, tool_call
 
-TICKET_FINDING = RawFinding(
+TICKET_EXTRACTION = FindingExtraction(
     title="Tool error reported to the user as success",
     description="create_ticket returned an error; the answer claims a ticket was created.",
     category_id="tool_misuse",
@@ -24,6 +25,9 @@ TICKET_FINDING = RawFinding(
     span_id="s-t-2",
     turn_index=0,
 )
+
+# The same observation once the orchestrator has stamped its trace.
+TICKET_FINDING = RawFinding(trace_id="trace-planted-ticket", **TICKET_EXTRACTION.model_dump())
 
 
 def model(responses=None, structured=None) -> FakeChatModel:
@@ -49,7 +53,7 @@ def emit_prompt(fake: FakeChatModel) -> str:
 
 def test_a_clean_trace_yields_no_findings(index, categories):
     fake = model(responses=[AIMessage(content="Nothing wrong here.")],
-                 structured=[RawFindingList()])
+                 structured=[FindingExtractionList()])
     assert analyze_trace(fake, index, "trace-clean-pricing", [], categories) == []
 
 
@@ -60,7 +64,7 @@ def test_tool_calls_are_executed_and_fed_back(index, categories):
             tool_call("read_span", {"trace_id": "trace-planted-ticket", "span_id": "s-t-2"}, "c2"),
             AIMessage(content="The ticket tool failed but the answer says it succeeded."),
         ],
-        structured=[RawFindingList(findings=[TICKET_FINDING])],
+        structured=[FindingExtractionList(findings=[TICKET_EXTRACTION])],
     )
     findings = analyze_trace(fake, index, "trace-planted-ticket", [], categories)
 
@@ -74,15 +78,14 @@ def test_tool_calls_are_executed_and_fed_back(index, categories):
 def test_the_analysis_trace_id_overrides_whatever_the_model_reports(index, categories):
     """A model-supplied trace_id would let one trace's finding be filed against
     another trace's occurrences, silently corrupting the {trace_id, error_id} matrix."""
-    stray = TICKET_FINDING.model_copy(update={"trace_id": "some-other-trace"})
     fake = model(responses=[AIMessage(content="done")],
-                 structured=[RawFindingList(findings=[stray])])
+                 structured=[FindingExtractionList(findings=[TICKET_EXTRACTION])])
     findings = analyze_trace(fake, index, "trace-planted-ticket", [], categories)
     assert findings[0].trace_id == "trace-planted-ticket"
 
 
 def test_running_titles_and_categories_reach_the_analysis_prompt(index, categories):
-    fake = model(responses=[AIMessage(content="ok")], structured=[RawFindingList()])
+    fake = model(responses=[AIMessage(content="ok")], structured=[FindingExtractionList()])
     analyze_trace(fake, index, "trace-clean-pricing", ["Truncated response"], categories)
     system = next(m for m in fake.calls[0] if isinstance(m, SystemMessage)).content
     assert "Truncated response" in system
@@ -95,7 +98,7 @@ def test_the_emit_step_sees_the_tool_log_and_has_no_tools(index, categories):
     fake = model(
         responses=[tool_call("search_text", {"query": "14 days"}, "c1"),
                    AIMessage(content="The answer contradicts the retrieved policy.")],
-        structured=[RawFindingList()],
+        structured=[FindingExtractionList()],
     )
     analyze_trace(fake, index, "trace-planted-refund", [], categories)
     prompt = emit_prompt(fake)
@@ -110,7 +113,7 @@ def test_the_tool_budget_is_enforced(index, categories):
     fake = model(
         responses=[tool_call("get_trace", {"trace_id": "trace-clean-pricing"}, f"c{i}")
                    for i in range(10)],
-        structured=[RawFindingList()],
+        structured=[FindingExtractionList()],
     )
     analyze_trace(fake, index, "trace-clean-pricing", [], categories, max_tool_calls=3)
     prompt = emit_prompt(fake)
@@ -122,7 +125,7 @@ def test_the_tool_budget_is_enforced(index, categories):
 def test_a_hallucinated_tool_call_does_not_stop_the_pass(index, categories):
     fake = model(
         responses=[tool_call("write_file", {"path": "/tmp/x"}, "c1"), AIMessage(content="ok")],
-        structured=[RawFindingList()],
+        structured=[FindingExtractionList()],
     )
     analyze_trace(fake, index, "trace-clean-pricing", [], categories)
     assert "no such tool" in fed_back_tool_messages(fake)[0].content
@@ -130,13 +133,16 @@ def test_a_hallucinated_tool_call_does_not_stop_the_pass(index, categories):
 
 def test_a_dict_shaped_structured_result_is_accepted(index, categories):
     fake = model(responses=[AIMessage(content="ok")],
-                 structured=[{"findings": [TICKET_FINDING.model_dump()]}])
+                 structured=[{"findings": [TICKET_EXTRACTION.model_dump()]}])
     assert len(analyze_trace(fake, index, "trace-planted-ticket", [], categories)) == 1
 
 
-def test_an_unusable_structured_result_yields_no_findings(index, categories):
+def test_an_unusable_structured_result_raises_into_the_counted_failure_path(index, categories):
+    """Returning [] here would report a broken response as "this trace looked
+    clean" — a silent fabrication that moves the score."""
     fake = model(responses=[AIMessage(content="ok")], structured=[None])
-    assert analyze_trace(fake, index, "trace-planted-ticket", [], categories) == []
+    with pytest.raises(ValueError, match="no usable structured output"):
+        analyze_trace(fake, index, "trace-planted-ticket", [], categories)
 
 
 # -- consolidation ---------------------------------------------------------

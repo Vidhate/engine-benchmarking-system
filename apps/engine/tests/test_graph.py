@@ -11,7 +11,13 @@ from langchain_core.messages import AIMessage
 
 from engine import graph as graph_module
 from engine.llm import DEFAULT_MODEL, resolve_model_name
-from engine.models import Cluster, ConsolidationPlan, RawFinding, RawFindingList
+from engine.models import (
+    Cluster,
+    ConsolidationPlan,
+    FindingExtraction,
+    FindingExtractionList,
+    RawFinding,
+)
 from tests.fakes import FakeChatModel
 
 ALL_TRACE_IDS = [
@@ -24,6 +30,7 @@ ALL_TRACE_IDS = [
 ]
 
 TICKET_FINDING = RawFinding(
+    trace_id="trace-planted-ticket",
     title="Tool error reported to the user as success",
     description="create_ticket errored; the answer claims a ticket was created.",
     category_id="tool_misuse",
@@ -45,7 +52,14 @@ def script_for(fake, per_trace_findings: dict[str, list[RawFinding]], plan=None,
     """One AIMessage + one RawFindingList per trace, then the plan."""
     fake.responses.extend(AIMessage(content="reviewed") for _ in range(n))
     for trace_id in ALL_TRACE_IDS[:n]:
-        fake.structured.append(RawFindingList(findings=per_trace_findings.get(trace_id, [])))
+        fake.structured.append(
+            FindingExtractionList(
+                findings=[
+                    FindingExtraction(**f.model_dump(exclude={"trace_id"}))
+                    for f in per_trace_findings.get(trace_id, [])
+                ]
+            )
+        )
     if plan is not None:
         fake.structured.append(plan)
 
@@ -496,7 +510,15 @@ def test_a_real_analysis_pass_runs_concurrently_end_to_end(
         trace_id = next(t for t in ALL_TRACE_IDS if t in text)
         with seen_lock:
             seen.append(trace_id)
-        return RawFindingList(findings=[TICKET_FINDING.model_copy(update={"title": "Shared"})])
+        return FindingExtractionList(
+            findings=[
+                FindingExtraction(
+                    **TICKET_FINDING.model_copy(update={"title": "Shared"}).model_dump(
+                        exclude={"trace_id"}
+                    )
+                )
+            ]
+        )
 
     fake = FakeChatModel(responses=[], structured=[], router=router)
     monkeypatch.setattr(graph_module, "build_model", lambda name: fake)

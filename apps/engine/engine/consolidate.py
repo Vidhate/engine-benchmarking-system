@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from collections.abc import Iterable
 
 from engine.models import (
@@ -229,6 +230,7 @@ def assemble_board(
     # so a model that lists the same finding under two clusters cannot inflate
     # the board with a duplicate issue.
     claimed: set[int] = set()
+    coerced: list[str] = []
 
     for cluster in plan.clusters:
         members = _members(cluster, findings, claimed)
@@ -241,13 +243,20 @@ def assemble_board(
         else:
             error_id = _unique_id(f"ep-{slug(cluster.title)}", used_ids)
             used_ids.add(error_id)
+            category_id = valid_category(cluster.category_id, categories)
+            if category_id != cluster.category_id:
+                # A category the model invented is a real prediction we cannot
+                # map, not an absent one — different from a default, and kept.
+                # Counted because the rate is a per-model quality signal: an
+                # Engine that keeps inventing vocabulary is telling us something.
+                coerced.append(f"{cluster.category_id!r} ({cluster.title})")
             issues.append(
                 Issue(
                     error_id=error_id,
                     title=cluster.title.strip() or "Unnamed issue",
                     description=cluster.description.strip()[:MAX_DESCRIPTION_CHARS],
-                    category_id=valid_category(cluster.category_id, categories),
-                    severity=_max_severity([cluster.severity]),  # type: ignore[arg-type]
+                    category_id=category_id,
+                    severity=cluster.severity,
                 )
             )
         for finding in members:
@@ -267,6 +276,13 @@ def assemble_board(
             )
             by_pair[pair] = occurrence
             occurrences.append(occurrence)
+
+    if coerced:
+        print(
+            f"[engine] coerced {len(coerced)} out-of-vocabulary category/ies to "
+            f"'{OTHER_CATEGORY_ID}': {'; '.join(coerced)}",
+            file=sys.stderr,
+        )
 
     board = Issueboard(source="engine_predicted", issues=issues, occurrences=occurrences)
     return board.model_copy(update={"board_id": board_id(board)})

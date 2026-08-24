@@ -34,10 +34,10 @@ def test_no_filesystem_shell_or_delegation_tool_is_registered(index):
 def test_the_model_is_bound_to_exactly_the_registry(index, categories):
     """What the graph binds is what the graph dispatches — no hidden extras."""
     from engine.analysis import analyze_trace
-    from engine.models import RawFindingList
+    from engine.models import FindingExtractionList
     from tests.fakes import FakeChatModel
 
-    model = FakeChatModel(responses=[], structured=[RawFindingList()])
+    model = FakeChatModel(responses=[], structured=[FindingExtractionList()])
     analyze_trace(model, index, "trace-clean-pricing", [], categories)
     assert {t.name for t in model.bound_tools} == TRACE_TOOL_NAMES
 

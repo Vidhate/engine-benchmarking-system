@@ -24,9 +24,10 @@ from engine.consolidate import (
 from engine.models import (
     Category,
     ConsolidationPlan,
+    FindingExtraction,
+    FindingExtractionList,
     Issueboard,
     RawFinding,
-    RawFindingList,
     SeedIssueboard,
 )
 from engine.tools import build_trace_tools
@@ -94,7 +95,7 @@ def analyze_trace(
     else:
         log.append("(tool-call budget exhausted)")
 
-    emit = model.with_structured_output(RawFindingList)
+    emit = model.with_structured_output(FindingExtractionList)
     result = emit.invoke(
         [
             SystemMessage(prompts.EMIT_SYSTEM),
@@ -109,10 +110,12 @@ def analyze_trace(
             ),
         ]
     )
-    findings = _as_findings(result)
-    # The trace under analysis is authoritative: a model-supplied trace_id would
-    # let one trace's findings be filed against another's occurrences.
-    return [f.model_copy(update={"trace_id": trace_id}) for f in findings]
+    # The trace under analysis is authoritative, and it is the orchestrator that
+    # knows it — hence the stamp here rather than a field on the model's schema.
+    return [
+        RawFinding(trace_id=trace_id, **extraction.model_dump())
+        for extraction in _as_extractions(result)
+    ]
 
 
 def _dispatch(registry: dict, call: dict) -> str:
@@ -129,12 +132,22 @@ def _dispatch(registry: dict, call: dict) -> str:
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
 
 
-def _as_findings(result) -> list[RawFinding]:
-    if isinstance(result, RawFindingList):
+def _as_extractions(result) -> list[FindingExtraction]:
+    """Coerce the structured-output result, or raise.
+
+    Raising matters: a model response missing a required `category_id` or
+    `severity` must land in the per-trace failure accounting, where it is
+    counted and reported. Returning `[]` here instead would turn a broken
+    response into "this trace looked clean" — a silent, and silently
+    score-affecting, fabrication.
+    """
+    if isinstance(result, FindingExtractionList):
         return list(result.findings)
     if isinstance(result, dict):
-        return list(RawFindingList.model_validate(result).findings)
-    return []
+        return list(FindingExtractionList.model_validate(result).findings)
+    raise ValueError(
+        f"analysis returned no usable structured output: {type(result).__name__}"
+    )
 
 
 def consolidate(

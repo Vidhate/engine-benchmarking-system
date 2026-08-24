@@ -124,23 +124,66 @@ class SeedIssueboard(_Strict):
 # --------------------------------------------------------------------------
 
 
-class RawFinding(BaseModel):
-    """One unconsolidated observation from the per-trace analysis pass."""
+# NOTE ON DEFAULTS (applies to every LLM-facing schema below).
+#
+# A field the model may omit, that then arrives at scoring carrying a default,
+# is a prediction the Engine never made being graded as though it had. Default
+# `category_id="other"` and `severity="medium"` would do exactly that: silence
+# becomes a scoreable answer, and the benchmark measures the default's luck
+# against the ground-truth distribution instead of the model's judgement.
+#
+# So on these schemas: anything SCORED is required — no default, no fallback —
+# and the model is forced to predict it. Anything the orchestrator already
+# knows (trace_id) is kept off the model's schema entirely, so a construction
+# bug fails loudly instead of quietly emitting "". Only unscored localization
+# hints stay optional.
 
-    trace_id: str = ""
+
+class FindingExtraction(BaseModel):
+    """LLM-facing schema for one finding. Pydantic marks the fields without
+    defaults `required` in the generated JSON schema, and OpenAI structured
+    output enforces that, so the model cannot decline to answer.
+
+    `trace_id` is deliberately ABSENT: the orchestrator knows which trace it
+    asked about, and stamps it (`analysis.analyze_trace`). Asking the model for
+    it invites a mis-attributed finding, which would corrupt the
+    {trace_id, error_id} matrix scoring consumes.
+    """
+
     title: str
     description: str
-    category_id: str = OTHER_CATEGORY_ID
-    severity: Severity = "medium"
+    category_id: str  # required — scored
+    severity: Severity  # required — scored
+    # Unscored localization hints: helpful for auditing an occurrence, never
+    # graded, so absence here costs nothing and forcing them would only push
+    # the model to invent a span id it could not find.
     evidence: str = ""
     span_id: str | None = None
     turn_index: int | None = None
 
 
-class RawFindingList(BaseModel):
+class FindingExtractionList(BaseModel):
     """Structured-output envelope for one trace's findings."""
 
-    findings: list[RawFinding] = Field(default_factory=list)
+    findings: list[FindingExtraction] = Field(default_factory=list)
+
+
+class RawFinding(BaseModel):
+    """One unconsolidated observation, after the orchestrator stamps its trace.
+
+    `trace_id` is required here precisely because it is not on the extraction
+    schema — if the stamping step is ever skipped, construction raises rather
+    than producing a finding attributed to "".
+    """
+
+    trace_id: str
+    title: str
+    description: str
+    category_id: str
+    severity: Severity
+    evidence: str = ""
+    span_id: str | None = None
+    turn_index: int | None = None
 
 
 # --------------------------------------------------------------------------
@@ -153,9 +196,15 @@ class Cluster(BaseModel):
 
     title: str
     description: str
-    category_id: str = OTHER_CATEGORY_ID
-    severity: Severity = "medium"
+    # Required for the same reason as on FindingExtraction, and more urgently:
+    # the canonical Issue the benchmark scores takes its category and severity
+    # from HERE, so a default on this schema is a defaulted prediction sitting
+    # directly on the board.
+    category_id: str
+    severity: Severity
     # Index into the flat raw-findings list handed to the consolidation pass.
+    # Structural bookkeeping, not a prediction — an empty grouping is a real,
+    # meaningful answer, so the default stays.
     finding_indices: list[int] = Field(default_factory=list)
     # Set when this cluster is the same failure mode as an issue already on the
     # seed board; the cluster then attaches occurrences instead of creating a
