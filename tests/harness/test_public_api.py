@@ -207,3 +207,31 @@ def test_replay_is_importable_as_a_module_level_function(tmp_path):
     harness, _app, _store = build(tmp_path)
     trace = replay("thread-7", "ckpt-3", {"messages": []}, ["one"], harness=harness, input_id="i")
     assert trace.trace_id
+
+
+# ---------------------------------------------------- locating the fork point
+
+def test_locate_checkpoint_finds_the_snapshot_that_ends_with_a_given_answer(tmp_path):
+    harness, app, _store = build(tmp_path)
+    # The SDK returns history newest-first.
+    app.get_history = lambda thread_id, limit=100: [
+        {
+            "checkpoint": {"checkpoint_id": "ckpt-2"},
+            "values": {"messages": [{"type": "ai", "id": "m2", "content": "second answer"}]},
+        },
+        {
+            "checkpoint": {"checkpoint_id": "ckpt-1"},
+            "values": {"messages": [{"type": "ai", "id": "m1", "content": "first answer"}]},
+        },
+        {"checkpoint": {"checkpoint_id": "ckpt-0"}, "values": {"messages": []}},
+    ]
+
+    assert harness.locate_checkpoint("t", "first answer") == ("ckpt-1", "m1")
+    assert harness.locate_checkpoint("t", "second answer") == ("ckpt-2", "m2")
+
+
+def test_locate_checkpoint_fails_loudly_when_the_answer_is_not_on_the_thread(tmp_path):
+    harness, app, _store = build(tmp_path)
+    app.get_history = lambda thread_id, limit=100: []
+    with pytest.raises(KeyError):
+        harness.locate_checkpoint("t", "never said this")

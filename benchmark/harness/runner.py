@@ -31,6 +31,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from benchmark.harness.client import LangGraphAppClient, TargetAppClient
+from benchmark.harness.client import message_text as _text_of
 from benchmark.harness.collector import (
     IngestionTimeout,
     LangSmithCollector,
@@ -467,6 +468,28 @@ class Harness:
             trace, fault_config, baseline=baseline
         )
         return trace
+
+    def locate_checkpoint(self, thread_id: str, response_text: str) -> tuple[str, str]:
+        """Find where to fork for a Mode-A edit of `response_text`.
+
+        Returns `(checkpoint_id, message_id)`: the checkpoint whose newest
+        message *is* that assistant response, and the id `update_state` needs
+        to rewrite it in place. Reading the thread's checkpoint history is the
+        one piece of LangGraph knowledge Phase 5 would otherwise have to
+        duplicate, so it lives behind this boundary.
+        """
+        for snapshot in reversed(self.client.get_history(thread_id)):  # oldest -> newest
+            messages = (snapshot.get("values") or {}).get("messages") or []
+            if not messages:
+                continue
+            last = messages[-1]
+            if (last.get("type") or last.get("role")) != "ai":
+                continue
+            if _text_of(last).strip() == response_text.strip():
+                return snapshot["checkpoint"]["checkpoint_id"], last["id"]
+        raise KeyError(
+            f"no checkpoint on thread {thread_id} ends with the given assistant response"
+        )
 
     def replay(
         self,
