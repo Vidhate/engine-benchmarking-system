@@ -59,6 +59,19 @@ def test_every_input_produced_a_trace(run):
     assert len(run.traces.traces) == len(run.inputs.inputs)
 
 
+def test_a_slice_that_selects_nothing_is_refused(cfg, fake_harness_factory):
+    """A benchmark over zero inputs would run to completion and report nothing."""
+    empty = cfg.model_copy(update={"max_inputs": 0}).with_root(cfg.root)
+    with pytest.raises(ValueError, match="none of the"):
+        run_pipeline(
+            empty,
+            ablation_stage=fake_run_ablation,
+            engine_invoker=FakeEngineInvoker(),
+            harness_factory=fake_harness_factory,
+            expander=FakeExpander(),
+        )
+
+
 # -------------------------------------------------------------- the artifacts
 
 EXPECTED_ARTIFACTS = [
@@ -100,6 +113,31 @@ def test_traces_descend_from_inputs(run):
 
 def test_the_ablated_set_descends_from_the_traces(run):
     assert run.ablated.parent_dataset_id == run.traces.dataset_id
+
+
+def test_broken_ablation_lineage_is_warned_about_not_swallowed(cfg, fake_harness_factory):
+    """The pipeline does not own Phase 5's lineage — it does notice when it breaks."""
+    invoker = FakeEngineInvoker()
+
+    def orphaning_stage(**kwargs):
+        result = fake_run_ablation(**kwargs)
+        result.ablated = result.ablated.model_copy(update={"parent_dataset_id": None})
+        invoker.ground_truth = result.ground_truth
+        return result
+
+    run = run_pipeline(
+        cfg,
+        ablation_stage=orphaning_stage,
+        engine_invoker=invoker,
+        harness_factory=fake_harness_factory,
+        expander=FakeExpander(),
+    )
+    assert any("lineage is broken" in w for w in run.manifest.warnings)
+    assert not by_name(run.deliverables)["dataset_lineage"].ok
+
+
+def by_name(checks):
+    return {c.name: c for c in checks}
 
 
 def test_the_manifest_records_the_whole_chain(run):

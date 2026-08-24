@@ -123,6 +123,12 @@ def slice_inputs(inputs: InputDataset, cfg: PipelineConfig) -> InputDataset:
         specs = [s for s in specs if s.mode in cfg.input_modes]
     if cfg.max_inputs is not None and len(specs) > cfg.max_inputs:
         specs = sorted(specs, key=lambda s: s.input_id)[: cfg.max_inputs]
+    if not specs:
+        raise ValueError(
+            f"the slice (input_modes={cfg.input_modes}, max_inputs={cfg.max_inputs}) left "
+            f"none of the {len(inputs.inputs)} generated input(s) — a benchmark over zero "
+            f"inputs would run to completion and report nothing"
+        )
     if len(specs) == len(inputs.inputs):
         return inputs
     return stamp_dataset_id(
@@ -304,9 +310,17 @@ def run_pipeline(
             )
 
     ablated: TraceDataset = result.ablated
-    ground_truth: Issueboard = result.ground_truth
+    # Idempotent (the hash excludes the id field itself): stamping a board that
+    # is already stamped is a no-op, and an unstamped one would otherwise reach
+    # the manifest with an empty dataset id.
+    ground_truth: Issueboard = stamp_dataset_id(result.ground_truth)
     records: list[AblationRecord] = list(result.records)
     split: AblationSplit = result.split
+    if ablated.parent_dataset_id != traces.dataset_id:
+        warnings.append(
+            f"the ablated dataset's parent is {ablated.parent_dataset_id!r}, not the traces "
+            f"it was built from ({traces.dataset_id!r}) — lineage is broken"
+        )
     artifacts.write_model("ablated_traces", ablated)
     artifacts.write_model("ablation_split", split)
     artifacts.write_json(
@@ -446,7 +460,9 @@ def run_pipeline(
     # Runs last, and off the run directory rather than off these objects: the
     # deliverable is what someone else can pick up from disk, not what this
     # process happens to be holding.
-    checks = check_deliverables(cfg.run_dir, min_traces=cfg.deliverables.min_traces, judge=judge)
+    # `judge=None` on purpose: the re-score is a reproducibility check, and
+    # re-running an LLM judge would both fail to reproduce and double its cost.
+    checks = check_deliverables(cfg.run_dir, min_traces=cfg.deliverables.min_traces)
     artifacts.write_json("deliverables", [c.model_dump(mode="json") for c in checks])
     for check in checks:
         (log.info if check.ok else log.error)(

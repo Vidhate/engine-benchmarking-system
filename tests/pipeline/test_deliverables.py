@@ -74,6 +74,20 @@ def test_score_can_be_re_run_from_the_artifacts_alone(mini_run):
     assert rescored.report_id == mini_run.report.report_id
 
 
+def test_a_judge_scored_run_excludes_the_judge_headline_out_loud(mini_run):
+    """An LLM judge cannot be reproduced offline; the check says so rather than
+    silently re-scoring under a different rubric."""
+    path = mini_run.run_dir / "pipeline_config.json"
+    raw = json.loads(path.read_text())
+    raw["scoring"]["description_mode"] = "judge"
+    path.write_text(json.dumps(raw))
+    check = by_name(check_deliverables(mini_run.run_dir, min_traces=1))[
+        "standalone_scoring_entrypoint"
+    ]
+    assert check.ok
+    assert "mean_description_score excluded" in check.detail
+
+
 def test_the_scoring_check_notices_a_tampered_report(mini_run):
     path = mini_run.run_dir / "report.json"
     report = BenchmarkReport.model_validate_json(path.read_text())

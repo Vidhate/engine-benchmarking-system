@@ -14,7 +14,6 @@ machines. It lives on a private attribute instead.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Literal
 
@@ -195,7 +194,3 @@ def config_hashes(cfg: PipelineConfig) -> dict[str, str]:
         "scoring": content_hash(cfg.scoring),
         "harness": content_hash(cfg.harness),
     }
-
-
-def dump_config(cfg: PipelineConfig) -> str:
-    return json.dumps(cfg.model_dump(mode="json"), indent=2, sort_keys=True)

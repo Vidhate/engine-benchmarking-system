@@ -142,16 +142,31 @@ def check_deliverables(
         )
 
     def standalone_scoring() -> str:
+        raw_cfg = json.loads((run_dir / paths.pipeline_config).read_text())
+        recorded_mode = (raw_cfg.get("scoring") or {}).get("description_mode", "judge")
+        # An LLM judge is not reproducible offline, and re-running it here would
+        # also double the judging bill. Its headline is excluded, out loud,
+        # rather than being silently re-scored under a different rubric.
+        skip = {"mean_description_score"} if recorded_mode == "judge" and judge is None else set()
+
         rescored = rescore_from_disk(run_dir, paths=paths, judge=judge)
         original = _load(BenchmarkReport, run_dir / paths.report)
         drift = {
             key: (value, rescored.headline.get(key))
             for key, value in original.headline.items()
-            if abs(value - rescored.headline.get(key, float("nan"))) > 1e-9
+            if key not in skip
+            and abs(value - rescored.headline.get(key, float("nan"))) > 1e-9
         }
         if drift:
             raise AssertionError(f"re-scoring from disk did not reproduce the report: {drift}")
-        return f"score() re-run from artifacts reproduced all {len(original.headline)} headlines"
+        checked = len(original.headline) - len(skip & set(original.headline))
+        note = (
+            " (mean_description_score excluded: the run used an LLM judge, which cannot be "
+            "reproduced offline)"
+            if skip
+            else ""
+        )
+        return f"score() re-run from artifacts reproduced {checked} headline metric(s){note}"
 
     def lineage() -> str:
         manifest = _load(RunManifest, run_dir / paths.manifest)
