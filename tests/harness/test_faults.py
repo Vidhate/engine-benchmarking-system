@@ -84,17 +84,40 @@ def test_only_structural_behavior_names_join_the_leak_scan():
 
 # ----------------------------------------------------------------- activation
 
+def test_validation_strength_must_be_chosen_explicitly():
+    """Baseline-less validation is near-vacuous, so it cannot be the default.
+
+    Phase 5's step-3 validation must pass `baseline`; anything weaker has to
+    say so out loud.
+    """
+    fault = FaultConfig(shim="retriever", target="corpus_search", behavior="empty")
+    trace = trace_with(span("corpus_search", "retrieval", outputs={"output": []}))
+
+    with pytest.raises(ValueError) as excinfo:
+        activation_evidence(trace, fault)
+    assert "baseline" in str(excinfo.value)
+    assert "weak_validation" in str(excinfo.value)
+
+    # Weak form: acknowledged explicitly.
+    assert "output" in activation_evidence(trace, fault, weak_validation=True)
+    # Strong form: a byte-diff against the unarmed run.
+    unarmed = trace_with(
+        span("corpus_search", "retrieval", outputs={"output": [{"doc_id": "refund-policy"}]})
+    )
+    assert "output" in activation_evidence(trace, fault, baseline=unarmed)
+
+
 def test_activation_evidence_is_read_off_the_relevant_span():
     fault = FaultConfig(shim="retriever", target="corpus_search", behavior="empty")
     trace = trace_with(span("corpus_search", "retrieval", outputs={"output": []}))
-    assert "output" in activation_evidence(trace, fault)
+    assert "output" in activation_evidence(trace, fault, weak_validation=True)
 
 
 def test_a_dependency_that_was_never_exercised_cannot_have_activated():
     fault = FaultConfig(shim="retriever", target="corpus_search", behavior="empty")
     trace = trace_with(span("ChatOpenAI", "llm", outputs={"generations": []}))
     with pytest.raises(FaultNotActivated, match="retrieval"):
-        activation_evidence(trace, fault)
+        activation_evidence(trace, fault, weak_validation=True)
 
 
 def test_a_baseline_turns_activation_into_a_visible_diff():
@@ -118,9 +141,9 @@ def test_a_delay_parameter_must_show_up_in_the_span_duration():
     fast = trace_with(span("create_ticket", "tool", outputs={"output": "{}"}, duration_ms=120))
     slow = trace_with(span("create_ticket", "tool", outputs={"output": "{}"}, duration_ms=3400))
 
-    activation_evidence(slow, fault)
+    activation_evidence(slow, fault, weak_validation=True)
     with pytest.raises(FaultNotActivated, match="delay"):
-        activation_evidence(fast, fault)
+        activation_evidence(fast, fault, weak_validation=True)
 
 
 def test_the_named_target_span_is_preferred_when_it_exists():
@@ -129,7 +152,7 @@ def test_the_named_target_span_is_preferred_when_it_exists():
         span("rag_search", "tool", outputs={"output": "docs"}, span_id="a"),
         span("create_ticket", "tool", outputs={"output": '{"status": "error"}'}, span_id="b"),
     )
-    assert "error" in activation_evidence(trace, fault)
+    assert "error" in activation_evidence(trace, fault, weak_validation=True)
 
 
 def test_activation_looks_across_every_turn_of_a_multi_turn_trace():
@@ -153,4 +176,4 @@ def test_activation_looks_across_every_turn_of_a_multi_turn_trace():
             ),
         ],
     )
-    assert activation_evidence(trace, fault)
+    assert activation_evidence(trace, fault, weak_validation=True)

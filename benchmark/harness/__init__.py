@@ -22,6 +22,7 @@ from benchmark.harness.collector import (
     IngestionTimeout,
     LangSmithCollector,
     TraceCollector,
+    TurnCoverageError,
     TurnHint,
     VacuousProjectionError,
 )
@@ -34,6 +35,7 @@ from benchmark.harness.faults import (
 )
 from benchmark.harness.ids import session_id_for, trace_id_for
 from benchmark.harness.runner import (
+    AmbiguousCheckpoint,
     Harness,
     Quarantine,
     replay,
@@ -50,6 +52,7 @@ from benchmark.harness.simulator import (
 
 __all__ = [
     "DONE_TOKEN",
+    "AmbiguousCheckpoint",
     "AppResponse",
     "FaultNotActivated",
     "Harness",
@@ -62,6 +65,7 @@ __all__ = [
     "ScriptedUserSimulator",
     "TargetAppClient",
     "TraceCollector",
+    "TurnCoverageError",
     "TurnHint",
     "UndeclaredFault",
     "UserSimulator",

@@ -226,6 +226,39 @@ def test_uncollectable_traces_are_quarantined_with_a_reason_never_silently_dropp
     assert harness.stats["quarantined"] == 1
 
 
+def test_a_successful_rerun_clears_the_inputs_stale_quarantine_record(tmp_path):
+    inputs = make_inputs(2)
+    silent = session_id_for(inputs.dataset_id, "safe-1")
+    harness, app, store, quarantine, _ = build(tmp_path, inputs, silent_sessions={silent})
+
+    harness.run_batch(inputs)
+    assert quarantine.list_ids() == [silent]
+
+    # The app starts behaving; the stale quarantine record must not outlive it.
+    app.silent_sessions = set()
+    harness.run_batch(inputs)
+
+    assert quarantine.list_ids() == [], "a resolved quarantine record was left behind"
+    assert store.exists(trace_id_for(silent))
+
+
+def test_an_unreadable_stored_trace_re_runs_that_input_instead_of_killing_the_batch(tmp_path):
+    inputs = make_inputs(3)
+    harness, app, store, _q, _ = build(tmp_path, inputs)
+    harness.run_batch(inputs)
+
+    corrupted = trace_id_for(session_id_for(inputs.dataset_id, "safe-1"))
+    (tmp_path / "traces" / f"{corrupted}.json").write_text("{ this is not json")
+    calls_before = len(app.calls)
+
+    _outputs, traces = harness.run_batch(inputs)
+
+    assert len(traces.traces) == 3, "one corrupt file took the whole batch down"
+    assert len(app.calls) == calls_before + 1, "only the corrupt input should re-run"
+    assert harness.stats["skipped"] == 2
+    assert store.get(corrupted).input_id == "safe-1"
+
+
 # ------------------------------------------------------------------ multi-turn
 
 def test_a_persona_conversation_becomes_one_trace_with_per_turn_spans(tmp_path):

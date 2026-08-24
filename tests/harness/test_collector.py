@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from benchmark.harness.collector import (
     SPAN_SELECT,
     IngestionTimeout,
     LangSmithCollector,
+    TurnCoverageError,
     VacuousProjectionError,
 )
 from benchmark.harness.ids import trace_id_for
@@ -329,6 +332,112 @@ def test_collector_waits_for_all_expected_turn_roots():
     )
     with pytest.raises(IngestionTimeout):
         collector.collect("s-mt", input_id="i", mode="multi_turn", expected_turns=2)
+
+
+def test_retry_duplicated_roots_collapse_to_the_latest_attempt_per_turn():
+    """A retried turn leaves several roots carrying the SAME turn_index.
+
+    Slicing the raw list would assemble {failed attempt, retry, turn 1} and
+    silently drop turn 2 — a "3-turn" trace that never happened.
+    """
+    turn0_failed = react_agent_runs(
+        "s-mt", turn_index=0, trace_id="tr-0a", user_message="hi", final_response="(timed out)"
+    )
+    turn0_retry = react_agent_runs(
+        "s-mt", turn_index=0, trace_id="tr-0b", user_message="hi", final_response="hello"
+    )
+    turn1 = react_agent_runs(
+        "s-mt", turn_index=1, trace_id="tr-1", user_message="refunds?", final_response="30 days"
+    )
+    turn2 = react_agent_runs(
+        "s-mt", turn_index=2, trace_id="tr-2", user_message="thanks", final_response="anytime"
+    )
+    # The retry started later than the attempt it replaced.
+    for run in turn0_retry:
+        run.start_time = run.start_time + timedelta(seconds=30)
+        run.end_time = run.end_time + timedelta(seconds=30)
+
+    collector = make_collector(
+        FakeLangSmithClient(turn0_failed + turn0_retry + turn1 + turn2)
+    )
+    trace = collector.collect("s-mt", input_id="i", mode="multi_turn", expected_turns=3)
+
+    assert [t.turn_index for t in trace.turns] == [0, 1, 2]
+    assert [t.user_message for t in trace.turns] == ["hi", "refunds?", "thanks"]
+    assert trace.turns[0].final_response == "hello", "kept the failed attempt, not the retry"
+    assert trace.metadata["langsmith_trace_ids"] == ["tr-0b", "tr-1", "tr-2"]
+
+
+def test_duplicated_roots_do_not_let_the_wait_finish_before_every_turn_lands():
+    turn0_a = react_agent_runs("s-mt", turn_index=0, trace_id="tr-0a")
+    turn0_b = react_agent_runs("s-mt", turn_index=0, trace_id="tr-0b")
+    turn1 = react_agent_runs("s-mt", turn_index=1, trace_id="tr-1")
+    ticks = iter([float(i) for i in range(0, 2000)])
+    collector = make_collector(
+        FakeLangSmithClient(turn0_a + turn0_b + turn1),
+        root_timeout_s=5.0,
+        monotonic=lambda: next(ticks),
+    )
+    # Three roots exist, but they cover only turn indices {0, 1}.
+    with pytest.raises(IngestionTimeout) as excinfo:
+        collector.collect("s-mt", input_id="i", mode="multi_turn", expected_turns=3)
+    assert "[0, 1]" in str(excinfo.value)
+
+
+def test_a_turn_index_outside_the_expected_range_is_a_loud_failure():
+    turn0 = react_agent_runs("s-mt", turn_index=0, trace_id="tr-0")
+    stray = react_agent_runs("s-mt", turn_index=7, trace_id="tr-7")
+    collector = make_collector(FakeLangSmithClient(turn0 + stray))
+
+    with pytest.raises(TurnCoverageError, match="7"):
+        collector.collect("s-mt", input_id="i", mode="single_turn", expected_turns=1)
+
+
+# ------------------------------------------------ ingestion settle window
+
+def test_a_burst_flushed_tree_is_not_accepted_at_its_first_plateau():
+    """LangSmith flushes in bursts; a plateau is not the same as settled."""
+    full = react_agent_runs("s-abc")
+    root_only = [full[0]]
+    burst = full[:4]
+    schedule = [root_only, burst, burst, burst] + [full] * 8
+    collector = make_collector(FakeLangSmithClient(full, reveal_schedule=schedule))
+
+    trace = collector.collect("s-abc", input_id="i", mode="single_turn")
+
+    assert len(trace.turns[0].spans) == 6, "settled on a mid-burst plateau"
+
+
+def test_the_default_stability_window_covers_the_documented_ingestion_lag():
+    collector = LangSmithCollector(project="p", client=FakeLangSmithClient([]))
+    window_s = (collector.settle_polls - 1) * collector.poll_interval_s
+    assert window_s >= 10.0, "a ~2s window is meaningless against a ~30s ingestion lag"
+    assert collector.child_timeout_s > window_s
+
+
+def test_a_tree_with_no_llm_run_at_all_never_settles():
+    full = react_agent_runs("s-abc")
+    without_llm = [r for r in full if r.run_type != "llm"]
+    collector = make_collector(FakeLangSmithClient(without_llm), child_timeout_s=0.0)
+
+    with pytest.raises(IngestionTimeout, match="llm span present=False"):
+        collector.collect("s-abc", input_id="i", mode="single_turn")
+
+
+def test_the_structural_floor_is_checked_after_normalization_and_is_configurable():
+    """The app cannot answer without a model call, so too few llm spans means
+    an incomplete tree however stable the raw run count looked."""
+    full = react_agent_runs("s-abc")  # exactly one llm run, stable on every poll
+    collector = make_collector(FakeLangSmithClient(full), min_llm_spans=2)
+
+    with pytest.raises(IngestionTimeout, match="below the floor"):
+        collector.collect("s-abc", input_id="i", mode="single_turn")
+
+    # ...and the same tree is fine at the default floor of 1.
+    ok = make_collector(FakeLangSmithClient(full)).collect(
+        "s-abc", input_id="i", mode="single_turn"
+    )
+    assert sum(1 for s in ok.turns[0].spans if s.span_type == "llm") == 1
 
 
 def test_caller_supplied_turn_text_overrides_the_derived_text():

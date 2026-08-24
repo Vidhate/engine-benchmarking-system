@@ -92,13 +92,32 @@ def candidate_spans(trace: Trace, fault: FaultConfig) -> list[Span]:
 
 
 def activation_evidence(
-    trace: Trace, fault: FaultConfig, *, baseline: Trace | None = None
+    trace: Trace,
+    fault: FaultConfig,
+    *,
+    baseline: Trace | None = None,
+    weak_validation: bool = False,
 ) -> str:
     """Evidence that `fault` activated in `trace`, or raise `FaultNotActivated`.
 
     The returned string is what Phase 5 records as the `AblationRecord`'s
     activation evidence (`before_after` gets `("", <evidence>)`).
+
+    **Phase 5's step-3 validation must pass `baseline`** — the unarmed trace
+    for the same input. Only then is activation a byte-diff of the span the
+    fault must corrupt. Without a baseline the check degrades to "the
+    dependency ran at all" (plus a `delay_seconds` duration check), which a
+    completely disarmed run also passes, so the caller has to say
+    `weak_validation=True` to accept that. Passing neither is an error rather
+    than a silent downgrade.
     """
+    if baseline is None and not weak_validation:
+        raise ValueError(
+            "activation_evidence needs either baseline=<the unarmed trace for this "
+            "input> for a real byte-diff, or weak_validation=True to acknowledge the "
+            "weak form (which only proves the dependency was exercised, something a "
+            "disarmed run also does). Phase 5 step-3 validation must use baseline."
+        )
     spans = candidate_spans(trace, fault)
     span_type = SHIM_TO_SPAN_TYPE.get(fault.shim)
     if not spans:

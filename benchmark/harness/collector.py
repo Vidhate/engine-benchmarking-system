@@ -37,6 +37,11 @@ kept when:
 Any other run type is dropped. When a span is dropped its surviving children
 are re-parented onto the nearest surviving ancestor, so the tree stays
 connected and no `parent_span_id` dangles.
+
+Known limitation: the rule matches on names, so a *meaningful* graph node an
+app happens to name `route`, `should_continue` or `_write` would be filtered
+as plumbing. The pattern list is the place to fix that per app; nothing in the
+target app's graph currently collides.
 """
 
 from __future__ import annotations
@@ -128,6 +133,14 @@ class IngestionTimeout(Exception):
 
 class VacuousProjectionError(Exception):
     """A field this collector reads or audits came back None where it must exist."""
+
+
+class TurnCoverageError(Exception):
+    """The session's root runs do not map onto the turns the harness drove.
+
+    Raised when a root carries a turn_index outside `0..expected_turns-1` —
+    a stale or colliding session, not a slow one, so waiting cannot fix it.
+    """
 
 
 @runtime_checkable
@@ -297,9 +310,17 @@ class LangSmithCollector:
         *,
         cfg: TargetAppConfig | None = None,
         root_timeout_s: float = 90.0,
-        child_timeout_s: float = 45.0,
-        poll_interval_s: float = 2.0,
-        settle_polls: int = 2,
+        # Child spans lag the root by up to ~30s and arrive in bursts, so a
+        # plateau is not the same as settled. The stability window is
+        # (settle_polls - 1) * poll_interval_s = 10s by default; the total
+        # bound must comfortably exceed lag + window.
+        child_timeout_s: float = 60.0,
+        poll_interval_s: float = 2.5,
+        settle_polls: int = 5,
+        # Structural floor: the app cannot produce an answer without a model
+        # call, so a turn with no llm span is an incomplete tree, however
+        # stable the run count looked.
+        min_llm_spans: int = 1,
         audit_manifests: bool = True,
         span_select: list[str] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -312,6 +333,7 @@ class LangSmithCollector:
         self.child_timeout_s = child_timeout_s
         self.poll_interval_s = poll_interval_s
         self.settle_polls = settle_polls
+        self.min_llm_spans = min_llm_spans
         self.audit_manifests = audit_manifests
         self.span_select = span_select or SPAN_SELECT
         self._sleep = sleep
@@ -348,29 +370,52 @@ class LangSmithCollector:
         # otherwise hand us somebody else's trace.
         return [r for r in runs if self._metadata(r).get("session_id") == session_id]
 
+    def _roots_by_turn(self, runs: Sequence[Any]) -> dict[int, Any]:
+        """One root per turn — the LATEST attempt at each turn index.
+
+        A turn the client retried leaves two or three roots sharing a
+        turn_index. Slicing the raw list to `expected_turns` would assemble
+        {failed attempt, retry, turn 1} and silently drop the real last turn,
+        so retries collapse here before anything is ordered or sliced.
+        """
+        latest: dict[int, Any] = {}
+        for run in runs:
+            turn_index = self._metadata(run).get("turn_index")
+            turn_index = turn_index if isinstance(turn_index, int) else 0
+            previous = latest.get(turn_index)
+            if previous is None or run.start_time > previous.start_time:
+                latest[turn_index] = run
+        return latest
+
     def wait_for_roots(self, session_id: str, expected_turns: int) -> list[Any]:
         deadline = self._monotonic() + self.root_timeout_s
-        found: list[Any] = []
+        by_turn: dict[int, Any] = {}
+        wanted = set(range(expected_turns)) if expected_turns else set()
         while True:
-            found = self._root_runs(session_id)
-            if len(found) >= expected_turns:
+            by_turn = self._roots_by_turn(self._root_runs(session_id))
+            covered = wanted <= set(by_turn) if wanted else bool(by_turn)
+            if covered:
                 break
             if self._monotonic() >= deadline:
                 raise IngestionTimeout(
-                    f"LangSmith returned {len(found)}/{expected_turns} root runs for "
-                    f"session_id={session_id} in project {self.project} after "
-                    f"{self.root_timeout_s}s (a server-side metadata filter that is "
-                    f"silently ignored looks exactly like this)"
+                    f"LangSmith has root runs for turn indices {sorted(by_turn)} of "
+                    f"session_id={session_id} in project {self.project}, expected "
+                    f"{sorted(wanted)}, after {self.root_timeout_s}s (a server-side "
+                    f"metadata filter that is silently ignored looks exactly like this)"
                 )
             self._sleep(self.poll_interval_s)
 
-        def order(run: Any) -> tuple:
-            turn_index = self._metadata(run).get("turn_index")
-            return (turn_index if isinstance(turn_index, int) else 0, run.start_time)
-
-        return sorted(found, key=order)[:expected_turns] if expected_turns else sorted(
-            found, key=order
-        )
+        if not expected_turns:
+            return [by_turn[i] for i in sorted(by_turn)]
+        # Exactly the turns the harness drove — an index outside the range is
+        # a colliding or stale session, and waiting longer cannot fix it.
+        stray = sorted(set(by_turn) - wanted)
+        if stray:
+            raise TurnCoverageError(
+                f"session_id={session_id} has root runs at turn indices {stray}, "
+                f"outside the {expected_turns} turn(s) this harness drove"
+            )
+        return [by_turn[i] for i in range(expected_turns)]
 
     def _span_runs(self, trace_id: Any) -> list[Any]:
         return list(
@@ -510,6 +555,17 @@ class LangSmithCollector:
                 final = (
                     hint.final_response if isinstance(hint, TurnHint) else hint["final_response"]
                 )
+
+            if require_children:
+                llm_spans = sum(1 for s in spans if s.span_type == "llm")
+                if llm_spans < self.min_llm_spans:
+                    raise IngestionTimeout(
+                        f"turn {index} of session {session_id} (trace {root.trace_id}) "
+                        f"normalized to {llm_spans} llm span(s), below the floor of "
+                        f"{self.min_llm_spans}: the app cannot produce an answer without "
+                        f"a model call, so this run tree is still incomplete "
+                        f"({len(spans)} span(s) total)"
+                    )
 
             turns.append(
                 Turn(turn_index=index, user_message=user, final_response=final, spans=spans)

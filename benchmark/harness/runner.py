@@ -60,6 +60,10 @@ from benchmark.tracing.store import TraceStore
 
 log = logging.getLogger("benchmark.harness")
 
+
+class AmbiguousCheckpoint(LookupError):
+    """Several turns end with the same assistant response — say which one."""
+
 # Collection problems: our bug, so the result is quarantined rather than stored.
 COLLECTION_FAILURES = (IngestionTimeout, LeakDetected, ValidationError, ValueError, KeyError)
 
@@ -82,6 +86,15 @@ class Quarantine:
         path.write_text(json.dumps(record, indent=2, default=str) + "\n")
         log.error("quarantined %s: %s", key, reason)
         return path
+
+    def discard(self, key: str) -> bool:
+        """Drop a record whose input has since succeeded. True if one existed."""
+        path = self._path(key)
+        if not path.exists():
+            return False
+        path.unlink()
+        log.info("cleared stale quarantine record %s", key)
+        return True
 
     def get(self, key: str) -> dict:
         return json.loads(self._path(key).read_text())
@@ -348,20 +361,40 @@ class Harness:
 
     # ------------------------------------------------------------------ batch
 
+    def _existing_ok_trace(self, trace_id: str, input_id: str) -> Trace | None:
+        """The stored ok trace for this input, or None if it must be re-run.
+
+        A stored file that will not parse is a corrupt artifact, not a reason
+        to abort the whole batch: log it and let the input run again.
+        """
+        if not self.store.exists(trace_id):
+            return None
+        try:
+            existing = self.store.get(trace_id)
+        except Exception as exc:  # noqa: BLE001 - any unreadable artifact re-runs
+            log.warning(
+                "stored trace %s for %s is unreadable (%s: %s) — re-running the input",
+                trace_id,
+                input_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        return existing if existing.status == "ok" else None
+
     def _run_one(self, inputs: InputDataset, spec: InputSpec) -> _Outcome:
         session_id = session_id_for(inputs.dataset_id, spec.input_id)
         trace_id = trace_id_for(session_id)
-        if self.store.exists(trace_id):
-            existing = self.store.get(trace_id)
-            if existing.status == "ok":
-                self._bump("skipped")
-                log.info("skipping %s — ok trace %s already collected", spec.input_id, trace_id)
-                return _Outcome(
-                    spec.input_id,
-                    trace=existing,
-                    responses=[t.final_response for t in existing.turns],
-                    skipped=True,
-                )
+        existing = self._existing_ok_trace(trace_id, spec.input_id)
+        if existing is not None:
+            self._bump("skipped")
+            log.info("skipping %s — ok trace %s already collected", spec.input_id, trace_id)
+            return _Outcome(
+                spec.input_id,
+                trace=existing,
+                responses=[t.final_response for t in existing.turns],
+                skipped=True,
+            )
 
         try:
             if spec.mode == "multi_turn":
@@ -385,6 +418,9 @@ class Harness:
             self._bump("quarantined")
             return _Outcome(spec.input_id, quarantined=True)
 
+        # The input produced a trace, so any quarantine record from an earlier
+        # attempt is stale — leaving it would keep reporting a resolved fault.
+        self.quarantine.discard(session_id)
         self._bump("ran")
         if trace.status == "app_error":
             self._bump("app_error")
@@ -424,18 +460,35 @@ class Harness:
         *,
         dataset_id: str = "",
         baseline: Trace | None = None,
+        weak_validation: bool = False,
         persona: Persona | None = None,
         max_turns: int = 1,
         store_result: bool = True,
     ) -> Trace:
         """Mode C — arm a declared dependency fault, re-run, prove activation.
 
+        Pass `baseline` (the unarmed trace for this input) for real activation
+        validation; `weak_validation=True` acknowledges the weak form. Passing
+        neither raises — see `benchmark.harness.faults.activation_evidence`.
+
         Raises `UndeclaredFault` before touching the app if the shim is not in
         `fault_configurable_keys`, and `FaultNotActivated` if the regenerated
         trace shows no corruption in the span the fault must corrupt.
+
+        The trace is persisted **only after activation is proven**: an armed
+        run whose fault did not activate is an unlabelled, fault-contaminated
+        trace, and leaving one in the store would later feed it to Engine as
+        organic signal.
+
         Activation evidence is published on `self.activation_evidence`, keyed
         by trace_id — never inside the Trace (that would leak ground truth).
         """
+        if baseline is None and not weak_validation:
+            raise ValueError(
+                "run_with_faults needs either baseline=<the unarmed trace for this "
+                "input> or an explicit weak_validation=True; see "
+                "benchmark.harness.faults.activation_evidence for why"
+            )
         configurable = fault_configurable(self.cfg, fault_config)
         variant = "fault:" + hashlib.sha256(
             json.dumps(fault_config.model_dump(mode="json"), sort_keys=True).encode()
@@ -443,6 +496,8 @@ class Harness:
         session_id = session_id_for(dataset_id, input_spec.input_id, variant=variant)
         tokens = structural_behavior_tokens(fault_config)
 
+        # store_result=False on the way in: nothing is persisted until the
+        # fault is proven to have activated.
         if input_spec.mode == "multi_turn":
             if persona is None:
                 raise ValueError("multi_turn run_with_faults needs the input's persona")
@@ -453,7 +508,7 @@ class Harness:
                 session_id=session_id,
                 configurable=configurable,
                 extra_leak_tokens=tokens,
-                store_result=store_result,
+                store_result=False,
             )
         else:
             trace = self.run_single_turn(
@@ -461,35 +516,90 @@ class Harness:
                 session_id=session_id,
                 configurable=configurable,
                 extra_leak_tokens=tokens,
-                store_result=store_result,
+                store_result=False,
             )
 
-        self.activation_evidence[trace.trace_id] = activation_evidence(
-            trace, fault_config, baseline=baseline
+        evidence = activation_evidence(
+            trace, fault_config, baseline=baseline, weak_validation=weak_validation
         )
+        self.activation_evidence[trace.trace_id] = evidence
+        if store_result:
+            self.store.put(trace)
         return trace
 
-    def locate_checkpoint(self, thread_id: str, response_text: str) -> tuple[str, str]:
-        """Find where to fork for a Mode-A edit of `response_text`.
+    def turn_boundaries(self, thread_id: str) -> list[tuple[str, str, str]]:
+        """The thread's turn boundaries, oldest first.
 
-        Returns `(checkpoint_id, message_id)`: the checkpoint whose newest
-        message *is* that assistant response, and the id `update_state` needs
-        to rewrite it in place. Reading the thread's checkpoint history is the
-        one piece of LangGraph knowledge Phase 5 would otherwise have to
-        duplicate, so it lives behind this boundary.
+        One entry per *answer*: `(checkpoint_id, message_id, text)` for each
+        checkpoint whose newest message is a non-tool-calling assistant
+        message. Intra-turn checkpoints — the ones ending in a tool call — are
+        not turn boundaries and would otherwise shift every turn index.
         """
+        boundaries: list[tuple[str, str, str]] = []
         for snapshot in reversed(self.client.get_history(thread_id)):  # oldest -> newest
             messages = (snapshot.get("values") or {}).get("messages") or []
             if not messages:
                 continue
             last = messages[-1]
-            if (last.get("type") or last.get("role")) != "ai":
+            if (last.get("type") or last.get("role")) != "ai" or last.get("tool_calls"):
                 continue
-            if _text_of(last).strip() == response_text.strip():
-                return snapshot["checkpoint"]["checkpoint_id"], last["id"]
-        raise KeyError(
-            f"no checkpoint on thread {thread_id} ends with the given assistant response"
-        )
+            boundaries.append(
+                (snapshot["checkpoint"]["checkpoint_id"], last["id"], _text_of(last).strip())
+            )
+        return boundaries
+
+    def locate_checkpoint(
+        self, thread_id: str, response_text: str = "", *, turn_index: int | None = None
+    ) -> tuple[str, str]:
+        """Find where to fork for a Mode-A edit, as `(checkpoint_id, message_id)`.
+
+        Pass `turn_index` (0-based over the thread's answers), `response_text`,
+        or both — both is the safest, since the text then double-checks the
+        index. Matching on text alone and finding SEVERAL matches raises
+        `AmbiguousCheckpoint` rather than picking one: two turns ending in the
+        same words ("You're welcome!") are perfectly ordinary, and forking at
+        the wrong one would mislabel the ground-truth turn index silently.
+
+        Reading the thread's checkpoint history is the one piece of LangGraph
+        knowledge Phase 5 would otherwise have to duplicate, so it lives here.
+        """
+        if not response_text and turn_index is None:
+            raise ValueError("locate_checkpoint needs response_text, turn_index, or both")
+
+        boundaries = self.turn_boundaries(thread_id)
+        wanted = response_text.strip()
+
+        if turn_index is not None:
+            if not 0 <= turn_index < len(boundaries):
+                raise KeyError(
+                    f"thread {thread_id} has only {len(boundaries)} answer turn(s); "
+                    f"turn_index={turn_index} is out of range"
+                )
+            checkpoint_id, message_id, text = boundaries[turn_index]
+            if wanted and text != wanted:
+                raise KeyError(
+                    f"turn {turn_index} of thread {thread_id} does not end with the given "
+                    f"response (it ends with {text[:80]!r})"
+                )
+            return checkpoint_id, message_id
+
+        matches = [
+            (index, checkpoint_id, message_id)
+            for index, (checkpoint_id, message_id, text) in enumerate(boundaries)
+            if text == wanted
+        ]
+        if not matches:
+            raise KeyError(
+                f"no checkpoint on thread {thread_id} ends with the given assistant response"
+            )
+        if len(matches) > 1:
+            raise AmbiguousCheckpoint(
+                f"{len(matches)} turns of thread {thread_id} end with the same assistant "
+                f"response (turn indices {[m[0] for m in matches]}); pass turn_index to "
+                f"say which one to fork at"
+            )
+        _index, checkpoint_id, message_id = matches[0]
+        return checkpoint_id, message_id
 
     def replay(
         self,

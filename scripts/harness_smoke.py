@@ -218,7 +218,10 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
         print(f"input: {spec.input_id} — {spec.prompt[:100]!r}")
         print(f"baseline docs : {json.dumps(retrieval_spans(baseline)[-1].outputs)[:200]}")
 
-        fault = FaultConfig(shim="retriever", target="corpus_search", behavior="stale")
+        # `irrelevant_docs` is a *structural* behaviour name, so collection
+        # also scans the armed trace for it — the extra_leak_tokens path gets
+        # exercised live, not just in unit tests.
+        fault = FaultConfig(shim="retriever", target="corpus_search", behavior="irrelevant_docs")
         armed = harness.run_with_faults(
             spec, fault, dataset_id=inputs.dataset_id, baseline=baseline
         )
@@ -237,7 +240,8 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
         conversation = best
         thread_id = conversation.metadata["thread_id"]
         answer = conversation.turns[0].final_response
-        checkpoint_id, message_id = harness.locate_checkpoint(thread_id, answer)
+        # Text AND index: the index says which turn, the text double-checks it.
+        checkpoint_id, message_id = harness.locate_checkpoint(thread_id, answer, turn_index=0)
         print(f"thread={thread_id} checkpoint={checkpoint_id} message={message_id}")
         print(f"original turn-0 answer: {answer[:160]!r}")
         assert CASE_REFERENCE not in answer, "the marker was not unique to the edit"
@@ -263,21 +267,30 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
 
         # --------------------------------------------------------- leak audit
         banner("GATE 6 — live leak audit over every stored trace")
-        tokens = leak_tokens(cfg)
+        # The armed behaviour joins the scan for this pass, so the live audit
+        # covers exactly what run_with_faults itself scanned for.
+        tokens = leak_tokens(cfg, ("irrelevant_docs",))
         scanned = 0
         manifests = 0
+        unaudited = []
         for trace_id in store.list_ids():
             trace = store.get(trace_id)
             payload = trace.model_dump(mode="json", exclude={"ablation_ids"})
             leaked = find_leaks(payload, tokens)
             keys = find_leaked_keys(payload)
             assert not leaked and not keys, f"{trace_id}: tokens={leaked} keys={keys}"
-            manifests += trace.metadata.get("llm_manifests_audited", 0)
+            audited = trace.metadata.get("llm_manifests_audited", 0)
+            manifests += audited
+            # Per trace, not summed: one trace with 40 manifests would otherwise
+            # hide ten traces whose manifests were never fetched at all.
+            if trace.status == "ok" and audited < 1:
+                unaudited.append(trace_id)
             scanned += 1
         print(f"traces scanned: {scanned}; llm manifests fetched with serialized: {manifests}")
         assert scanned >= len(inputs.inputs)
-        assert manifests > 0, (
-            "no serialized manifest was ever fetched — the manifest audit was vacuous"
+        assert not unaudited, (
+            f"{len(unaudited)} ok trace(s) had no serialized manifest fetched — the "
+            f"audit was vacuous for them: {unaudited}"
         )
         print("PASS — no fault key, behaviour token, shim name, or fault_* metadata key")
 
