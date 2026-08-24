@@ -18,4 +18,5 @@ apps/target_app/.langgraph_api/
 apps/engine/scripts/.server.pid
 apps/engine/scripts/.server.log
 apps/engine/scripts/.last_run.json
+apps/engine/scripts/.model_swap.json
 apps/engine/.langgraph_api/
