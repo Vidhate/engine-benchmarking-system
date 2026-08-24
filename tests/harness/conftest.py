@@ -266,3 +266,126 @@ def react_agent_runs(
 
 def new_id() -> str:
     return uuid.uuid4().hex[:8]
+
+
+# ------------------------------------------------------- fake target app
+
+class FakeTargetApp:
+    """A `TargetAppClient` that also feeds the fake LangSmith backend.
+
+    Invoking it appends a realistic run tree to `ls_client.runs`, so the *real*
+    `LangSmithCollector` can be exercised end to end without a network. Fault
+    behaviour is modelled just enough for activation checks: an armed
+    retriever fault changes the documents the retrieval span records, exactly
+    as the app's shim does, and never names itself.
+    """
+
+    def __init__(
+        self,
+        ls_client: FakeLangSmithClient,
+        *,
+        fail_sessions: set[str] | None = None,
+        silent_sessions: set[str] | None = None,
+        answer: Any = None,
+    ):
+        self.ls = ls_client
+        self.fail_sessions = fail_sessions or set()
+        self.silent_sessions = silent_sessions or set()
+        self._answer = answer or (lambda message: f"answer to: {message}")
+        self.calls: list[dict] = []
+        self.updates: list[dict] = []
+        self.threads_created = 0
+        self._checkpoints = 0
+        self.max_in_flight = 0
+        self._in_flight = 0
+        import threading
+
+        self._lock = threading.Lock()
+
+    # -- TargetAppClient ---------------------------------------------------
+    def create_thread(self) -> str:
+        with self._lock:
+            self.threads_created += 1
+            return f"thread-{self.threads_created}"
+
+    def invoke(
+        self,
+        thread_id,
+        message,
+        *,
+        session_id,
+        turn_index=0,
+        configurable=None,
+        checkpoint=None,
+        metadata=None,
+    ):
+        from benchmark.harness.client import AppResponse
+
+        with self._lock:
+            self._in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self._in_flight)
+            self.calls.append(
+                {
+                    "thread_id": thread_id,
+                    "message": message,
+                    "session_id": session_id,
+                    "turn_index": turn_index,
+                    "configurable": configurable,
+                    "checkpoint": checkpoint,
+                }
+            )
+        try:
+            if session_id in self.fail_sessions:
+                return AppResponse("", [], error="ConnectionError: app is down")
+            answer = self._answer(message)
+            if session_id not in self.silent_sessions:
+                docs = self._docs_for(configurable)
+                with self._lock:
+                    self.ls.runs.extend(
+                        react_agent_runs(
+                            session_id,
+                            turn_index=turn_index,
+                            trace_id=f"tr-{session_id}-{turn_index}",
+                            user_message=message,
+                            final_response=answer,
+                            docs=docs,
+                        )
+                    )
+            with self._lock:
+                self._checkpoints += 1
+                checkpoint_id = f"ckpt-{self._checkpoints}"
+            return AppResponse(answer, [], checkpoint_id=checkpoint_id, thread_id=thread_id)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+    @staticmethod
+    def _docs_for(configurable: dict | None) -> list[dict]:
+        """Model the app's retriever shim: organic corruption, never a marker."""
+        normal = [{"doc_id": "refund-policy", "updated": "2026-01-02"}]
+        fault = (configurable or {}).get("fault_retriever")
+        if not isinstance(fault, dict):
+            return normal
+        behavior = fault.get("behavior")
+        if behavior == "empty":
+            return []
+        if behavior == "stale":
+            return [{"doc_id": "refund-policy", "updated": "2019-04-11"}]
+        if behavior == "irrelevant_docs":
+            return [{"doc_id": "webhook-setup", "updated": "2026-02-01"}]
+        return normal
+
+    def get_state(self, thread_id):
+        return {
+            "checkpoint": {"checkpoint_id": f"ckpt-{self._checkpoints}"},
+            "values": {"messages": []},
+        }
+
+    def get_history(self, thread_id, limit=100):
+        return []
+
+    def update_state(self, thread_id, values, *, checkpoint=None):
+        self.updates.append(
+            {"thread_id": thread_id, "values": values, "checkpoint": checkpoint}
+        )
+        return {"checkpoint_id": "fork-ckpt", "thread_id": thread_id}
