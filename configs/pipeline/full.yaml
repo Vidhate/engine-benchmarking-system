@@ -1,0 +1,117 @@
+# full — the assignment-scale benchmark run.
+#
+# MANUALLY RUN, NEVER IN CI:
+#
+#     uv run python -m benchmark.pipeline run --config configs/pipeline/full.yaml
+#
+# ---------------------------------------------------------------------------
+# Scope
+# ---------------------------------------------------------------------------
+# configs/generation/v0.yaml is `mixed`, and its full grid is 1230 inputs:
+#
+#     single-turn  = (D x V_D) + (A_c x V_AC) + A_F = 150 + 80 + 80 = 310
+#     multi-turn   = (P x D1) + (P_A x D2) = 4x150 + 2x160          = 920
+#
+# The two modes do NOT cost the same. A single-turn input is one app
+# invocation; a multi-turn conversation is up to `max_turns` (6) invocations
+# plus a user-simulator LLM call before each one, and Phase 5's Mode-A replay
+# re-runs part of it again. Running all 920 would spend roughly four fifths of
+# the budget on the mode the assignment does not size its deliverable in.
+#
+# So: every single-turn input runs, and the multi-turn tail is a seeded sample
+# of 30 — enough for multi-turn traces to be genuinely present in the corpus
+# (state_loss is only observable across turns, and Mode-A replay needs a
+# downstream to regenerate) without the tail setting the run's cost.
+#
+#     340 traces, against a deliverable of >=300.
+#
+# The 40-trace margin is the only slack there is. Traces the collector cannot
+# retrieve are quarantined rather than stored (they are our bug, not signal),
+# and each one comes out of that margin; past 40, `traces_file_scale` fails and
+# the run has to be re-run. Re-running is cheap — the harness skips inputs that
+# already have an ok trace — but it is a re-run, so watch the quarantine count
+# in the manifest rather than discovering it in the deliverables report.
+#
+# FUTURE WORK: the full 1230-input mixed run (all 920 conversations). It is a
+# scale question, not a correctness one — nothing here changes except this
+# file — and it belongs with Phase 8's experiments, where the extra multi-turn
+# mass would actually be analysed.
+#
+# ---------------------------------------------------------------------------
+# What it costs (first run; a re-run is far cheaper, see below)
+# ---------------------------------------------------------------------------
+#   generation  ~1230 mid-tier LLM calls, ~30-40 min. NOTE: the whole grid is
+#               expanded before the slice is applied — expansion belongs to
+#               benchmark/generation/, slicing is a pipeline concern — so this
+#               pays for the 890 conversations it then drops. Cached on disk
+#               and keyed by config hash, so only the first run pays at all.
+#   harness     310 single-turn runs + 30 conversations at concurrency 8,
+#               plus LangSmith span-ingestion polling: ~45-60 min.
+#   ablation    Phase 5: proposal/plan agents plus replay and fault re-runs
+#               through the app for the ablate subset. Tens of minutes; the
+#               exact figure is Phase 5's to measure.
+#   engine      340 traces at analysis_concurrency 16 = 22 batches at ~49 s
+#               per batch plus consolidation: ~25 min.
+#   scoring     seconds (TF-IDF, no judge).
+#
+#   Total: roughly 1.5-2.5 h of wall clock on the first run, most of it model
+#   time. A re-run with a warm expansion cache and an existing trace store is
+#   dominated by the Engine pass alone.
+run_id: full
+generation_config: configs/generation/v0.yaml
+taxonomy: configs/taxonomy.yaml
+target_app_config: configs/target_app.yaml
+engine_app_config: configs/engine.yaml
+seed_issueboard: null
+artifacts_root: data/pipeline
+expansion_cache: data/expansion_cache
+
+# All 310 single-turn inputs (uncapped), 30 of the 920 conversations.
+input_modes: [single_turn, multi_turn]
+max_inputs_per_mode:
+  multi_turn: 30
+slice_seed: 20260824
+
+harness:
+  # The target app is a two-tool react agent on a small model; 8 concurrent
+  # conversations keeps it busy without tripping provider rate limits.
+  concurrency: 8
+
+ablation:
+  seed: 20260824
+  control_fraction: 0.3
+  min_eligible: 5
+  n_per_category: 2
+
+engine:
+  # See configs/pipeline/mini.yaml: benchmark/models.py pins `gpt-5.1-mini`,
+  # this account 404s on it, and both apps already default to `gpt-5-mini`.
+  # Phase 8's comparison swaps this via `--engine-model` (or a second config).
+  model: gpt-5-mini
+  # RULED full-scale setting. A run costs ceil(n/N) batches, and a batch costs
+  # its slowest trace: N=8 projects to ~35 min at 300 traces, N=16 to ~21 min
+  # (apps/engine/README.md, "Analysis concurrency"). 16 is the clamp ceiling.
+  analysis_concurrency: 16
+  # MUST be passed explicitly: the server default of 25 caps a run at ~23
+  # traces, and the failure mode is a recursion error mid-corpus.
+  recursion_limit: 10000
+  # `runs.wait` is ONE blocking request spanning the whole ~25 min pass; the
+  # SDK's default read timeout is 300 s and would abort it five minutes in.
+  timeout_s: 10800
+
+scoring:
+  severity_alpha: 0.5
+  description_mode: similarity
+  text_fallback_threshold: 0.5
+
+deliverables:
+  # The assignment's own number.
+  min_traces: 300
+
+servers:
+  target_app:
+    script: apps/target_app/scripts/serve.sh
+    label: "target app (:2024)"
+  engine:
+    script: apps/engine/scripts/serve.sh
+    label: "engine (:2025)"

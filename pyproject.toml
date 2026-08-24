@@ -11,6 +11,10 @@ dependencies = [
     # backend (see docs/execution-plan.md, "Tracing backend").
     "langgraph-sdk>=0.4",
     "langsmith>=0.11",
+    # Phase 7 pipeline: the Engine invocation is one blocking request spanning
+    # the whole pass, so it must pass its own httpx.Timeout (the SDK default
+    # read timeout is 300s). Imported directly, so declared directly.
+    "httpx>=0.27",
 ]
 
 [dependency-groups]
