@@ -106,11 +106,13 @@ def make_split(inputs: InputDataset, cfg: AblationConfig) -> AblationSplit:
 
     control: list[str] = []
     ablate: list[str] = []
+    assignments: dict[str, str] = {}
     for stratum in sorted(strata):
         ordered = _shuffled(strata[stratum], cfg.seed, stratum)
         take = min(quotas[stratum], len(ordered))
         control.extend(ordered[:take])
         ablate.extend(ordered[take:])
+        assignments.update(dict.fromkeys(ordered, stratum))
 
     return AblationSplit(
         seed=cfg.seed,
@@ -118,4 +120,5 @@ def make_split(inputs: InputDataset, cfg: AblationConfig) -> AblationSplit:
         strata=sorted(strata),
         control_input_ids=sorted(control),
         ablate_input_ids=sorted(ablate),
+        assignments=assignments,
     )

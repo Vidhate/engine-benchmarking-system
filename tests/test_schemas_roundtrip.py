@@ -122,7 +122,26 @@ ROUNDTRIP_CASES = [
     AblationRecord(
         ablation_id="a1", error_id="e1", trace_id="t1", before_after=[("old", "new")]
     ),
+    # `mode` on the record: which injection kind produced it, without joining
+    # back through error_id -> Issue.
+    AblationRecord(
+        ablation_id="a2",
+        error_id="e2",
+        trace_id="t2",
+        mode="dependency_fault",
+        before_after=[("", "evidence")],
+    ),
     AblationSplit(seed=7, control_fraction=0.3, control_input_ids=["i1"], ablate_input_ids=["i2"]),
+    # `assignments`: the per-input stratum, so base rates stay reportable
+    # without recomputing the stratification.
+    AblationSplit(
+        seed=7,
+        control_fraction=0.3,
+        strata=["single_turn|safe|topic"],
+        control_input_ids=["i1"],
+        ablate_input_ids=["i2"],
+        assignments={"i1": "single_turn|safe|topic", "i2": "single_turn|safe|topic"},
+    ),
     make_report(),
 ]
 
@@ -131,6 +150,26 @@ ROUNDTRIP_CASES = [
 def test_roundtrip(obj: BaseModel):
     restored = type(obj).model_validate_json(obj.model_dump_json())
     assert restored == obj
+
+
+def test_ablation_config_carries_the_stage_iii_knobs():
+    from benchmark.schemas.configs import AblationConfig
+
+    cfg = AblationConfig()
+    assert cfg.target_count == 5, "step 4's per-error sub-sample size"
+    assert cfg.max_replans == 2, "step 3's re-plan bound"
+    restored = AblationConfig.model_validate_json(
+        AblationConfig(target_count=3, max_replans=1).model_dump_json()
+    )
+    assert (restored.target_count, restored.max_replans) == (3, 1)
+
+
+def test_the_new_ablation_fields_all_default_so_old_payloads_still_load():
+    """Additive only: a document written before these fields existed must load."""
+    assert AblationRecord.model_validate(
+        {"ablation_id": "a", "error_id": "e", "trace_id": "t"}
+    ).mode is None
+    assert AblationSplit.model_validate({"seed": 0, "control_fraction": 0.3}).assignments == {}
 
 
 def test_validation_rejects_bad_enum():

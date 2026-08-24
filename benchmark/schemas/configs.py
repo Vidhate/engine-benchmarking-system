@@ -46,6 +46,8 @@ class AblationConfig(BaseModel):
     control_fraction: float = 0.3  # input-level split, stratified on provenance
     min_eligible: int = 5  # step-3 filter gate, within the ablate set
     n_per_category: int = 2  # step-1 proposals per category
+    target_count: int = 5  # step-4 sub-sample size per error (the injection rate)
+    max_replans: int = 2  # step-3 re-plan bound before an error is dropped
 
 
 class ScoringConfig(BaseModel):

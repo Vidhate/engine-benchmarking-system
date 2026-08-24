@@ -65,6 +65,17 @@ def test_stratification_matches_the_distribution_of_provenance():
         assert abs(control[key] - ablate[key]) <= 1, key
 
 
+def test_the_split_records_every_inputs_stratum(inputs):
+    """Recorded, not recomputed: per-stratum base rates must be readable from
+    the artifact alone."""
+    split = make_split(inputs, AblationConfig(seed=2, control_fraction=0.3))
+    assert set(split.assignments) == {i.input_id for i in inputs.inputs}
+    assert set(split.assignments.values()) == set(split.strata)
+    by_id = {i.input_id: i for i in inputs.inputs}
+    for input_id, stratum in split.assignments.items():
+        assert stratum == stratum_of(by_id[input_id], inputs.generation_config)
+
+
 def test_split_records_its_own_parameters(inputs):
     split = make_split(inputs, AblationConfig(seed=11, control_fraction=0.25))
     assert split.seed == 11
