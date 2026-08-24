@@ -98,7 +98,15 @@ def plan_ablation(
     attempt: int = 0,
     target_count: int | None = None,
 ) -> AblationSpec:
-    """`[N,M,T]`, `[E,C_E]` -> `AblationSpec`. See the table in the module docstring."""
+    """`[N,M,T]`, `[E,C_E]` -> `AblationSpec`. See the table in the module docstring.
+
+    `target_count` precedence: an explicit value **wins over** the agent's own
+    `proposal.target_count`, and the engine always passes `cfg.target_count`.
+    Prevalence is an operator decision — it is what makes precision and recall
+    interpretable against a known base rate — not something a per-error draft
+    should move. Keep `cfg.target_count <= cfg.min_eligible`: step 3 admits an
+    error on `min_eligible` candidates, so a larger target only under-fills.
+    """
     steps = mode_preconditions(proposal) + _relaxed(proposal.filter_steps, attempt)
     mode = proposal.issue.injection_mode
     if mode is None:

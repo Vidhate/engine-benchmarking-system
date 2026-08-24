@@ -46,7 +46,13 @@ class AblationConfig(BaseModel):
     control_fraction: float = 0.3  # input-level split, stratified on provenance
     min_eligible: int = 5  # step-3 filter gate, within the ablate set
     n_per_category: int = 2  # step-1 proposals per category
-    target_count: int = 5  # step-4 sub-sample size per error (the injection rate)
+    # Step-4 sub-sample size per error — the injection rate, and therefore
+    # prevalence, which is an operator decision: this OVERRIDES the per-error
+    # `ProposedError.target_count` the agent suggests (see
+    # `ablation.plan.plan_ablation`). Keep it <= `min_eligible`: an error is
+    # allowed through step 3 on `min_eligible` candidates, so a larger
+    # target_count can only under-fill, and the shortfall is silent.
+    target_count: int = 5
     max_replans: int = 2  # step-3 re-plan bound before an error is dropped
 
 
