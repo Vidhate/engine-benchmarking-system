@@ -227,6 +227,52 @@ def test_the_predicted_board_is_the_updated_board(run):
     assert seed_ids <= {i.error_id for i in run.predicted.issues}
 
 
+def test_an_empty_seed_board_is_the_default(run):
+    assert run.seed_board.issues == []
+    assert run.seed_board.source == "seed"
+
+
+def test_a_provided_seed_board_is_carried_through_and_updated(
+    cfg, fake_harness_factory, tmp_path
+):
+    """The other half of the assignment's input: a board that already has issues."""
+    seed_path = tmp_path / "seed.json"
+    seed_path.write_text(
+        Issueboard(
+            source="seed",
+            issues=[
+                {
+                    "error_id": "seed-tool-failure-hidden",
+                    "title": "Tool failure reported as success",
+                    "description": "a tool errors and the answer claims it worked",
+                    "category_id": "tool_misuse",
+                    "severity": "high",
+                }
+            ],
+        ).model_dump_json()
+    )
+    seeded = cfg.model_copy(update={"seed_issueboard": str(seed_path)}).with_root(cfg.root)
+    invoker = FakeEngineInvoker()
+
+    def stage(**kwargs):
+        result = fake_run_ablation(**kwargs)
+        invoker.ground_truth = result.ground_truth
+        return result
+
+    run = run_pipeline(
+        seeded,
+        ablation_stage=stage,
+        engine_invoker=invoker,
+        harness_factory=fake_harness_factory,
+        expander=FakeExpander(),
+    )
+    assert invoker.calls[0]["seed_board"].issues[0].error_id == "seed-tool-failure-hidden"
+    assert "seed-tool-failure-hidden" in {i.error_id for i in run.predicted.issues}
+    assert by_name(run.deliverables)["issueboard_in"].ok
+    assert by_name(run.deliverables)["issueboard_out_updated"].ok
+    assert (run.run_dir / "seed_issueboard.json").exists()
+
+
 # ------------------------------------------------------------------ scoring
 
 def test_scoring_sees_the_full_trace_universe_including_clean_traces(run):
