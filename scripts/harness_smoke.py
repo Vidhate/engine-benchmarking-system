@@ -240,7 +240,9 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
         conversation = best
         thread_id = conversation.metadata["thread_id"]
         answer = conversation.turns[0].final_response
-        # Text AND index: the index says which turn, the text double-checks it.
+        # index=0 is the one position where a boundary index and a conversation
+        # turn coincide (an answer spans several boundary entries — see
+        # `Harness.turn_boundaries`), and the text double-checks it.
         checkpoint_id, message_id = harness.locate_checkpoint(thread_id, answer, turn_index=0)
         print(f"thread={thread_id} checkpoint={checkpoint_id} message={message_id}")
         print(f"original turn-0 answer: {answer[:160]!r}")

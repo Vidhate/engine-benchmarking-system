@@ -68,6 +68,10 @@ class AblationRecord(BaseModel):
     ablation_id: str
     error_id: str
     trace_id: str
+    # Which injection kind produced this record. Recoverable by joining
+    # error_id -> Issue.injection_mode, but a record is meant to be a complete,
+    # self-contained account of what was done.
+    mode: InjectionMode | None = None
     actions_applied: list[AblationAction] = Field(default_factory=list)
     # (original, mutated) per action for replay_edit; activation evidence for
     # dependency_fault lands in `before_after` as ("", <observed corrupted span text>).
@@ -85,3 +89,6 @@ class AblationSplit(BaseModel):
     strata: list[str] = Field(default_factory=list)  # stratification keys (mode, kind, dim)
     control_input_ids: list[str] = Field(default_factory=list)  # never ablated / re-run
     ablate_input_ids: list[str] = Field(default_factory=list)  # sole filter population
+    # input_id -> stratum key. Recorded rather than recomputed so per-stratum
+    # base rates stay reportable from the artifact alone.
+    assignments: dict[str, str] = Field(default_factory=dict)

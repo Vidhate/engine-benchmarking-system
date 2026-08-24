@@ -541,12 +541,20 @@ class Harness:
         return trace
 
     def turn_boundaries(self, thread_id: str) -> list[tuple[str, str, str]]:
-        """The thread's turn boundaries, oldest first.
+        """The thread's answer checkpoints, oldest first.
 
-        One entry per *answer*: `(checkpoint_id, message_id, text)` for each
-        checkpoint whose newest message is a non-tool-calling assistant
-        message. Intra-turn checkpoints — the ones ending in a tool call — are
-        not turn boundaries and would otherwise shift every turn index.
+        One entry per *checkpoint* whose newest message is a non-tool-calling
+        assistant message: `(checkpoint_id, message_id, text)`. Intra-turn
+        checkpoints — the ones ending in a tool call — are filtered out.
+
+        **Not one entry per answer.** The server writes several snapshots per
+        turn, and more than one of them can end with the same assistant
+        message, so an answer usually appears 2+ times; a Mode-A replay also
+        forks the thread and appends its regenerated answers to the same
+        history. Measured live: 10 entries for a 3-turn conversation. Consumers
+        must therefore treat the position in this list as meaningless and key
+        on the `checkpoint_id` recorded per turn instead — see
+        `benchmark/ablation/inject.fork_point` for the robust pattern.
         """
         boundaries: list[tuple[str, str, str]] = []
         for snapshot in reversed(self.client.get_history(thread_id)):  # oldest -> newest
@@ -566,9 +574,15 @@ class Harness:
     ) -> tuple[str, str]:
         """Find where to fork for a Mode-A edit, as `(checkpoint_id, message_id)`.
 
-        Pass `turn_index` (0-based over the thread's answers), `response_text`,
-        or both — both is the safest, since the text then double-checks the
-        index. Matching on text alone and finding SEVERAL matches raises
+        `turn_index` is 0-based over **`turn_boundaries`'s entries**, which is
+        *not* the conversation's turn numbering: an answer usually occupies
+        several consecutive entries, so conversation turn k is not entry k
+        (only k = 0 lines up, by accident). Read `turn_boundaries`'s docstring
+        before passing it, and prefer keying on the `checkpoint_id` recorded
+        per turn — `benchmark/ablation/inject.fork_point` does that and is the
+        pattern to copy.
+
+        Matching on text alone and finding SEVERAL matches raises
         `AmbiguousCheckpoint` rather than picking one: two turns ending in the
         same words ("You're welcome!") are perfectly ordinary, and forking at
         the wrong one would mislabel the ground-truth turn index silently.
