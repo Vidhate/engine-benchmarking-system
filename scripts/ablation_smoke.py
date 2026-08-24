@@ -191,10 +191,19 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
             cfg,
             store,
             client=LangGraphAppClient(cfg),
-            collector=LangSmithCollector(cfg.langsmith_project, cfg=cfg),
+            # Gentler on LangSmith than the defaults. The collector polls
+            # /runs/query once per poll_interval per in-flight trace, and a
+            # measured 429 (Rate limit exceeded) killed a whole batch when two
+            # smoke runs went back to back at concurrency 4 / 2.5s. The window
+            # the collector waits for is (settle_polls-1) * poll_interval, so
+            # settle_polls comes down as the interval goes up — same ~15s of
+            # stability, a third of the requests.
+            collector=LangSmithCollector(
+                cfg.langsmith_project, cfg=cfg, poll_interval_s=6.0, settle_polls=4
+            ),
             simulator=OpenAIUserSimulator(),
             quarantine=quarantine,
-            concurrency=4,
+            concurrency=2,
         )
         started = time.time()
         outputs, traces = harness.run_batch(inputs)
