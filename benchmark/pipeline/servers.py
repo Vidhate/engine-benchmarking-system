@@ -64,14 +64,20 @@ class ServerLifetime:
         return {name: spec.script for name, spec in self.specs.items()} if self.enabled else {}
 
     def _spec(self, name: str) -> ServerSpec | None:
+        """The spec for `name`, or None when this run does not manage it.
+
+        A name with no declared spec is a no-op, not an error: `servers` is the
+        list of servers this run OWNS, and running against an app someone else
+        already has up is a first-class mode (`--no-serve`, a stage-only rerun,
+        two arms sharing one target app). Typos cannot hide here — the config's
+        server keys are a `Literal`, so an unknown name fails at parse time.
+        """
         if not self.enabled:
             return None
-        if not self.specs:
-            # No servers declared: run against whatever the operator has up.
-            return None
-        if name not in self.specs:
-            raise KeyError(f"no server named {name!r} in this pipeline config")
-        return self.specs[name]
+        spec = self.specs.get(name)
+        if spec is None:
+            log.debug("no declared server for %r — assuming it is already running", name)
+        return spec
 
     def _run(self, name: str, action: str) -> None:
         spec = self._spec(name)

@@ -79,9 +79,27 @@ def test_the_two_servers_take_turns():
     ]
 
 
-def test_an_undeclared_server_is_refused():
-    with pytest.raises(KeyError, match="ollama"):
-        lifetime(FakeRunner()).start("ollama")
+def test_managing_only_one_of_the_two_servers_is_allowed():
+    """A stage-only rerun owns the Engine and leaves the target app alone."""
+    runner = FakeRunner()
+    manager = lifetime(runner, specs={"engine": SPECS["engine"]})
+    with manager.running("target_app"), manager.running("engine"):
+        pass
+    assert runner.actions == ["engine:start", "engine:stop"]
+
+
+def test_the_config_schema_is_what_rejects_a_server_typo():
+    """Undeclared names are a no-op here, so the typo guard lives in the config."""
+    from pydantic import ValidationError
+
+    from benchmark.pipeline.config import PipelineConfig
+
+    with pytest.raises(ValidationError):
+        PipelineConfig(
+            run_id="r",
+            generation_config="g.yaml",
+            servers={"ollama": {"script": "nope.sh"}},
+        )
 
 
 def test_a_server_that_will_not_start_fails_loudly():

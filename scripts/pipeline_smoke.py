@@ -47,6 +47,13 @@ Usage:
     uv run python scripts/pipeline_smoke.py --fresh         # wipe prior artifacts
     uv run python scripts/pipeline_smoke.py --model gpt-5.1 # the other arm
     uv run python scripts/pipeline_smoke.py --target-port 2124 --engine-port 2125
+    uv run python scripts/pipeline_smoke.py --engine-only  # skip the target app
+
+`--engine-only` replays traces already in this run's TraceStore instead of
+driving the target app, so the Engine / scoring / report / manifest seams can
+be verified without LangSmith in the loop — useful when the trace-collection
+backend is unavailable or its per-account rate limit is being shared with
+another run. It proves strictly less than a full pass and says so.
 
 `--target-port` / `--engine-port` exist because :2024 and :2025 are one machine's
 worth of ports and more than one of these runs can want them — a parallel
@@ -103,6 +110,69 @@ def port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+class StoredTraceHarness:
+    """A `HarnessLike` that replays traces already in the TraceStore.
+
+    `--engine-only`: the target app and LangSmith have already done their part
+    in an earlier attempt, and this run only wants the stages after them. It is
+    the same resumability the real harness has (an input with an ok trace is
+    not re-run), reduced to its limit case — so it exercises the real stored
+    artifacts, not fabricated ones.
+    """
+
+    def __init__(self, cfg, store):
+        self.cfg = cfg
+        self.store = store
+        self.stats: dict[str, int] = {}
+
+    def run_batch(self, inputs):
+        from benchmark.harness.ids import session_id_for, trace_id_for  # noqa: PLC0415
+        from benchmark.schemas.io import derive  # noqa: PLC0415
+        from benchmark.schemas.traces import (  # noqa: PLC0415, E501
+            OutputDataset,
+            OutputRecord,
+            TraceDataset,
+        )
+
+        traces, outputs, missing = [], [], []
+        for spec in inputs.inputs:
+            trace_id = trace_id_for(session_id_for(inputs.dataset_id, spec.input_id))
+            if not self.store.exists(trace_id):
+                missing.append(spec.input_id)
+                continue
+            trace = self.store.get(trace_id)
+            traces.append(trace)
+            outputs.append(
+                OutputRecord(
+                    input_id=spec.input_id,
+                    trace_id=trace.trace_id,
+                    responses=[t.final_response for t in trace.turns],
+                )
+            )
+        if not traces:
+            raise SystemExit(
+                "BLOCKED: --engine-only found no stored traces for this config. Run the "
+                "full smoke at least once so the TraceStore has something to replay."
+            )
+        self.stats = {"ran": 0, "skipped": len(traces), "quarantined": 0, "app_error": 0}
+        if missing:
+            print(f"  --engine-only: {len(missing)} input(s) have no stored trace: {missing}")
+        return (
+            derive(OutputDataset(outputs=outputs), inputs),
+            derive(TraceDataset(traces=traces), inputs),
+        )
+
+
+def wait_for_port_closed(port: int, deadline: float = 15.0) -> bool:
+    """A killed `langgraph dev` can hold its socket for a moment after exit."""
+    until = time.time() + deadline
+    while time.time() < until:
+        if not port_open(port):
+            return True
+        time.sleep(0.5)
+    return not port_open(port)
+
+
 def app_config_on_port(source: Path, port: int, destination: Path) -> Path:
     """A copy of an app config with its `base_url` moved to `port`.
 
@@ -133,6 +203,14 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
         type=int,
         default=None,
         help="harness concurrency (lower it when sharing a LangSmith quota)",
+    )
+    parser.add_argument(
+        "--engine-only",
+        action="store_true",
+        help=(
+            "replay traces already in this run's TraceStore instead of driving the "
+            "target app — isolates the Engine/scoring/report seams from LangSmith"
+        ),
     )
     args = parser.parse_args()
 
@@ -202,9 +280,19 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     print(f"artifacts       : {cfg.run_dir}")
     print("ablation stage  : FAKE (Phase 5 not merged) — see this script's header")
 
-    servers = ServerLifetime(cfg.root, cfg.servers, enabled=not args.no_serve)
+    # --engine-only owns the Engine's server and nothing else: the target app
+    # is not started because it is not driven.
+    managed = (
+        {k: v for k, v in cfg.servers.items() if k == "engine"}
+        if args.engine_only
+        else cfg.servers
+    )
+    servers = ServerLifetime(cfg.root, managed, enabled=not args.no_serve)
     if not args.no_serve:
-        for name, port in (("target app", target_port), ("engine", engine_port)):
+        checked = [("engine", engine_port)]
+        if not args.engine_only:
+            checked.insert(0, ("target app", target_port))
+        for name, port in checked:
             if port_open(port):
                 print(f"\nNOTE: something is already listening on :{port} ({name}). "
                       f"Re-run with --no-serve, or stop it first.")
@@ -218,6 +306,7 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
         # -----------------------------------------------------------------
         expander=OpenAIPromptExpander(),
         servers=servers,
+        harness_factory=StoredTraceHarness if args.engine_only else None,
     )
     elapsed = time.time() - started
 
@@ -228,11 +317,14 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     print(f"harness stats: {run.manifest.harness_stats}")
     assert 1 <= len(run.inputs.inputs) <= 10, len(run.inputs.inputs)
     assert run.traces.parent_dataset_id == run.inputs.dataset_id, "lineage broken"
-    assert len(run.traces.traces) == len(run.inputs.inputs), "an input produced no trace"
+    if args.engine_only:
+        print("  (--engine-only: traces replayed from the store, not freshly collected)")
+    else:
+        assert len(run.traces.traces) == len(run.inputs.inputs), "an input produced no trace"
     for trace in run.traces.traces:
         assert trace.turns, f"{trace.trace_id} has no turns"
         assert any(t.spans for t in trace.turns), f"{trace.trace_id} has no spans"
-    print("PASS — every input produced a schema-valid trace with spans, lineage intact")
+    print("PASS — every trace is schema-valid with spans, lineage intact")
 
     # --------------------------------------------------------------- gate 2
     banner("GATE 2 — ablation stage (FAKE) -> ground truth + leak-stripped export")
@@ -317,10 +409,15 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     if args.no_serve or args.keep:
         print("  skipped (--no-serve/--keep: this run does not own the servers)")
     else:
-        for name, port in (("target app", target_port), ("engine", engine_port)):
-            assert not port_open(port), f"the {name} server is still listening on :{port}"
+        owned = [("engine", engine_port)]
+        if not args.engine_only:
+            owned.insert(0, ("target app", target_port))
+        for name, port in owned:
+            assert wait_for_port_closed(port), (
+                f"the {name} server is still listening on :{port}"
+            )
             print(f"  {name} (:{port}) is down")
-        print("PASS — both servers started and stopped by the pipeline")
+        print(f"PASS — {len(owned)} server(s) started and stopped by the pipeline")
 
     banner("REPORT")
     print(run.markdown)

@@ -44,10 +44,13 @@ def run(mini_run):
 
 # ----------------------------------------------------------------- the shape
 
-def test_a_single_command_turns_configs_into_a_benchmark_report(run):
+def test_a_single_command_turns_configs_into_a_benchmark_report(run, cfg):
     assert isinstance(run.report, BenchmarkReport)
     assert run.report.report_id
-    assert run.report.engine_config.model == "gpt-5.1-mini"
+    # Read from the config, not hardcoded: the model is the comparison axis and
+    # a test that pins it would have to be edited to swap arms.
+    assert run.report.engine_config.model == cfg.engine.model
+    assert run.report.engine_config.app is not None, "the report records which app answered"
 
 
 def test_the_mini_config_slices_to_single_turn_inputs(run):
@@ -156,8 +159,8 @@ def test_the_manifest_records_config_hashes(run, cfg):
     assert run.manifest.config_hashes["pipeline"]
 
 
-def test_the_manifest_records_the_model_and_the_stage_implementations(run):
-    assert run.manifest.models["engine"] == "gpt-5.1-mini"
+def test_the_manifest_records_the_model_and_the_stage_implementations(run, cfg):
+    assert run.manifest.models["engine"] == cfg.engine.model
     assert "fake_run_ablation" in run.manifest.stages["ablation"]
 
 

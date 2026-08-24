@@ -38,8 +38,14 @@ ablation:
   n_per_category: 1
 
 engine:
-  # The mini arm of the comparison axis (benchmark/models.py ENGINE_MODEL_MINI).
-  model: gpt-5.1-mini
+  # The mini arm of the comparison axis. benchmark/models.py pins the execution
+  # plan's `gpt-5.1-mini`, but this account's API 404s on that id — the same
+  # finding both apps already record (apps/target_app/target_app/agent.py and
+  # apps/engine/engine/llm.py both default to `gpt-5-mini` with that note), and
+  # the Engine's own failure path turns it into "analysis failed on 7 of 7
+  # traces". The run's model is a run-identity fact, so it is named here rather
+  # than defaulted, and the config is the one place that has to match reality.
+  model: gpt-5-mini
   # Small corpus, so the batch never fills; kept explicit rather than defaulted
   # because the value is a run-identity fact recorded in the manifest.
   analysis_concurrency: 8

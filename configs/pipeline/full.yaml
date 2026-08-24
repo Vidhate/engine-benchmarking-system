@@ -31,7 +31,10 @@ ablation:
   n_per_category: 2
 
 engine:
-  model: gpt-5.1-mini
+  # See configs/pipeline/mini.yaml: benchmark/models.py pins `gpt-5.1-mini`,
+  # this account 404s on it, and both apps already default to `gpt-5-mini`.
+  # Phase 8's comparison swaps this via `--engine-model` (or a second config).
+  model: gpt-5-mini
   # RULED full-scale setting. A 300-trace run costs ceil(n/N) batches, and a
   # batch costs its slowest trace: N=8 projects to ~35 min, N=16 to ~21 min
   # (apps/engine/README.md, "Analysis concurrency"). 16 is the clamp ceiling.
