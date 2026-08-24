@@ -1,0 +1,47 @@
+# C_E — the shared high-level error taxonomy (docs/architecture/01-data-schemas.md §3).
+# This is the PUBLIC category vocabulary: the ablation engine proposes concrete errors
+# under these categories, and the Engine-under-test receives exactly these names +
+# descriptions (never the concrete injected error definitions).
+# "other" is the escape hatch — always included so out-of-taxonomy (E_h) discoveries
+# are never shoehorned into a wrong category (docs/architecture/06-scoring.md).
+categories:
+  - category_id: hallucination
+    name: hallucination
+    description: >-
+      The assistant asserts facts not supported by its retrieved context, tool
+      results, or conversation history — fabricated policies, invented numbers,
+      or unsupported claims presented as fact.
+  - category_id: retrieval_failure
+    name: retrieval_failure
+    description: >-
+      The retrieval step returns wrong, irrelevant, empty, or stale content —
+      or the answer ignores/bypasses what was actually retrieved (e.g. answers
+      from model memory while retrieved documents say otherwise).
+  - category_id: tool_misuse
+    name: tool_misuse
+    description: >-
+      Tool-call failures: calling the wrong tool, malformed or missing
+      arguments, ignoring a tool error, fabricating a tool result, failing to
+      call a tool the task required, or acting on corrupted tool output.
+  - category_id: instruction_violation
+    name: instruction_violation
+    description: >-
+      The assistant violates its operating instructions or policy — off-policy
+      behavior, complying with injected/adversarial instructions, revealing
+      internal details, or ignoring explicit user constraints.
+  - category_id: formatting
+    name: formatting
+    description: >-
+      Output-shape failures: truncated or cut-off responses, malformed
+      structure, wrong language or register, unreadable or garbled text.
+  - category_id: state_loss
+    name: state_loss
+    description: >-
+      Conversation-state failures across turns: forgetting or contradicting
+      earlier context, losing track of the user's goal, repeating resolved
+      steps, or mixing up entities established earlier in the conversation.
+  - category_id: other
+    name: other
+    description: >-
+      Escape hatch for genuine issues that fit none of the categories above.
+      Use this rather than forcing a bad fit.
