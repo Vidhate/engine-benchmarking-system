@@ -64,7 +64,7 @@ def test_propose_errors_restamps_ids_and_keeps_the_injection_mode(
             ],
         }
     )
-    proposals, _digest = propose_errors(
+    proposals, _digest, _dropped = propose_errors(
         store, [t.trace_id for t in traces.traces], categories, 1, target_cfg, agent
     )
     ids = [p.issue.error_id for p in proposals]
@@ -79,7 +79,7 @@ def test_a_proposal_whose_marker_is_not_in_its_replacement_is_dropped(
 ):
     broken = make_proposal(marker="MISSING-999", replacement="no marker here")
     agent = ScriptedAblationAgent({"hallucination": [broken]})
-    proposals, _ = propose_errors(
+    proposals, _digest, _dropped = propose_errors(
         store, [t.trace_id for t in traces.traces], categories, 1, target_cfg, agent
     )
     assert proposals == []
@@ -99,7 +99,7 @@ def test_a_dependency_fault_on_an_undeclared_shim_is_dropped(
         fault=FaultConfig(shim="tool", target="create_ticket", behavior="error"),
     )
     agent = ScriptedAblationAgent({"retrieval_failure": [proposal]})
-    proposals, _ = propose_errors(
+    proposals, _digest, _dropped = propose_errors(
         store, [t.trace_id for t in traces.traces], categories, 1, bare, agent
     )
     assert proposals == []
@@ -180,10 +180,117 @@ def test_a_hallucinated_filter_field_costs_the_step_not_the_error(
         ]
     )
     agent = ScriptedAblationAgent({"hallucination": [proposal]})
-    proposals, _ = propose_errors(
+    proposals, _digest, _dropped = propose_errors(
         store, [t.trace_id for t in traces.traces], categories, 1, target_cfg, agent
     )
     assert [s.field for s in proposals[0].filter_steps] == ["span_types"]
+
+
+# ------------------------------------------------- the agent seam is guarded
+
+class _ExplodingAgent:
+    """An agent that fails a fixed number of times, then behaves."""
+
+    def __init__(self, exc: Exception, fail_times: int = 99):
+        self.exc = exc
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def propose(self, category, n, digest, allowed_modes):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise self.exc
+        return [make_proposal(f"ok-{category.category_id}", category.category_id)]
+
+    def revise_corruption(self, proposal, digest, reasons):  # pragma: no cover
+        raise AssertionError("not reached")
+
+
+def _propose(agent, store, traces, categories, cfg):
+    return propose_errors(
+        store, [t.trace_id for t in traces.traces], categories, 1, cfg, agent
+    )
+
+
+def test_a_transport_failure_is_retried_once(store, traces, categories, target_cfg):
+    from benchmark.ablation.agent import AgentTransportError
+
+    agent = _ExplodingAgent(AgentTransportError("connection reset"), fail_times=1)
+    proposals, _digest, dropped = _propose(agent, store, traces, categories, target_cfg)
+    assert agent.calls == len(categories) + 1, "exactly one extra call, for the retry"
+    assert dropped == {}
+    assert len(proposals) == len(categories)
+
+
+def test_a_persistent_transport_failure_drops_only_that_category(
+    store, traces, categories, target_cfg
+):
+    from benchmark.ablation.agent import AgentTransportError
+
+    agent = _ExplodingAgent(AgentTransportError("connection reset"))
+    proposals, _digest, dropped = _propose(agent, store, traces, categories, target_cfg)
+    assert proposals == []
+    assert set(dropped) == {c.category_id for c in categories}
+    assert all("failed twice" in reason for reason in dropped.values())
+
+
+def test_a_non_json_reply_drops_the_category_without_a_retry(
+    store, traces, categories, target_cfg
+):
+    from benchmark.ablation.agent import AgentResponseError
+
+    agent = _ExplodingAgent(AgentResponseError("the model's reply was not JSON"))
+    proposals, _digest, dropped = _propose(agent, store, traces, categories, target_cfg)
+    assert agent.calls == len(categories), "a bad reply is not worth a second identical prompt"
+    assert proposals == []
+    assert all("nothing usable" in reason for reason in dropped.values())
+
+
+def test_an_unexpected_agent_error_still_only_costs_its_category(
+    store, traces, categories, target_cfg
+):
+    agent = _ExplodingAgent(ValueError("something nobody predicted"), fail_times=1)
+    proposals, _digest, dropped = _propose(agent, store, traces, categories, target_cfg)
+    # first category dies, the rest proceed
+    assert len(dropped) == 1
+    assert len(proposals) == len(categories) - 1
+
+
+def test_a_hallucinated_operator_costs_the_step_not_the_error(
+    store, traces, categories, target_cfg
+):
+    bad = FilterStep.model_construct(field="span_types", op="in", value=["tool"])
+    good = FilterStep(field="status", op="eq", value="ok")
+    proposal = make_proposal(filter_steps=[bad, good])
+    agent = ScriptedAblationAgent({"hallucination": [proposal]})
+    proposals, _digest, _dropped = _propose(agent, store, traces, categories, target_cfg)
+    assert [s.op for s in proposals[0].filter_steps] == ["eq"]
+
+
+def test_the_openai_parser_skips_a_step_with_an_invented_operator():
+    """The Literal on FilterStep raises; one bad step must not lose the draft."""
+    from benchmark.ablation.agent import OpenAIAblationAgent
+    from benchmark.schemas.issues import ErrorCategory
+
+    raw = {
+        "injection_mode": "replay_edit",
+        "title": "t",
+        "description": "d",
+        "severity": "high",
+        "filter_steps": [
+            {"field": "span_types", "op": "in", "value": ["tool"]},
+            {"field": "status", "op": "eq", "value": "ok"},
+        ],
+        "corruption": {"replacement": "case NBX-1 is open", "marker": "NBX-1"},
+    }
+    proposal = OpenAIAblationAgent._to_proposal(
+        ErrorCategory(category_id="hallucination", name="h", description="d"),
+        0,
+        raw,
+        ["replay_edit"],
+    )
+    assert proposal is not None
+    assert [s.op for s in proposal.filter_steps] == ["eq"]
 
 
 def test_a_proposal_with_no_injection_mode_cannot_be_planned():

@@ -44,7 +44,7 @@ import urllib.request
 from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from benchmark.models import ABLATION_AGENT_MODEL
 from benchmark.schemas.ablation import FaultConfig, FilterStep
@@ -62,23 +62,64 @@ BEHAVIOR_VOCABULARY: dict[str, tuple[str, ...]] = {
     "llm_proxy": ("truncate_output",),
 }
 
-# Phrases that mean the app took an injected claim back. Checked against the
-# REGENERATED tail only (docs/architecture/04-ablation-engine.md: the corrupted
+# Phrases that mean the app took an injected claim back, checked against the
+# REGENERATED tail (docs/architecture/04-ablation-engine.md: the corrupted
 # content must be present in T* and not explicitly retracted downstream).
+#
+# Deliberately first-person and self-referential. Bare words like "correction"
+# or "no such" were removed after review: a support assistant says "I've filed
+# a correction request" or "there's no such setting in the mobile app" in
+# perfectly healthy answers, and a false positive here is expensive — it burns
+# a validated spec and can drop an error the corpus could have carried.
 DEFAULT_RETRACTION_PATTERNS: tuple[str, ...] = (
     "i apologi",
-    "correction",
     "i was incorrect",
     "i made an error",
-    "that was wrong",
-    "disregard",
-    "let me correct",
-    "actually, the correct",
+    "i made a mistake",
     "i misspoke",
-    "does not exist",
-    "no such",
+    "i gave you incorrect",
+    "i gave you the wrong",
+    "that was incorrect",
+    "that was wrong",
+    "let me correct",
+    "correction to my earlier",
+    "please disregard",
     "i cannot find any record",
+    "i don't have any record",
+    "i do not have any record",
 )
+
+# Phrases that only count as a retraction when they land near the injected
+# marker's own terms — "does not exist" is a retraction of *the fabricated
+# ticket id*, and ordinary English everywhere else.
+ANCHORED_RETRACTION_PATTERNS: tuple[str, ...] = (
+    "does not exist",
+    "doesn't exist",
+    "no such",
+    "not a valid",
+    "isn't valid",
+    "is invalid",
+    "could not find",
+    "couldn't find",
+    "unable to locate",
+    "no record of",
+)
+
+# How far from a marker term an anchored phrase still counts, in characters.
+ANCHOR_WINDOW = 240
+
+
+class AgentTransportError(Exception):
+    """The model call itself failed (network, timeout, 5xx). Worth one retry."""
+
+
+class AgentResponseError(Exception):
+    """The model replied with something unusable. Retrying rarely helps.
+
+    Kept distinct from `AgentTransportError` so the caller can spend a retry on
+    the failure that a retry actually fixes, and drop the category promptly on
+    the one it does not.
+    """
 
 
 class Corruption(BaseModel):
@@ -87,7 +128,10 @@ class Corruption(BaseModel):
     replacement: str  # the corrupted assistant response for the target turn
     marker: str  # the unfalsifiable token that proves the corruption is in T*
     retraction_patterns: list[str] = Field(default_factory=list)
-    turn_index: int = 0  # which turn k to corrupt
+    # Which turn k to corrupt. None (the usual case) means "choose per trace,
+    # seeded" — see `inject.choose_turn_index`. An agent may pin it when the
+    # error only makes sense at a particular point in a conversation.
+    turn_index: int | None = None
 
 
 class ProposedError(BaseModel):
@@ -290,9 +334,28 @@ class OpenAIAblationAgent:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
-            payload = json.loads(response.read())
-        return json.loads(payload["choices"][0]["message"]["content"])
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
+                raw = response.read()
+        except Exception as exc:  # noqa: BLE001 - any transport failure is retryable
+            raise AgentTransportError(f"{type(exc).__name__}: {exc}") from exc
+        try:
+            payload = json.loads(raw)
+            content = payload["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise AgentResponseError(
+                f"the completions response was not the expected shape: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            return json.loads(content)
+        except ValueError as exc:
+            # `response_format=json_object` makes this rare, not impossible —
+            # a refusal or a truncated completion both land here.
+            raise AgentResponseError(
+                f"the model's reply was not JSON: {type(exc).__name__}: {exc}; "
+                f"first 200 chars: {str(content)[:200]!r}"
+            ) from exc
 
     @staticmethod
     def _digest_block(digest: CorpusDigest) -> str:
@@ -341,11 +404,18 @@ class OpenAIAblationAgent:
             ("low", "medium", "high") else "medium",
             injection_mode=mode,
         )
-        steps = [
-            FilterStep.model_validate(step)
-            for step in (raw.get("filter_steps") or [])
-            if isinstance(step, dict) and step.get("field") and step.get("op")
-        ]
+        # A malformed step costs that step, never the draft: `FilterStep`'s op
+        # is a Literal, so an invented operator ("in", "matches") raises out of
+        # model_validate, and one bad step would otherwise discard an error the
+        # model got right in every other respect.
+        steps = []
+        for step in raw.get("filter_steps") or []:
+            if not isinstance(step, dict) or not step.get("field") or not step.get("op"):
+                continue
+            try:
+                steps.append(FilterStep.model_validate(step))
+            except ValidationError:
+                continue
         corruption = None
         fault = None
         if mode == "replay_edit":

@@ -25,10 +25,11 @@ from collections.abc import Iterable, Sequence
 from benchmark.ablation.agent import (
     BEHAVIOR_VOCABULARY,
     AblationAgent,
+    AgentTransportError,
     CorpusDigest,
     ProposedError,
 )
-from benchmark.ablation.filters import known_field
+from benchmark.ablation.filters import known_field, known_op
 from benchmark.harness.faults import SHIM_TO_CONFIG_KIND
 from benchmark.schemas.configs import TargetAppConfig
 from benchmark.schemas.issues import ErrorCategory, InjectionMode, Issue
@@ -159,20 +160,54 @@ def propose_errors(
     *,
     app_context: str = "",
     digest: CorpusDigest | None = None,
-) -> tuple[list[ProposedError], CorpusDigest]:
+) -> tuple[list[ProposedError], CorpusDigest, dict[str, str]]:
     """`[N,M,T]`, `C_E` -> `[E, C_E]` — concrete drafts, one batch per category.
 
     `error_id` is re-stamped here so ids are unique across categories however
     the agent numbered them, and unusable drafts are dropped with a logged
     reason rather than being carried into planning to fail later.
+
+    Returns `(proposals, digest, dropped_categories)`. **One bad draw costs its
+    category, never the run**: by the time step 1 executes the whole corpus has
+    already been collected and paid for, so a transport blip or a malformed
+    reply must not discard it. Transport failures get one retry; a response the
+    parser cannot use is not retried (a second identical prompt rarely helps).
+    Every drop carries a reason out to `AblationResult.dropped_errors`.
     """
     digest = digest or build_digest(store, trace_ids, cfg, app_context=app_context)
     modes = allowed_modes(cfg)
     shims = available_shims(cfg)
 
     out: list[ProposedError] = []
+    dropped: dict[str, str] = {}
     for category in categories:
-        drafts = agent.propose(category, n_per_category, digest, modes)
+        try:
+            drafts = agent.propose(category, n_per_category, digest, modes)
+        except AgentTransportError as exc:
+            log.warning(
+                "category %s: agent transport failure (%s) — retrying once",
+                category.category_id,
+                exc,
+            )
+            try:
+                drafts = agent.propose(category, n_per_category, digest, modes)
+            except Exception as retry_exc:  # noqa: BLE001 - the category is dropped either way
+                reason = (
+                    f"category {category.category_id} dropped: the proposing agent failed "
+                    f"twice ({type(retry_exc).__name__}: {retry_exc})"
+                )
+                log.warning("%s", reason)
+                dropped[category.category_id] = reason
+                continue
+        except Exception as exc:  # noqa: BLE001 - a bad reply must not kill the run
+            reason = (
+                f"category {category.category_id} dropped: the proposing agent returned "
+                f"nothing usable ({type(exc).__name__}: {exc})"
+            )
+            log.warning("%s", reason)
+            dropped[category.category_id] = reason
+            continue
+
         for index, draft in enumerate(drafts[:n_per_category]):
             reason = _usable(draft, shims)
             if reason is not None:
@@ -190,21 +225,28 @@ def propose_errors(
                     "category_id": category.category_id,
                 }
             )
+            # One hallucinated field or operator costs that step, not the
+            # error: letting either through would raise out of the middle of
+            # validation and take the whole run with it.
             steps = []
             for step in draft.filter_steps:
-                if known_field(step.field):
-                    steps.append(step)
-                else:
-                    # One hallucinated field costs that step, not the error:
-                    # letting it through would raise out of the middle of
-                    # validation and take the whole run with it.
+                if not known_field(step.field):
                     log.warning(
                         "%s: dropping filter step on unknown field %r",
                         issue.error_id,
                         step.field,
                     )
+                elif not known_op(step.op):
+                    log.warning(
+                        "%s: dropping filter step with unsupported op %r on %r",
+                        issue.error_id,
+                        step.op,
+                        step.field,
+                    )
+                else:
+                    steps.append(step)
             out.append(draft.model_copy(update={"issue": issue, "filter_steps": steps}))
-    return out, digest
+    return out, digest, dropped
 
 
 def proposed_issues(proposals: Sequence[ProposedError]) -> list[Issue]:

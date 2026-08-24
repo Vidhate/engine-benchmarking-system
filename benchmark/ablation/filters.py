@@ -42,9 +42,9 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Any, get_args
 
-from benchmark.schemas.ablation import FilterStep, TraceFilter
+from benchmark.schemas.ablation import FilterOp, FilterStep, TraceFilter
 from benchmark.schemas.traces import Trace
 
 _SEGMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)((?:\[(?:\*|\d+)])*)$")
@@ -110,6 +110,19 @@ def _descend(nodes: list[Any], name: str, indexes: list[str]) -> list[Any]:
             current = stepped
         out.extend(current)
     return out
+
+
+KNOWN_OPS: frozenset[str] = frozenset(get_args(FilterOp))
+
+
+def known_op(op: str) -> bool:
+    """Whether `op` is one this engine implements.
+
+    Same reasoning as `known_field`: the agent writes operators as free text
+    ("in", "matches", "not_contains"), and an unimplemented one must cost its
+    step at proposal time rather than raise from inside the filter engine.
+    """
+    return op in KNOWN_OPS
 
 
 def known_field(path: str) -> bool:
