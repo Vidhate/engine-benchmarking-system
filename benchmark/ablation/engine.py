@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
@@ -44,6 +44,9 @@ from benchmark.schemas.io import stamp_dataset_id
 from benchmark.schemas.issues import ErrorCategory, Issueboard
 from benchmark.schemas.traces import Trace, TraceDataset
 from benchmark.tracing.store import TraceStore
+
+if TYPE_CHECKING:  # the annotation only — importing the LangGraph-aware package
+    from benchmark.harness import Harness  # at runtime would drag its SDKs in
 
 log = logging.getLogger("benchmark.ablation")
 
@@ -237,13 +240,9 @@ def run_ablation(
     inputs: InputDataset,
     categories: list[ErrorCategory],
     cfg: AblationConfig,
-    harness: Any,
+    harness: Harness,
     store: TraceStore,
     export_path: Path,
 ) -> AblationResult:
-    """Stage III entrypoint — the signature Phase 7 codes against.
-
-    `harness` is a `benchmark.harness.Harness`; it is untyped here only to keep
-    this module free of a runtime import of the LangGraph-aware package.
-    """
+    """Stage III entrypoint — the signature Phase 7 codes against."""
     return AblationEngine(harness, store, cfg).run(traces, inputs, categories, export_path)
