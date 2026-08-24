@@ -321,6 +321,96 @@ def test_the_scan_covers_span_output_not_just_the_final_response():
     assert retraction_in([turn], []) == "i made an error"
 
 
+# ------------------------------------------------------------- fork point
+
+def test_the_fork_point_is_the_recorded_checkpoint_not_a_boundary_position(harness, store):
+    """A thread's boundary list is not the trace's turn space.
+
+    Measured live: the server writes several checkpoints per answer, so turn k
+    of the trace is boundary 2k, and asking for `turn_index=k` either forked at
+    the wrong turn or was refused outright. The collector already recorded a
+    checkpoint id per turn; that id is the key.
+    """
+    from benchmark.ablation.inject import fork_point
+
+    trace = store.get("trace-mt-00")
+    assert harness.turn_boundaries("thread-trace-mt-00")[1][0] != "ckpt-trace-mt-00-1", (
+        "the fixture must reproduce the duplicated-boundary layout"
+    )
+    checkpoint_id, message_id = fork_point(
+        trace, 1, harness, trace.turns[1].final_response
+    )
+    assert (checkpoint_id, message_id) == ("ckpt-trace-mt-00-1", "msg-trace-mt-00-1")
+
+
+def test_a_replay_forks_the_turn_it_says_it_forked(harness, store):
+    trace = store.get("trace-mt-00")
+    spec = plan_ablation(make_proposal(turn_index=1))
+    apply_replay_edit(
+        trace, spec, harness, ablation_id="abl-fp", dataset_id="ds", store_result=False
+    )
+    assert harness.replays[-1]["checkpoint_ref"] == "ckpt-trace-mt-00-1"
+    state = harness.replays[-1]["corrupted_state"]
+    assert state["messages"][0]["id"] == "msg-trace-mt-00-1"
+
+
+def test_an_earlier_replays_fork_on_the_same_thread_does_not_move_the_fork_point(
+    harness, store
+):
+    """Mode A forks the SAME thread, so a previous injection's regenerated
+    answers are appended to the same history."""
+    from benchmark.ablation.inject import fork_point
+
+    trace = store.get("trace-mt-00")
+    fork = trace.model_copy(deep=True, update={"trace_id": "regen-earlier"})
+    store.put(fork)  # same thread_id, extra boundaries
+    assert len(harness.turn_boundaries("thread-trace-mt-00")) == 12
+    assert fork_point(trace, 1, harness, trace.turns[1].final_response) == (
+        "ckpt-trace-mt-00-1",
+        "msg-trace-mt-00-1",
+    )
+
+
+def test_a_trace_with_no_recorded_checkpoints_falls_back_to_the_answer_text(
+    harness, store
+):
+    from benchmark.ablation.inject import fork_point
+
+    trace = store.get("trace-mt-00")
+    trace.metadata.pop("turn_checkpoints")
+    checkpoint_id, _message_id = fork_point(
+        trace, 1, harness, trace.turns[1].final_response
+    )
+    assert checkpoint_id == "ckpt-trace-mt-00-1"
+
+
+def test_a_fallback_that_matches_two_different_answers_is_refused(harness, store):
+    """Two turns ending in the same words are ordinary; forking at the wrong
+    one would mislabel the ground-truth turn index silently."""
+    from benchmark.ablation.inject import fork_point
+
+    trace = store.get("trace-mt-00")
+    trace.metadata.pop("turn_checkpoints")
+    for turn in trace.turns:
+        turn.final_response = "Anything else I can help with?"
+    store.put(trace)
+    with pytest.raises(InjectionError, match="different assistant messages"):
+        fork_point(trace, 1, harness, "Anything else I can help with?")
+
+
+def test_a_fork_point_that_no_longer_exists_is_refused_with_the_reason(harness, store):
+    """The recorded id is authoritative; when the thread has neither it nor the
+    answer text, the injection is refused rather than forked at a guess."""
+    from benchmark.ablation.inject import fork_point
+
+    trace = store.get("trace-mt-00")
+    trace.metadata["turn_checkpoints"] = [
+        {"turn_index": 1, "checkpoint_id": "ckpt-the-server-dropped"}
+    ]
+    with pytest.raises(InjectionError, match="no checkpoint on thread"):
+        fork_point(trace, 1, harness, "an answer this thread never produced")
+
+
 # ------------------------------------------------------- thread liveness
 
 def test_a_corpus_of_dead_threads_fails_loudly_with_guidance(target_cfg, store, traces):

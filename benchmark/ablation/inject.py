@@ -1,8 +1,20 @@
 """The two injection mechanics: Mode A (`replay_edit`) and Mode C (`dependency_fault`).
 
 Everything here goes through the Phase-4 public API (`Harness.replay`,
-`Harness.run_with_faults`, `Harness.locate_checkpoint`) — no LangGraph or
+`Harness.run_with_faults`, `Harness.turn_boundaries`) — no LangGraph or
 LangSmith type crosses this file.
+
+## Where to fork: an id, never a position
+
+`Harness.turn_boundaries` returns one entry per *checkpoint* whose newest
+message is a plain answer, and the live server writes **several checkpoints per
+answer** — so trace turn k is boundary 2k, and a previous Mode-A replay forks
+the same thread and appends its regenerated answers to the same history. The
+boundary list is therefore not the trace's turn space, and
+`locate_checkpoint(..., turn_index=k)` is only correct at k = 0 by accident.
+`fork_point` resolves the fork from the checkpoint id the collector recorded
+for that turn (`metadata.turn_checkpoints`), falling back to the answer text
+and refusing an ambiguous match.
 
 ## Mode A — replay_edit, and what the harness actually returns
 
@@ -151,6 +163,68 @@ def live_threads(traces: Sequence[Trace], harness: Any) -> set[str]:
         if checked[ref]:
             alive.add(trace.trace_id)
     return alive
+
+
+def _recorded_checkpoint(trace: Trace, turn_index: int) -> str | None:
+    """The checkpoint the collector recorded for turn k, if it recorded one."""
+    for entry in trace.metadata.get("turn_checkpoints") or []:
+        if isinstance(entry, dict) and entry.get("turn_index") == turn_index:
+            value = entry.get("checkpoint_id")
+            return value if isinstance(value, str) and value else None
+    return None
+
+
+def fork_point(
+    trace: Trace, turn_index: int, harness: Any, response_text: str = ""
+) -> tuple[str, str]:
+    """`(checkpoint_id, message_id)` to fork turn k at.
+
+    **Not** `locate_checkpoint(..., turn_index=k)`. That `turn_index` indexes
+    the *thread's* boundary list, which is not the trace's turn space, as the
+    live run showed:
+
+    * the server writes **several checkpoints per answer**, so one answer
+      appears 2+ times in `turn_boundaries` — trace turn k is boundary 2k;
+    * a previous Mode-A replay **forks the same thread**, so its regenerated
+      answers are appended to the same history.
+
+    Only k = 0 survived that by accident, which is why it stayed hidden while
+    every corruption was pinned to turn 0. The collector already recorded which
+    checkpoint each turn ended at (`metadata.turn_checkpoints`), so that **id**,
+    never a position, is the key. Text is only the fallback, and it is refused
+    as ambiguous unless every match is the same assistant message.
+    """
+    thread_id = thread_ref(trace)
+    if thread_id is None:
+        raise InjectionError(f"trace {trace.trace_id} has no thread ref to fork")
+    boundaries = harness.turn_boundaries(thread_id)
+    recorded = _recorded_checkpoint(trace, turn_index)
+    if recorded is not None:
+        for checkpoint_id, message_id, _text in boundaries:
+            if checkpoint_id == recorded:
+                return checkpoint_id, message_id
+        log.warning(
+            "trace %s records checkpoint %s for turn %d, but the thread no longer "
+            "has it — falling back to matching on the answer text",
+            trace.trace_id,
+            recorded,
+            turn_index,
+        )
+    wanted = (response_text or "").strip()
+    matches = [(c, m) for c, m, text in boundaries if wanted and text == wanted]
+    if not matches:
+        raise InjectionError(
+            f"no checkpoint on thread {thread_id} is turn {turn_index} of trace "
+            f"{trace.trace_id} (recorded checkpoint {recorded!r}, "
+            f"{len(boundaries)} boundary/boundaries on the thread)"
+        )
+    if len({message_id for _c, message_id in matches}) > 1:
+        raise InjectionError(
+            f"turn {turn_index} of trace {trace.trace_id} matches {len(matches)} different "
+            f"assistant messages on thread {thread_id}; forking at the wrong one would "
+            f"mislabel the ground-truth turn index"
+        )
+    return matches[0]
 
 
 def assert_threads_alive(traces: Sequence[Trace], harness: Any) -> set[str]:
@@ -512,8 +586,8 @@ def apply_replay_edit(
                 f"{spec.error_id}: trace {trace.trace_id} has no thread ref, so turns "
                 f"{turn_index + 1}..{len(trace.turns) - 1} cannot be regenerated"
             )
-        checkpoint_id, message_id = harness.locate_checkpoint(
-            thread_id, original_response, turn_index=turn_index
+        checkpoint_id, message_id = fork_point(
+            trace, turn_index, harness, original_response
         )
         regenerated = harness.replay(
             thread_id,

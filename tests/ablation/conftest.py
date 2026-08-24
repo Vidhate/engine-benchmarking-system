@@ -287,17 +287,80 @@ class FakeHarness:
     def _alive(self, thread_id: str) -> bool:
         return self.live_threads is None or thread_id in self.live_threads
 
+    def _traces_on_thread(self, thread_id: str) -> list[Trace]:
+        """Every trace whose turns live on this thread, the original first.
+
+        A Mode-A replay forks the SAME thread, so its regenerated answers end up
+        in the same history — measured live, and reproduced here.
+        """
+        found = [
+            self.store.get(trace_id)
+            for trace_id in sorted(self.store.list_ids())
+        ]
+        matching = [t for t in found if t.metadata.get("thread_id") == thread_id]
+        return sorted(matching, key=lambda t: (t.trace_id.startswith("regen-"), t.trace_id))
+
     def turn_boundaries(self, thread_id: str):
+        """One entry per CHECKPOINT whose newest message is a plain answer.
+
+        That is **two or more entries per answer**, not one: the server writes
+        several snapshots per turn, and every one of them ends with the same
+        assistant message. Measured on the live target app — a fake that
+        returned exactly one entry per turn hid a real index bug, where
+        `locate_checkpoint(turn_index=k)` indexed this list as if it were the
+        trace's turn space.
+        """
         self.boundary_probes.append(thread_id)
         if not self._alive(thread_id):
             return []
-        return [(f"ckpt-{thread_id}-{i}", f"msg-{thread_id}-{i}", f"answer {i}") for i in range(4)]
+        traces = self._traces_on_thread(thread_id)
+        if not traces:
+            return [
+                (f"ckpt-{thread_id}-{i}", f"msg-{thread_id}-{i}", f"answer {i}")
+                for i in range(4)
+            ]
+        boundaries = []
+        for trace in traces:
+            for turn in trace.turns:
+                checkpoint = f"ckpt-{trace.trace_id}-{turn.turn_index}"
+                message = f"msg-{trace.trace_id}-{turn.turn_index}"
+                text = turn.final_response.strip()
+                boundaries.append((checkpoint, message, text))
+                # the same answer, one snapshot later
+                boundaries.append((f"{checkpoint}-post", message, text))
+        return boundaries
 
     def locate_checkpoint(self, thread_id, response_text="", *, turn_index=None):
-        if not self._alive(thread_id):
+        """The real semantics: `turn_index` indexes `turn_boundaries`, and the
+        text is verified against that position."""
+        boundaries = self.turn_boundaries(thread_id)
+        if not boundaries:
             raise KeyError(f"thread {thread_id} has only 0 answer turn(s)")
-        index = turn_index or 0
-        return f"ckpt-{thread_id}-{index}", f"msg-{thread_id}-{index}"
+        wanted = (response_text or "").strip()
+        if turn_index is not None:
+            if not 0 <= turn_index < len(boundaries):
+                raise KeyError(
+                    f"thread {thread_id} has only {len(boundaries)} answer turn(s); "
+                    f"turn_index={turn_index} is out of range"
+                )
+            checkpoint_id, message_id, text = boundaries[turn_index]
+            if wanted and text != wanted:
+                raise KeyError(
+                    f"turn {turn_index} of thread {thread_id} does not end with the given "
+                    f"response (it ends with {text[:80]!r})"
+                )
+            return checkpoint_id, message_id
+        matches = [(c, m) for c, m, text in boundaries if text == wanted]
+        if not matches:
+            raise KeyError(
+                f"no checkpoint on thread {thread_id} ends with the given assistant response"
+            )
+        if len({message_id for _c, message_id in matches}) > 1:
+            raise KeyError(
+                f"{len(matches)} turns of thread {thread_id} end with the same assistant "
+                f"response; pass turn_index to say which one to fork at"
+            )
+        return matches[0]
 
     # -- Mode A ------------------------------------------------------------
     def replay(
