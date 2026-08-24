@@ -226,7 +226,9 @@ def validate_specs(
                     f"below min_eligible={min_eligible}"
                 )
 
-            if len(candidates) < min_eligible:
+            # max(..., 1): a min_eligible of 0 would otherwise send an empty
+            # candidate list into the dry run, which has nothing to sample.
+            if len(candidates) < max(min_eligible, 1):
                 outcome.failures.append(
                     ValidationFailure(
                         error_id=error_id, attempt=attempt, stage="filter", reason=reason
