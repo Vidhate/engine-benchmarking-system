@@ -174,6 +174,17 @@ def _recorded_checkpoint(trace: Trace, turn_index: int) -> str | None:
     return None
 
 
+def _checkpoints_before(trace: Trace, turn_index: int) -> list[Any]:
+    """The recorded checkpoints a splice at turn k leaves valid — those before k."""
+    return [
+        entry
+        for entry in (trace.metadata.get("turn_checkpoints") or [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("turn_index"), int)
+        and entry["turn_index"] < turn_index
+    ]
+
+
 def fork_point(
     trace: Trace, turn_index: int, harness: Any, response_text: str = ""
 ) -> tuple[str, str]:
@@ -394,8 +405,9 @@ def corrupt_turn(turn: Turn, replacement: str) -> tuple[Turn, list[str], str]:
             f"be made consistent with the model call that produced it"
         )
     original_llm_text = json.dumps(llm_span.outputs, sort_keys=True, default=str)
+    completion_before = _completion_text(llm_span.outputs)
     llm_span.outputs = _rewrite_llm_output(llm_span.outputs, replacement)
-    llm_span.attributes = _rescale_attributes(llm_span.attributes, original_llm_text, replacement)
+    llm_span.attributes = _adjust_tokens(llm_span.attributes, completion_before, replacement)
     rewritten = [llm_span.span_id]
 
     root = _root_span(corrupted)
@@ -405,28 +417,82 @@ def corrupt_turn(turn: Turn, replacement: str) -> tuple[Turn, list[str], str]:
     return corrupted, rewritten, original_llm_text
 
 
-def _rescale_attributes(
-    attributes: dict[str, Any], before: str, after: str
+def _completion_text(outputs: dict[str, Any]) -> str | None:
+    """The completion text this llm span recorded, or None if it cannot be read.
+
+    Mirrors `_rewrite_llm_output`'s search order exactly, so "what was there"
+    and "what gets replaced" are always the same string.
+    """
+    generations = outputs.get("generations")
+    if isinstance(generations, list) and generations:
+        last_batch = generations[-1]
+        if isinstance(last_batch, list) and last_batch and isinstance(last_batch[-1], dict):
+            entry = last_batch[-1]
+            if isinstance(entry.get("text"), str):
+                return entry["text"]
+            message = entry.get("message")
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                return message["content"]
+            return None
+    message = outputs.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        return content if isinstance(content, str) else None
+    messages = outputs.get("messages")
+    if isinstance(messages, list) and messages:
+        for entry in reversed(messages):
+            if isinstance(entry, dict) and (entry.get("type") or entry.get("role")) in (
+                "ai",
+                "assistant",
+            ):
+                content = entry.get("content")
+                return content if isinstance(content, str) else None
+    output = outputs.get("output")
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict) and isinstance(output.get("content"), str):
+        return output["content"]
+    return None
+
+
+# The usual English rule of thumb. Only the *delta* is divided by it, so being
+# 30% off here moves the count by a few tokens, not by a factor.
+CHARS_PER_TOKEN = 4
+
+
+def _adjust_tokens(
+    attributes: dict[str, Any], completion_before: str | None, replacement: str
 ) -> dict[str, Any]:
-    """Keep the rewritten llm span's `tokens` consistent with its new output.
+    """Move the rewritten llm span's `tokens` by its *completion* delta only.
 
     A span whose completion was replaced but whose token count still describes
-    the *original* text is a statistical tell: an Engine (or a reviewer) can
-    regress token count on output length and find every ablated span as an
-    outlier. The count is scaled by the length ratio rather than dropped —
-    dropping it would make "no token count" the tell instead, since every
-    organic llm span has one.
+    the original text is a statistical tell: regress token count on output
+    length and every ablated span is an outlier. But `tokens` is the
+    collector's **prompt + completion total** (`harness/collector.py`, which
+    prefers `total_tokens`), and the prompt did not change. An earlier version
+    scaled that total by a completion length ratio and, measured on a live run,
+    turned 2100 into 218 with `duration_ms` untouched — a far louder outlier
+    than the one it was erasing.
+
+    So only the completion component moves, estimated from the change in
+    completion *text* length. When the completion cannot be read out of the
+    span's output shape, the count is left exactly as it was: it is then wrong
+    by at most the completion delta (a few percent of a real total), which is
+    the quietest option available. Dropping it is not — every organic llm span
+    has a count, so a missing one would be the tell instead.
 
     `duration_ms` is deliberately left alone: it measures how long the model
     call took, which really did happen, and the corruption does not claim
     otherwise.
     """
     tokens = attributes.get("tokens")
-    if not isinstance(tokens, int) or isinstance(tokens, bool) or not before:
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or completion_before is None:
         return attributes
-    ratio = len(after) / max(len(before), 1)
+    delta = round((len(replacement) - len(completion_before)) / CHARS_PER_TOKEN)
+    if delta == 0:
+        return attributes
     out = dict(attributes)
-    out["tokens"] = max(1, round(tokens * ratio))
+    out["tokens"] = max(1, tokens + delta)
     return out
 
 
@@ -616,6 +682,13 @@ def apply_replay_edit(
             **trace.metadata,
             **replay_metadata,
             "turn_count": len(turns),
+            # Only the untouched prefix keeps its checkpoints. Turn k's content
+            # was rewritten and the tail was regenerated on a FORK of the
+            # thread, so the parent's entries from k on describe answers this
+            # trace no longer contains — and `fork_point` trusts these ids over
+            # the answer text, which is exactly how a stale entry would send a
+            # later injection to the wrong turn.
+            "turn_checkpoints": _checkpoints_before(trace, turn_index),
             # Ground-truth-side bookkeeping; stripped by the Engine export.
             "ablation_parent_trace_id": trace.trace_id,
         },

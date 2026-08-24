@@ -74,20 +74,73 @@ def test_only_the_root_agent_span_is_rewritten():
     assert survivor.outputs["messages"][-1]["content"] == "sub-agent said this"
 
 
-def test_the_rewritten_llm_spans_token_count_tracks_its_new_output():
-    """A span whose completion changed but whose token count still describes
-    the original text is a statistical outlier an Engine could learn."""
-    turn = make_turn("t", 0, final_response="short")
+def _llm_turn_with_a_real_looking_completion(answer: str, tokens: int):
+    turn = make_turn("t", 0, final_response=answer)
     llm = [s for s in turn.spans if s.span_type == "llm"][0]
-    llm.attributes["tokens"] = 100
-    before_len = len(json.dumps(llm.outputs, sort_keys=True, default=str))
+    llm.attributes["tokens"] = tokens
+    llm.attributes["duration_ms"] = 2400
+    llm.outputs = {
+        "generations": [
+            [
+                {
+                    "text": answer,
+                    "message": {
+                        "type": "ai",
+                        "content": answer,
+                        "response_metadata": {
+                            "model_name": "gpt-5.1-mini",
+                            "finish_reason": "stop",
+                        },
+                    },
+                }
+            ]
+        ]
+    }
+    return turn, llm
 
-    long_answer = "x" * (before_len * 3)
-    corrupted, _, _ = corrupt_turn(turn, long_answer)
+
+ORIGINAL_ANSWER = (
+    "Refunds are available within 30 days of the charge date. I can see the "
+    "subscription on your account, and the billing team processes eligible "
+    "refunds to the original payment method within five business days. "
+    "Let me know if you would like me to open a ticket for you."
+)
+
+
+def test_the_rewritten_llm_spans_token_count_stays_in_a_plausible_band():
+    """`tokens` is the collector's PROMPT+COMPLETION total.
+
+    Measured live: scaling that total by a completion-length ratio turned 2100
+    into 218 with `duration_ms` unchanged — a far louder outlier than the tell
+    it was meant to erase. Only the completion component may move.
+    """
+    turn, llm = _llm_turn_with_a_real_looking_completion(ORIGINAL_ANSWER, 2100)
+    corrupted, _, _ = corrupt_turn(turn, "I have escalated this under case NBX-4471.")
     after = [s for s in corrupted.spans if s.span_type == "llm"][0]
-    assert after.attributes["tokens"] > 100, after.attributes
+    assert 0.75 * 2100 <= after.attributes["tokens"] <= 1.25 * 2100, after.attributes
+    # and it did move in the right direction: the new completion is shorter
+    assert after.attributes["tokens"] < 2100
     # duration is untouched: the model call really did take that long
-    assert after.attributes.get("duration_ms") == llm.attributes.get("duration_ms")
+    assert after.attributes["duration_ms"] == llm.attributes["duration_ms"]
+
+
+def test_a_longer_replacement_moves_the_count_up_not_down():
+    turn, _llm = _llm_turn_with_a_real_looking_completion("Yes, that is correct.", 900)
+    corrupted, _, _ = corrupt_turn(turn, ORIGINAL_ANSWER)
+    after = [s for s in corrupted.spans if s.span_type == "llm"][0]
+    assert 900 < after.attributes["tokens"] <= 1.25 * 900, after.attributes
+
+
+def test_an_unreadable_output_shape_leaves_the_count_alone():
+    """Off by at most the completion delta is the quietest available answer;
+    a guessed number is not."""
+    turn = make_turn("t", 0)
+    llm = [s for s in turn.spans if s.span_type == "llm"][0]
+    llm.outputs = {"some_shape_we_do_not_know": {"blob": ["nested", "text"]}}
+    llm.attributes["tokens"] = 1500
+    corrupted, _, _ = corrupt_turn(turn, "a brand new answer")
+    after = [s for s in corrupted.spans if s.span_type == "llm"][0]
+    assert after.attributes["tokens"] == 1500
 
 
 def test_a_span_with_no_token_count_gains_none():
@@ -319,6 +372,33 @@ def test_the_scan_covers_span_output_not_just_the_final_response():
         "generations": [[{"text": "I made an error in my previous message."}]]
     }
     assert retraction_in([turn], []) == "i made an error"
+
+
+def test_a_spliced_trace_does_not_keep_checkpoints_for_turns_it_regenerated(
+    harness, store
+):
+    """`fork_point` trusts `metadata.turn_checkpoints`. Turn k's content changed
+    and the tail was regenerated on a fork, so those entries no longer describe
+    this trace — exactly the stale-metadata case fork_point defends against.
+    Only the untouched prefix survives.
+    """
+    trace = store.get("trace-mt-00")
+    spec = plan_ablation(make_proposal(turn_index=1))
+    ablated, _record = apply_replay_edit(
+        trace, spec, harness, ablation_id="abl-ck", dataset_id="ds", store_result=False
+    )
+    kept = ablated.metadata["turn_checkpoints"]
+    assert [entry["turn_index"] for entry in kept] == [0]
+    assert kept[0] == trace.metadata["turn_checkpoints"][0], "the prefix is untouched"
+
+
+def test_corrupting_turn_zero_leaves_no_checkpoints_at_all(harness, store):
+    trace = store.get("trace-mt-00")
+    spec = plan_ablation(make_proposal(turn_index=0))
+    ablated, _record = apply_replay_edit(
+        trace, spec, harness, ablation_id="abl-ck0", dataset_id="ds", store_result=False
+    )
+    assert ablated.metadata["turn_checkpoints"] == []
 
 
 # ------------------------------------------------------------- fork point
