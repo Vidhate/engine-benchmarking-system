@@ -139,6 +139,29 @@ def run_case(client, contract, label, prompt, configurable) -> dict:
     }
 
 
+def llm_manifests(ls, project, spans) -> dict[str, dict]:
+    """`serialized` (the `dumpd(model)` manifest) for each llm run in the trace.
+
+    LangSmith retains this field for llm and prompt runs, but `list_runs` does
+    not project it by default — it comes back None unless asked for explicitly.
+    Asking for it is the difference between auditing the manifest and auditing
+    nothing. The unit tests assert the model's manifest is clean on the local
+    object; this is the live channel the trace actually carries.
+    """
+    trace_ids = {r.trace_id for r in spans if r.trace_id}
+    manifests: dict[str, dict] = {}
+    for trace_id in trace_ids:
+        for run in ls.list_runs(
+            project_name=project,
+            trace_id=trace_id,
+            run_type="llm",
+            select=["id", "name", "run_type", "serialized"],
+        ):
+            if run.serialized:
+                manifests[str(run.id)] = run.serialized
+    return manifests
+
+
 def fetch_spans(ls, project, label, payload):
     root = find_root(ls, project, payload["session_id"])
     want = "create_ticket" if label.startswith("tool/") else "corpus_search"
@@ -241,14 +264,36 @@ def main() -> int:
     # If it did not, "final != last llm span output" would be a harness tell.
     assert span_text == armed["final"], "llm span and final answer disagree — inconsistent trace"
     assert unarmed_span_text == results["retriever/unarmed"]["final"]
-    assert len(armed["final"]) < len(unarmed_span_text), "armed answer was not shortened"
     assert not armed["final"].rstrip().endswith((".", "!", "?")), "does not look truncated"
+    # Deliberately NOT asserted: that the armed answer is shorter than the
+    # unarmed one. Those are two independent generations with no length
+    # comparability contract — the unarmed run can legitimately answer "30 days."
+    # in 105 chars while 40% of a chattier armed generation is 162. The armed
+    # run carries its own proof: the span equals the final answer (so the
+    # degradation happened inside the model call) and the text stops
+    # mid-sentence. Please do not reintroduce a cross-run length check.
     print("PASS — the llm span itself carries the truncated generation (no inconsistency)")
 
     # -------------------------------------------------------------- leak audit
     banner("leak audit — armed traces must not name their own fault")
     worst = 0
+    total_manifests = 0
+    total_llm_spans = 0
     for label, payload in results.items():
+        spans = payload["spans"]
+        manifests = llm_manifests(ls, project, spans)
+        llm_ids = [str(r.id) for r in spans if r.run_type == "llm"]
+        populated = [run_id for run_id in llm_ids if manifests.get(run_id)]
+        # Anti-vacuity: `list_runs` does not project `serialized` by default, so
+        # without an explicit select this scan silently audits None. Fail loudly
+        # if a projection change ever empties it again.
+        assert populated == llm_ids, (
+            f"{label}: {len(llm_ids) - len(populated)}/{len(llm_ids)} llm runs had no "
+            f"serialized manifest — the audit would be scanning nothing"
+        )
+        total_manifests += len(populated)
+        total_llm_spans += len(llm_ids)
+
         blob = json.dumps(
             [
                 {
@@ -258,9 +303,9 @@ def main() -> int:
                     "extra": r.extra,
                     # LangSmith retains `serialized` for llm and prompt runs, so
                     # the model manifest ships with every model call.
-                    "serialized": getattr(r, "serialized", None),
+                    "serialized": manifests.get(str(r.id)),
                 }
-                for r in payload["spans"]
+                for r in spans
             ],
             default=str,
         ).lower()
@@ -268,16 +313,20 @@ def main() -> int:
         metadata_keys = sorted(
             {
                 key
-                for r in payload["spans"]
+                for r in spans
                 for key in ((r.extra or {}).get("metadata") or {})
                 if key.startswith("fault_")
             }
         )
-        print(f"{label:28s} spans={len(payload['spans']):3d} leaked={leaked} "
-              f"fault_metadata={metadata_keys}")
+        print(f"{label:28s} spans={len(spans):3d} leaked={leaked} "
+              f"fault_metadata={metadata_keys} with_serialized={len(populated)}/{len(llm_ids)}")
         worst += len(leaked) + len(metadata_keys)
+
+    print(f"\nllm spans scanned with a populated manifest: {total_manifests}/{total_llm_spans}")
+    assert total_llm_spans > 0, "no llm spans at all — nothing was audited"
+    assert total_manifests > 0, "no serialized manifests were fetched — audit was vacuous"
     assert worst == 0, "a fault name reached the trace"
-    print("PASS — no fault key, behaviour name, or shim token anywhere in any span")
+    print("PASS — no fault key, behaviour name, shim token, or subclass name in any span")
 
     banner("GATE 4 OK — all three declared shims activate, visibly and without leaking")
     return 0

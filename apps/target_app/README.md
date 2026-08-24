@@ -97,6 +97,13 @@ Gate 4 (`scripts/gate4_shims.py`) ends with a live audit asserting that no
 fault key, behaviour name, shim token, or subclass name appears in any span's
 inputs, outputs, name, metadata, or serialized manifest, across all nine runs.
 
+The two layers are deliberate and neither replaces the other: the **unit tests**
+assert the manifest is clean on the local model object (they guard the fix),
+while the **gate** asserts it is clean on the wire (it guards the live channel).
+A local-object test cannot catch an API projection gap — `list_runs` does not
+return `serialized` unless asked, so the gate fetches it explicitly and fails if
+any llm run comes back without one, rather than silently scanning `None`.
+
 **NOT handled here — blocking hand-off requirement for Phase 4**
 
 > The trace collector **MUST strip run-level metadata and any `configurable`
