@@ -174,7 +174,12 @@ def cluster_findings(
     bounds = [(start, min(start + chunk_size, len(findings)))
               for start in range(0, len(findings), max(1, chunk_size))]
     if len(bounds) <= 1:
-        return _cluster_chunk(model, findings, 0, seed, categories)
+        # Folded here too, not just on the multi-batch path: a single call that
+        # names the same failure mode twice would otherwise yield two issues,
+        # while the very same findings split across two batches would yield one.
+        # Whether a corpus happens to straddle the chunk boundary must not
+        # change the board.
+        return fold_clusters(_cluster_chunk(model, findings, 0, seed, categories))
 
     print(
         f"[engine] consolidating {len(findings)} findings in {len(bounds)} batches",

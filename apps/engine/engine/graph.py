@@ -1,10 +1,16 @@
 """The served Engine graph.
 
-A deterministic LangGraph loop, not an agent scaffold: `load` -> `analyze` (once
-per trace, sequentially, carrying the running title list) -> `consolidate`. The
-orchestration is fixed code; the LLM is called inside the nodes. Only the
-per-trace analysis pass has tools, and its registry is exactly the four
+A deterministic LangGraph loop, not an agent scaffold: `load` -> `analyze`
+-> `consolidate`. The orchestration is fixed code; the LLM is called inside the
+nodes. Only the analysis pass has tools, and its registry is exactly the four
 trace-inspection tools (`engine/tools.py`).
+
+`analyze` runs once per *batch* of traces rather than once per trace: the
+batch's traces are analysed concurrently (default 8, see `resolve_concurrency`),
+while the batches themselves stay sequential so each one inherits the running
+title list the previous ones built. Findings are assembled in input trace order,
+never completion order, so the board does not depend on thread scheduling.
+`analysis_concurrency=1` reproduces fully sequential analysis.
 
 Run input  : {trace_file, seed_issueboard?, categories?}
 Run output : an Issueboard-shaped object — {board_id, source, issues,
@@ -180,6 +186,10 @@ def analyze_node(state: EngineState, config: RunnableConfig) -> dict[str, Any]:
     concurrency = resolve_concurrency(config)
     batch = state["trace_ids"][cursor : cursor + concurrency]
 
+    # One ChatOpenAI shared by every worker in the batch, deliberately: the
+    # client is stateless per call and its underlying httpx pool is thread-safe,
+    # so sharing reuses connections instead of opening one pool per worker.
+    # (Assumption, not just doctrine — confirmed by the live N=8 gate runs.)
     model = build_model(resolve_model_name(config))
     # Snapshotted before the batch runs: titles are shared BETWEEN batches, not
     # within one, or the analysis would depend on which worker finished first.

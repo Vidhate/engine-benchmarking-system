@@ -202,10 +202,12 @@ def smoke(model: str | None = None, concurrency: int = DEFAULT_CONCURRENCY) -> d
     # model: it fired once in five live runs during development (an over-eager
     # reading of a clean trace at concurrency=1, where every trace sees the full
     # running-title list and the model goes looking for known modes everywhere).
-    # The default stays 0 so a regression is loud; ENGINE_GATE_MAX_CLEAN_FLAGS
-    # lets a caller who has decided to tolerate the flake say so out loud rather
-    # than delete the check.
-    tolerated = int(os.environ.get("ENGINE_GATE_MAX_CLEAN_FLAGS", "0"))
+    # The default stays 0 so a regression is loud;
+    # ENGINE_GATE_MAX_FLAGGED_CLEAN_TRACES lets a caller who has decided to
+    # tolerate the flake say so out loud rather than delete the check. It counts
+    # clean TRACES carrying at least one occurrence, not occurrences — a trace
+    # the Engine misreads three ways is one false positive, not three.
+    tolerated = int(os.environ.get("ENGINE_GATE_MAX_FLAGGED_CLEAN_TRACES", "0"))
     flagged = recall["clean_traces_flagged"]
     assert len(flagged) <= tolerated, (
         f"issues reported against {len(flagged)} trace(s) with nothing planted in "

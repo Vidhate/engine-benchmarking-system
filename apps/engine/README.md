@@ -243,7 +243,7 @@ Two guards, in `tests/test_no_leak.py`:
 ## Tests and gates
 
 ```bash
-uv run pytest                       # 97 unit tests, no network
+uv run pytest                       # 146 unit tests, no network
 uv run ruff check engine tests scripts
 scripts/smoke.sh                    # all three gates, ~10 min, needs a real key
 ```
@@ -260,9 +260,11 @@ scripts/smoke.sh                    # all three gates, ~10 min, needs a real key
   not) plus the batch timings above.
 
   The clean-trace assertion is a real quality signal about a non-deterministic
-  model: it fired once in five development runs. `ENGINE_GATE_MAX_CLEAN_FLAGS`
-  raises the tolerance for a caller who has decided to live with the flake —
-  saying so out loud beats deleting the check.
+  model: it fired once in five development runs.
+  `ENGINE_GATE_MAX_FLAGGED_CLEAN_TRACES` raises the tolerance (counted in clean
+  *traces* carrying at least one occurrence, not in occurrences) for a caller
+  who has decided to live with the flake — saying so out loud beats deleting
+  the check.
 - **Gate 3** (`scripts/gate3_model_swap.py`) — the same run twice, differing only
   in `configurable["model"]`. Each arm's model is confirmed by server-side
   readback (`client.runs.list(thread_id)` → the persisted `config.configurable`),

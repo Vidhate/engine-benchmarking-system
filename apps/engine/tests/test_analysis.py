@@ -457,3 +457,52 @@ def test_chunk_size_is_configurable_for_testing(categories):
     assert batch_sizes(model) == [2, 2, 2]
     assert len(board.issues) == 1
     assert len(board.occurrences) == 6
+
+
+def test_a_single_batch_folds_duplicate_clusters_like_a_multi_batch_run(categories):
+    """Whether a corpus straddles the chunk boundary must not change the board.
+
+    One call that names the same failure mode twice used to yield two issues,
+    while the identical findings split across two batches yielded one.
+    """
+    findings = [
+        TICKET_FINDING.model_copy(update={"trace_id": "t1"}),
+        TICKET_FINDING.model_copy(update={"trace_id": "t2"}),
+    ]
+    duplicated = ConsolidationPlan(
+        clusters=[
+            Cluster(title="Tool error hidden", description="d", category_id="tool_misuse",
+                    severity="low", finding_indices=[0]),
+            Cluster(title="tool  error   hidden!", description="d", category_id="tool_misuse",
+                    severity="high", finding_indices=[1]),
+        ]
+    )
+    single = consolidate(
+        FakeChatModel(responses=[], structured=[duplicated]), findings, None, categories
+    )
+    assert len(single.issues) == 1
+    assert single.issues[0].severity == "high"
+    assert {o.trace_id for o in single.occurrences} == {"t1", "t2"}
+
+    # Same findings, same clusters, two batches -> identical board.
+    split = consolidate(
+        FakeChatModel(
+            responses=[],
+            structured=[
+                ConsolidationPlan(clusters=[duplicated.clusters[0]]),
+                ConsolidationPlan(
+                    clusters=[duplicated.clusters[1].model_copy(update={"finding_indices": [0]})]
+                ),
+                ConsolidationPlan(clusters=[
+                    Cluster(title="Tool error hidden", description="d",
+                            category_id="tool_misuse", severity="high", finding_indices=[0])
+                ]),
+            ],
+        ),
+        findings,
+        None,
+        categories,
+        chunk_size=1,
+    )
+    assert len(split.issues) == 1
+    assert split.board_id == single.board_id

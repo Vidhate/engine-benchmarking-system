@@ -505,3 +505,39 @@ def test_a_real_analysis_pass_runs_concurrently_end_to_end(
     result = run(traces_file, categories=categories, concurrency=8)
     assert sorted(seen) == sorted(ALL_TRACE_IDS)
     assert [o["trace_id"] for o in result["occurrences"]] == ALL_TRACE_IDS
+
+
+def five_trace_file(tmp_path, traces_file):
+    """A 5-trace corpus, so 1 failure is exactly 20% — the threshold itself."""
+    payload = json.loads(traces_file.read_text())
+    payload["traces"] = payload["traces"][:5]
+    path = tmp_path / "five.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_exactly_the_threshold_still_completes(tmp_path, traces_file, monkeypatch, categories):
+    """1 of 5 is 20.0%: the check is `> rate`, so the boundary itself passes."""
+    path = five_trace_file(tmp_path, traces_file)
+    instrument(monkeypatch, Instrumented(delay=0, failing={"trace-clean-pricing"}))
+    result = run(path, categories=categories, concurrency=8)
+    assert len(result["occurrences"]) == 4
+
+
+def test_just_over_the_threshold_raises(tmp_path, traces_file, monkeypatch, categories):
+    """2 of 5 is 40%, the next representable step up on this corpus."""
+    path = five_trace_file(tmp_path, traces_file)
+    instrument(
+        monkeypatch,
+        Instrumented(delay=0, failing={"trace-clean-pricing", "trace-clean-export"}),
+    )
+    with pytest.raises(Exception, match="analysis failed on 2 of 5 traces"):
+        run(path, categories=categories, concurrency=8)
+
+
+def test_the_boundary_is_inclusive_by_construction():
+    """Pins the comparison itself, so the fixture arithmetic above cannot drift
+    from the constant it is meant to exercise."""
+    rate = graph_module.MAX_TRACE_FAILURE_RATE
+    assert not 1 / 5 > rate, "1-of-5 must sit exactly on the threshold, not over it"
+    assert 2 / 5 > rate
