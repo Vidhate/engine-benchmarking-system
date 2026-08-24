@@ -293,6 +293,48 @@ def test_the_openai_parser_skips_a_step_with_an_invented_operator():
     assert [s.op for s in proposal.filter_steps] == ["eq"]
 
 
+def _parsed(raw: dict):
+    from benchmark.ablation.agent import OpenAIAblationAgent
+    from benchmark.schemas.issues import ErrorCategory
+
+    return OpenAIAblationAgent._to_proposal(
+        ErrorCategory(category_id="hallucination", name="h", description="d"),
+        0,
+        {
+            "injection_mode": "replay_edit",
+            "title": "t",
+            "description": "d",
+            "severity": "high",
+            **raw,
+        },
+        ["replay_edit"],
+    )
+
+
+def test_the_agent_can_pin_the_turn_it_wants_corrupted():
+    """`choose_turn_index` honours a pin, but nothing ever read one out of the
+    model's reply — so the override was unreachable in the live path."""
+    proposal = _parsed(
+        {"corruption": {"replacement": "case NBX-1 is open", "marker": "NBX-1",
+                        "turn_index": 2}}
+    )
+    assert proposal is not None
+    assert proposal.corruption.turn_index == 2
+
+
+def test_an_unpinned_or_unusable_turn_index_leaves_the_draw_alone():
+    for body in (
+        {"replacement": "case NBX-1 is open", "marker": "NBX-1"},
+        {"replacement": "case NBX-1 is open", "marker": "NBX-1", "turn_index": "second"},
+        {"replacement": "case NBX-1 is open", "marker": "NBX-1", "turn_index": -1},
+        {"replacement": "case NBX-1 is open", "marker": "NBX-1", "turn_index": True},
+        {"replacement": "case NBX-1 is open", "marker": "NBX-1", "turn_index": None},
+    ):
+        proposal = _parsed({"corruption": body})
+        assert proposal is not None
+        assert proposal.corruption.turn_index is None, body
+
+
 def test_a_proposal_with_no_injection_mode_cannot_be_planned():
     proposal = make_proposal()
     proposal.issue.injection_mode = None

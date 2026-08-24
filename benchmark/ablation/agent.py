@@ -253,10 +253,13 @@ Return STRICT JSON only:
   "filter_steps": [{"field": "...", "op": "eq|ne|contains|regex|gt|lt|exists",
                     "value": ...}],
   "corruption": {"replacement": "...", "marker": "...",
-                 "retraction_patterns": ["..."]},
+                 "retraction_patterns": ["..."], "turn_index": null},
   "fault": {"shim": "retriever|tool|llm_proxy", "target": "...",
             "behavior": "...", "params": {}}
 }]}
+`corruption.turn_index` is OPTIONAL: leave it null (the usual case) and the
+turn to corrupt is drawn per trace; set it only when the error can exist at
+one particular point in a conversation and nowhere else.
 `corruption` is required for replay_edit and omitted for dependency_fault;
 `fault` is the reverse. Never write the words fault_, shim, or ablation into
 any user-visible text you author — that text ships inside the trace, and
@@ -422,10 +425,21 @@ class OpenAIAblationAgent:
             body = raw.get("corruption") or {}
             if not body.get("replacement") or not body.get("marker"):
                 return None
+            # A pin is honoured only when it is a real, non-negative turn
+            # number. Anything else ("second", -1, True, null) leaves it
+            # unpinned, which means `inject.choose_turn_index` draws k per
+            # trace — a wrong pin would refuse every trace with fewer turns.
+            pinned = body.get("turn_index")
+            turn_index = (
+                pinned
+                if isinstance(pinned, int) and not isinstance(pinned, bool) and pinned >= 0
+                else None
+            )
             corruption = Corruption(
                 replacement=str(body["replacement"]),
                 marker=str(body["marker"]),
                 retraction_patterns=[str(p) for p in (body.get("retraction_patterns") or [])],
+                turn_index=turn_index,
             )
         else:
             body = raw.get("fault") or {}
