@@ -31,6 +31,12 @@ brings filesystem, shell, and subagent tools that stay registered on the
 ToolNode even when hidden from the model, plus ~10 middleware spans of trace
 noise per turn — all cost, no benefit, for a two-tool support assistant.
 
+> **Known deprecation.** `langgraph.prebuilt.create_react_agent` emits
+> `LangGraphDeprecatedSinceV10`: it moved to `langchain.agents.create_agent`
+> and is slated for removal in LangGraph V2.0. Migrating is a one-line import
+> change in `agent.py`, at the cost of re-adding the `langchain` dependency.
+> Left as-is for now; worth doing before this app is depended on long-term.
+
 ## Fault shims (Mode C surface)
 
 Each dependency reads its fault instruction from `config.configurable` on the
@@ -74,12 +80,22 @@ accident. What this app does about it, and what it cannot do:
    *inside* the model call, so the llm span and the final answer agree. A
    post-hoc truncation would have left "final != last llm span output" in every
    armed trace — a tell an Engine could learn instead of reading the trace.
-5. **No giveaway span names.** The `ChatOpenAI` subclass is constructed with
-   `name="ChatOpenAI"`, so the class name never reaches the trace.
+5. **No giveaway model identity.** Two separate places name the class, and
+   both are overridden. `name="ChatOpenAI"` pins the *run name*; `_serialized`
+   is overridden to rewrite `id[-1]`, because LangChain also ships `dumpd(self)`
+   as the run's `serialized` field and LangSmith **retains it for `llm` and
+   `prompt` runs**. Fixing only the run name would have left
+   `serialized.id == [..., "SupportChatModel"]` sitting next to the name
+   `ChatOpenAI` — and that mismatch is a sharper fingerprint than either half.
+6. **No shim-bypassing code path.** `disable_streaming=True`, so every
+   completion goes through `_generate`/`_agenerate`. `_stream`/`_astream`
+   route through neither, so a streaming caller (LangGraph Studio,
+   `stream_mode="messages"`) would have had an armed `fault_llm` silently
+   no-op and produce a trace that looks organic.
 
 Gate 4 (`scripts/gate4_shims.py`) ends with a live audit asserting that no
-fault key, behaviour name, or shim token appears in any span's inputs,
-outputs, name, or metadata, across all nine runs.
+fault key, behaviour name, shim token, or subclass name appears in any span's
+inputs, outputs, name, metadata, or serialized manifest, across all nine runs.
 
 **NOT handled here — blocking hand-off requirement for Phase 4**
 

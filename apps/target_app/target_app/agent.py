@@ -15,7 +15,10 @@ a fabricated tool call in a Mode A replay could have reached them.)
 from __future__ import annotations
 
 import os
+from functools import cached_property
+from typing import Any, cast
 
+from langchain_core.load.dump import dumpd
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
@@ -93,13 +96,34 @@ class SupportChatModel(ChatOpenAI):
     span itself records the degraded generation. Truncating after the span
     closed would leave "final answer != last llm span output" in every armed
     trace — a harness tell an Engine could learn instead of reading the trace.
+
+    Streaming is disabled so every completion goes through `_generate` /
+    `_agenerate`. `_stream` / `_astream` bypass both, which would let an armed
+    `fault_llm` silently no-op under any streaming caller (LangGraph Studio,
+    `stream_mode="messages"`) and produce a trace that looks organic.
     """
+
+    disable_streaming: bool = True
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         return _degrade(super()._generate(messages, stop, run_manager, **kwargs))
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         return _degrade(await super()._agenerate(messages, stop, run_manager, **kwargs))
+
+    @cached_property
+    def _serialized(self) -> dict[str, Any]:
+        """The manifest LangChain attaches to every llm run.
+
+        LangSmith retains `serialized` for llm runs, so the real class name
+        would sit in the trace next to the pinned run name `ChatOpenAI` — and
+        the mismatch is a sharper fingerprint than the class name alone.
+        """
+        manifest = cast("dict[str, Any]", dumpd(self))
+        identifier = manifest.get("id")
+        if isinstance(identifier, list) and identifier:
+            manifest["id"] = [*identifier[:-1], LLM_SPAN_NAME]
+        return manifest
 
 
 def _degrade(result: ChatResult) -> ChatResult:

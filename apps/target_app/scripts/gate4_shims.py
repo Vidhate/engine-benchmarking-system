@@ -56,6 +56,7 @@ FORBIDDEN_TOKENS = (
     "truncate_output",
     "shim",
     "ablat",
+    "supportchatmodel",
 )
 
 
@@ -250,7 +251,15 @@ def main() -> int:
     for label, payload in results.items():
         blob = json.dumps(
             [
-                {"name": r.name, "inputs": r.inputs, "outputs": r.outputs, "extra": r.extra}
+                {
+                    "name": r.name,
+                    "inputs": r.inputs,
+                    "outputs": r.outputs,
+                    "extra": r.extra,
+                    # LangSmith retains `serialized` for llm and prompt runs, so
+                    # the model manifest ships with every model call.
+                    "serialized": getattr(r, "serialized", None),
+                }
                 for r in payload["spans"]
             ],
             default=str,

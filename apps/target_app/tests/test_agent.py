@@ -1,8 +1,10 @@
 """Graph wiring, the LLM shim, and the tool allowlist — model mocked, no network."""
 
 import asyncio
+import json
 
 import pytest
+from langchain_core.load.dump import dumpd
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
@@ -48,6 +50,38 @@ def test_the_served_model_is_the_shimmed_subclass():
     assert isinstance(model, SupportChatModel)
     # the subclass must not be visible in the trace
     assert model.name == LLM_SPAN_NAME == "ChatOpenAI"
+
+
+# ------------------------------------------------- what an llm run carries
+
+def test_the_serialized_manifest_does_not_name_the_subclass():
+    """LangSmith retains `serialized` for llm runs, so `dumpd(self)` ships with
+    every model call. The real class name there would sit next to the pinned
+    run name `ChatOpenAI` — and the mismatch is a sharper tell than the name."""
+    manifest = agent_module.build_model()._serialized
+    assert manifest["id"] == ["langchain", "chat_models", "openai", "ChatOpenAI"]
+    assert "SupportChatModel" not in json.dumps(manifest, default=str)
+
+
+def test_the_whole_llm_run_payload_is_free_of_the_subclass_name():
+    """Belt and braces: scan everything the callback layer hands the tracer."""
+    model = agent_module.build_model()
+    payload = json.dumps(
+        {
+            "serialized": model._serialized,
+            "name": model.get_name(),
+            "metadata": model._get_ls_params(),
+        },
+        default=str,
+    )
+    assert "supportchatmodel" not in payload.lower()
+
+
+def test_a_plain_chat_openai_would_have_failed_that_check():
+    """Guard the assertion above against passing for the wrong reason."""
+    leaky = ChatOpenAI(model="gpt-5-mini")
+    leaky.__class__ = type("SupportChatModel", (ChatOpenAI,), {})
+    assert "SupportChatModel" in json.dumps(dumpd(leaky), default=str)
 
 
 # ------------------------------------------- truncation inside the model call
@@ -125,9 +159,19 @@ def mocked_llm(monkeypatch):
     async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         return fake_generate(self, messages)
 
+    def forbidden_stream(self, *args, **kwargs):
+        raise AssertionError(
+            "the streaming path was used: it bypasses _generate/_agenerate, so the "
+            "llm shim would silently no-op"
+        )
+
     monkeypatch.setattr(ChatOpenAI, "bind_tools", spy_bind_tools)
     monkeypatch.setattr(ChatOpenAI, "_generate", fake_generate)
     monkeypatch.setattr(ChatOpenAI, "_agenerate", fake_agenerate)
+    # Fail loudly (and offline) rather than reaching OpenAI if streaming is
+    # ever re-enabled on the model.
+    monkeypatch.setattr(ChatOpenAI, "_stream", forbidden_stream)
+    monkeypatch.setattr(ChatOpenAI, "_astream", forbidden_stream)
     return {"bound": bound, "script": scripted}
 
 
@@ -164,6 +208,42 @@ def test_llm_fault_truncates_on_the_async_path_too(mocked_llm):
 def test_async_run_without_faults_is_unaffected(mocked_llm):
     state = asyncio.run(agent_module.build_graph().ainvoke(ASK))
     assert state["messages"][-1].content == ANSWER
+
+
+# --------------------------------------------- streaming must not bypass it
+
+def streamed_answer(graph, config) -> str:
+    """Collect the assistant text a `stream_mode="messages"` caller would see."""
+
+    async def collect() -> str:
+        chunks = []
+        async for chunk, _meta in graph.astream(ASK, config=config, stream_mode="messages"):
+            if isinstance(chunk, AIMessage) and not chunk.tool_calls:
+                chunks.append(
+                    chunk.content if isinstance(chunk.content, str) else chunk.text
+                )
+        return "".join(chunks)
+
+    return asyncio.run(collect())
+
+
+def test_streaming_callers_still_get_the_truncated_answer(mocked_llm):
+    """`_stream`/`_astream` never route through `_generate`, so an armed
+    fault_llm would silently no-op for any streaming caller (LangGraph Studio,
+    stream_mode="messages") and yield a trace that looks organic."""
+    text = streamed_answer(agent_module.build_graph(), ARMED)
+    assert text, "no assistant text was streamed"
+    assert text != ANSWER, "streaming bypassed the llm shim"
+    assert ANSWER.startswith(text)
+
+
+def test_streaming_without_faults_returns_the_whole_answer(mocked_llm):
+    assert streamed_answer(agent_module.build_graph(), None) == ANSWER
+
+
+def test_streaming_is_disabled_on_the_model():
+    """The mechanism behind the two tests above."""
+    assert agent_module.build_model().disable_streaming is True
 
 
 # --------------------------------------------- dispatchable surface == declared
