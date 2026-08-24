@@ -67,6 +67,15 @@ Ownership legend (mirrors the notes):
 - **Assumed**: the Target AI App (any traced LangChain/LangGraph app works); real Engine is
   unavailable, so a coding agent with custom instructions simulates it.
 
+**v0 implementation note — the tech stack behind "assumed"/"simulated".** Concretely: the
+target app is a `langgraph.prebuilt.create_react_agent` graph (`apps/target_app`), and the
+simulated Engine is a deterministic LangGraph `StateGraph` loop, not a `deepagents`-scaffolded
+agent (`apps/engine`, see [05-engine-simulation.md](05-engine-simulation.md)) — both apps are
+served via `langgraph.json` (`langgraph dev`) and driven exclusively through `langgraph_sdk`.
+Trace collection is **LangSmith in v0**, normalized into the system's own `Trace` schema and
+written to a local `TraceStore`; everything downstream of collection reads only that store,
+never a LangSmith type (docs/execution-plan.md, "Tracing backend").
+
 ## Stage-by-stage dataflow (shapes)
 
 ```mermaid
@@ -137,7 +146,7 @@ Full set-relation analysis: [04-ablation-engine.md](04-ablation-engine.md#hidden
 | [02-input-generation.md](02-input-generation.md) | Stage I: dimension/persona grids, single vs multi-turn, distribution-trust argument |
 | [03-trace-harness.md](03-trace-harness.md) | Stage II: batch + persona-simulator harness, sequence diagrams |
 | [04-ablation-engine.md](04-ablation-engine.md) | Stage III: 4-step propose→plan→validate→apply loop, hidden-error bias |
-| [05-engine-simulation.md](05-engine-simulation.md) | Stage IV: simulated Engine (deep-agent + meta consolidation) |
+| [05-engine-simulation.md](05-engine-simulation.md) | Stage IV: simulated Engine (deterministic StateGraph loop + meta consolidation) |
 | [06-scoring.md](06-scoring.md) | Stage V: error matching, 4 scorers, benchmark report |
 
 ## Assignment fit
