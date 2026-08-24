@@ -16,11 +16,18 @@ from pydantic import BaseModel
 
 _ID_FIELDS = ("dataset_id", "board_id", "report_id")
 
+# Fields that record *when* something happened, not *what* it is. Ids version
+# content, not wall-clock time — two runs that produce the same content
+# seconds (or years) apart must still stamp the same id, or "same config +
+# seed reruns identically" becomes untestable outside an injected clock.
+_VOLATILE_FIELDS = ("created_at",)
+
 
 def content_hash(model: BaseModel) -> str:
-    """Deterministic 16-hex-char hash of the model's content, ignoring id fields."""
+    """Deterministic 16-hex-char hash of the model's content, ignoring id
+    fields and volatile (timestamp) fields."""
     payload = model.model_dump(mode="json")
-    for field in _ID_FIELDS:
+    for field in (*_ID_FIELDS, *_VOLATILE_FIELDS):
         payload.pop(field, None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]

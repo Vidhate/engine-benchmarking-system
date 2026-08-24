@@ -1,10 +1,12 @@
 """Gate: content-hash ids and parent lineage helpers behave deterministically."""
 
+from datetime import UTC, datetime
+
 import pytest
 
 from benchmark.schemas import Issueboard, Trace, TraceDataset
 from benchmark.schemas.io import content_hash, derive, load, save, stamp_dataset_id
-from tests.test_schemas_roundtrip import make_issueboard, make_trace
+from tests.test_schemas_roundtrip import make_input_dataset, make_issueboard, make_trace
 
 
 def test_same_content_same_id():
@@ -66,3 +68,14 @@ def test_board_hash_ignores_board_id_only():
         board_id="different", source=a.source, issues=a.issues, occurrences=a.occurrences
     )
     assert content_hash(a) == content_hash(b)
+
+
+def test_created_at_does_not_affect_content_hash():
+    """created_at is volatile provenance metadata (wall-clock at generation time),
+    not content — two datasets differing only in created_at must hash identically
+    so real (non-test-clock) reruns of the same config+seed are reproducible."""
+    ds = make_input_dataset()
+    a = ds.model_copy(update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)})
+    b = ds.model_copy(update={"created_at": datetime(2030, 6, 15, 12, 30, tzinfo=UTC)})
+    assert content_hash(a) == content_hash(b)
+    assert stamp_dataset_id(a).dataset_id == stamp_dataset_id(b).dataset_id
