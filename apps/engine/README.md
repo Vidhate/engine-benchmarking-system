@@ -30,7 +30,19 @@ load ──▶ analyze (once per trace, sequential) ──▶ consolidate ──
   which findings are the same failure mode, and which of them the seed board
   already names. `engine/consolidate.py:assemble_board` then does the merge in
   pure code, so the invariants the benchmark depends on hold regardless of what
-  the model returns.
+  the model returns: one issue per failure mode, each finding claimed by exactly
+  one cluster (first claim wins), one occurrence per `(issue, trace)` pair —
+  that pair being what scoring consumes — and seed issues gaining occurrences
+  rather than duplicates.
+
+  Findings are clustered **in batches of 80**, then merged across batches: a
+  single call over 300 traces' findings would carry tens of thousands of tokens,
+  and the failure that produces arrives at the one point in the run where
+  everything else is already paid for. `fold_clusters` reunites identically
+  named clusters in code; a bounded second-stage LLM pass over *cluster
+  summaries* catches differently-worded duplicates. Every LLM call on this path
+  is retried once and then falls back deterministically, so no batch failure
+  costs more than that batch's clustering — never a finding.
 
 Why not `deepagents`: Phase 2 dropped it after finding its scaffold kept
 filesystem and shell tools registered on the ToolNode even when hidden from the
@@ -46,12 +58,17 @@ exactly the four trace tools.
 | `get_trace(trace_id)` | turns, final responses, span table (no payloads) |
 | `list_spans(trace_id, turn_index?)` | span ids/names/types, error flags, output previews |
 | `read_span(trace_id, span_id)` | one span in full |
-| `search_text(query, trace_id?)` | substring hits + snippets across trace text |
+| `search_text(query, trace_id?)` | matching fields + snippets, with per-field and total match counts |
 
 All read-only, all pure functions over a `TraceIndex` (`engine/traces.py`), all
 unit-tested without a model. Results are fitted to a 6 000-character budget by
 shedding whole items — never by chopping the serialized string, which would hand
 the model an object it cannot parse.
+
+`search_text` reports `location_count` (fields that matched) and `total_matches`
+(occurrences across them) separately, and each entry carries its own
+`matches_here`. One number under the other's name is how an agent concludes
+"mentioned once" about a span that repeats the phrase throughout.
 
 ## Invoking the Engine (what Phase 7 needs)
 
@@ -77,8 +94,13 @@ Four things worth knowing:
 1. **The run output *is* the issueboard.** It comes back as
    `{board_id, source, issues, occurrences}` with `source="engine_predicted"` —
    `Issueboard.model_validate(output)` works with no unwrapping and no
-   translation. `board_id` is a content hash over the board, computed the same
-   way `benchmark.schemas.io.content_hash` does.
+   translation. **Re-stamp `board_id` on ingest.** It is a 16-hex content hash
+   of the same shape as `benchmark.schemas.io.content_hash`, but not the same
+   value: that helper hashes the board *after* parsing into the benchmark's
+   `Issueboard`, whose `Issue` carries an `injection_mode` field this app does
+   not, so the canonical JSON differs (verified: `a07711de78578c30` here vs
+   `d1f32c72bb4cae7d` there, on one identical board). Treat the Engine's
+   `board_id` as the Engine's own label, not as a benchmark dataset id.
 2. **`trace_file` is a path the server can read.** The corpus is not sent
    through the API and is never put into graph state — a 300-trace corpus in a
    checkpointed state would be re-serialized on every superstep.
@@ -87,10 +109,18 @@ Four things worth knowing:
    its own default to 10 000, but pass it explicitly on the run for anything
    large.
 4. **Partial failure is reported, not hidden.** A trace whose analysis throws is
-   logged to stderr and skipped; the run continues. If *every* trace fails —
-   what a bad key or an unknown model id looks like — the consolidate node
-   raises rather than returning an empty board, because "no issues found" and
-   "the Engine never ran" must not look alike downstream.
+   logged to stderr and skipped, and the failure count is printed on every run
+   that has one. Past `MAX_TRACE_FAILURE_RATE` (20% of traces) the consolidate
+   node raises instead of emitting a board: at that point "the Engine found
+   little" is a far less likely story than "the Engine barely ran", and the two
+   must not reach scoring wearing the same shape. Below the threshold the run
+   completes with a smaller board — the failure count is on stderr, not in the
+   output, so a caller that needs it should capture the log.
+5. **Consolidation degrades, it does not abort.** The clustering call is
+   retried once and then falls back to deterministic grouping, because by the
+   time consolidation runs every per-trace pass has already been paid for — and
+   one arm of a model comparison losing consolidation while the other completes
+   would read as a quality difference rather than an outage.
 
 ## Model selection — the comparison axis
 
@@ -137,10 +167,15 @@ scripts/smoke.sh                    # all three gates, ~10 min, needs a real key
   the vocabulary is names + descriptions only with `other` present; a board from
   the real consolidation code validates as `Issueboard`.
 - **Gate 2** (`scripts/gate2_live_smoke.py`) — a live run over the six fixture
-  traces; asserts schema validity, seed-board survival, no duplicate ids, and
-  reports which planted errors were found.
+  traces; asserts schema validity, seed-board survival, no duplicate ids, **no
+  issue reported against a clean trace**, and — when a model is named — that the
+  run record the server persisted names that model. Reports which planted errors
+  were found (imperfect recall is acceptable; crashes are not).
 - **Gate 3** (`scripts/gate3_model_swap.py`) — the same run twice, differing only
-  in `configurable["model"]`.
+  in `configurable["model"]`. Each arm's model is confirmed by server-side
+  readback (`client.runs.list(thread_id)` → the persisted `config.configurable`),
+  not by trusting the request that was sent; and two byte-identical boards fail
+  the gate, since that is what a silently-ignored model config looks like.
 
 Scripts may import `benchmark.schemas` — they stand in for the benchmark side of
 the boundary, and validating output against the real `Issueboard` is the point.

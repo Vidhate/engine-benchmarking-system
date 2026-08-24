@@ -49,7 +49,7 @@ def test_every_tool_reaches_its_index_operation(index):
     span = tools["read_span"].invoke({"trace_id": "trace-clean-pricing", "span_id": "s-p-2"})
     assert json.loads(span)["span_type"] == "retrieval"
     hits = tools["search_text"].invoke({"query": "TicketServiceError"})
-    assert json.loads(hits)["hit_count"] >= 1
+    assert json.loads(hits)["location_count"] >= 1
 
 
 def test_tools_are_read_only(index, traces_file):

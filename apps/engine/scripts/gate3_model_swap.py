@@ -34,7 +34,13 @@ def main() -> int:
     for model in arms:
         outcome = smoke(model)
         board = outcome["board"]
+        # Verified server-side inside smoke(): the persisted run record names
+        # the requested model. Repeated here so the failure message names the arm.
+        assert set(outcome["recorded_models"]) == {model}, (
+            f"arm {model!r} was not honored; server recorded {outcome['recorded_models']}"
+        )
         results[model] = {
+            "recorded_models": outcome["recorded_models"],
             "board_id": board.board_id,
             "issue_count": len(board.issues),
             "occurrence_count": len(board.occurrences),
@@ -53,6 +59,19 @@ def main() -> int:
     banner("GATE 3 — model swap via run config only")
     print(json.dumps(results, indent=2))
     RESULTS.write_text(json.dumps(results, indent=2) + "\n")
+
+    # Belt and braces: two different models producing a byte-identical board is
+    # possible but unlikely, and it is precisely what a silently-ignored model
+    # config looks like. The readback above is the real check; this catches the
+    # case where the readback itself is reading something stale.
+    board_ids = {row["board_id"] for row in results.values()}
+    if len(board_ids) == 1:
+        raise SystemExit(
+            f"both arms produced the identical board {board_ids.pop()}. Either the "
+            f"model config was not honored, or the two models genuinely agreed "
+            f"issue-for-issue and occurrence-for-occurrence — verify before "
+            f"reporting any comparison from this run."
+        )
 
     print("\nside by side")
     print(f"{'model':<16} {'issues':>7} {'occurrences':>12} {'planted found':>14}")

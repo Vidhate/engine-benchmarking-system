@@ -109,6 +109,92 @@ def complete_plan(plan: ConsolidationPlan, findings: list[RawFinding]) -> Consol
     return ConsolidationPlan(clusters=[*plan.clusters, *remapped])
 
 
+def offset_plan(plan: ConsolidationPlan, offset: int, chunk_size: int) -> ConsolidationPlan:
+    """Rebase a chunk-local plan onto the global findings list.
+
+    Indices outside the chunk are dropped rather than shifted: a model that
+    invents an index has not told us anything about a finding it never saw.
+    """
+    return ConsolidationPlan(
+        clusters=[
+            cluster.model_copy(
+                update={
+                    "finding_indices": [
+                        index + offset
+                        for index in cluster.finding_indices
+                        if isinstance(index, int) and 0 <= index < chunk_size
+                    ]
+                }
+            )
+            for cluster in plan.clusters
+        ]
+    )
+
+
+def fold_clusters(plan: ConsolidationPlan) -> ConsolidationPlan:
+    """Merge clusters that name the same failure mode, in code.
+
+    Chunked consolidation asks the model about disjoint slices of the findings,
+    so the same failure mode can come back once per chunk. Identical
+    (category, normalized title) pairs are the same issue by construction and
+    are folded here; differently-worded duplicates are the LLM merge pass's job.
+    """
+    groups: dict[tuple[str, str], Cluster] = {}
+    order: list[tuple[str, str]] = []
+    for cluster in plan.clusters:
+        key = (cluster.category_id, normalize_title(cluster.title))
+        head = groups.get(key)
+        if head is None:
+            groups[key] = cluster.model_copy(deep=True)
+            order.append(key)
+            continue
+        head.finding_indices = [*head.finding_indices, *cluster.finding_indices]
+        head.severity = _max_severity([head.severity, cluster.severity])  # type: ignore[assignment]
+        head.matches_seed_error_id = head.matches_seed_error_id or cluster.matches_seed_error_id
+    return ConsolidationPlan(clusters=[groups[key] for key in order])
+
+
+def apply_merge(merge: ConsolidationPlan, source: ConsolidationPlan) -> ConsolidationPlan:
+    """Apply a second-stage plan whose `finding_indices` are *cluster* indices.
+
+    The merge pass reuses `ConsolidationPlan` over cluster summaries, so one
+    schema and one prompt shape serve both stages. Clusters the merge pass never
+    mentions survive untouched — a forgotten cluster must not become a lost issue.
+    """
+    claimed: set[int] = set()
+    merged: list[Cluster] = []
+    for group in merge.clusters:
+        members: list[Cluster] = []
+        for index in dict.fromkeys(group.finding_indices):
+            if not isinstance(index, int) or not 0 <= index < len(source.clusters):
+                continue
+            if index in claimed:
+                continue
+            claimed.add(index)
+            members.append(source.clusters[index])
+        if not members:
+            continue
+        head = members[0]
+        merged.append(
+            Cluster(
+                title=group.title.strip() or head.title,
+                description=group.description.strip() or head.description,
+                category_id=group.category_id or head.category_id,
+                severity=_max_severity([group.severity, *(m.severity for m in members)]),  # type: ignore[arg-type]
+                finding_indices=[i for m in members for i in m.finding_indices],
+                matches_seed_error_id=group.matches_seed_error_id or _first_seed_id(members),
+            )
+        )
+    merged.extend(
+        cluster for index, cluster in enumerate(source.clusters) if index not in claimed
+    )
+    return ConsolidationPlan(clusters=merged)
+
+
+def _first_seed_id(clusters: list[Cluster]) -> str | None:
+    return next((c.matches_seed_error_id for c in clusters if c.matches_seed_error_id), None)
+
+
 def assemble_board(
     plan: ConsolidationPlan,
     findings: list[RawFinding],
@@ -128,13 +214,24 @@ def assemble_board(
 
     issues: list[Issue] = [issue.model_copy(deep=True) for issue in seed.issues]
     occurrences: list[IssueOccurrence] = [o.model_copy(deep=True) for o in seed.occurrences]
-    seen_occurrences = {(o.error_id, o.trace_id, o.span_id) for o in occurrences}
+    # One occurrence per (issue, trace). That pair IS what scoring consumes, so
+    # a second sighting of the same failure mode in the same trace enriches the
+    # existing occurrence's localization rather than adding a row — otherwise a
+    # seed occurrence (no span_id) and a fresh finding (span_id set) would both
+    # land and double-count the trace.
+    by_pair: dict[tuple[str, str], IssueOccurrence] = {
+        (o.error_id, o.trace_id): o for o in occurrences
+    }
     used_ids = set(seed_ids)
 
     plan = complete_plan(plan, findings)
+    # "Every finding index appears in exactly one cluster" — first claim wins,
+    # so a model that lists the same finding under two clusters cannot inflate
+    # the board with a duplicate issue.
+    claimed: set[int] = set()
 
     for cluster in plan.clusters:
-        members = _members(cluster, findings)
+        members = _members(cluster, findings, claimed)
         if not members:
             continue
         if cluster.matches_seed_error_id in seed_ids:
@@ -156,32 +253,53 @@ def assemble_board(
         for finding in members:
             if not finding.trace_id:
                 continue
-            key = (error_id, finding.trace_id, finding.span_id)
-            if key in seen_occurrences:
+            pair = (error_id, finding.trace_id)
+            existing = by_pair.get(pair)
+            if existing is not None:
+                _enrich(existing, finding)
                 continue
-            seen_occurrences.add(key)
-            occurrences.append(
-                IssueOccurrence(
-                    error_id=error_id,
-                    trace_id=finding.trace_id,
-                    turn_index=finding.turn_index,
-                    span_id=finding.span_id,
-                    evidence=finding.evidence or finding.description,
-                )
+            occurrence = IssueOccurrence(
+                error_id=error_id,
+                trace_id=finding.trace_id,
+                turn_index=finding.turn_index,
+                span_id=finding.span_id,
+                evidence=finding.evidence or finding.description,
             )
+            by_pair[pair] = occurrence
+            occurrences.append(occurrence)
 
     board = Issueboard(source="engine_predicted", issues=issues, occurrences=occurrences)
     return board.model_copy(update={"board_id": board_id(board)})
 
 
-def _members(cluster: Cluster, findings: list[RawFinding]) -> list[RawFinding]:
-    """Resolve a cluster's indices: in range, de-duplicated, order preserved."""
-    seen: set[int] = set()
+def _enrich(occurrence: IssueOccurrence, finding: RawFinding) -> None:
+    """Fill in localization the existing occurrence is missing. Never overwrites:
+    the first sighting (a seed occurrence, or the first cluster to claim the
+    trace) stays authoritative."""
+    if occurrence.turn_index is None and finding.turn_index is not None:
+        occurrence.turn_index = finding.turn_index
+    if occurrence.span_id is None and finding.span_id:
+        occurrence.span_id = finding.span_id
+    if not occurrence.evidence:
+        occurrence.evidence = finding.evidence or finding.description
+
+
+def _members(
+    cluster: Cluster, findings: list[RawFinding], claimed: set[int] | None = None
+) -> list[RawFinding]:
+    """Resolve a cluster's indices: in range, unclaimed, de-duplicated, in order.
+
+    `claimed` is shared across the clusters of one plan, which is how the
+    "exactly one cluster per finding" rule is enforced.
+    """
+    claimed = claimed if claimed is not None else set()
     members = []
     for index in cluster.finding_indices:
-        if not isinstance(index, int) or index < 0 or index >= len(findings) or index in seen:
+        if not isinstance(index, int) or index < 0 or index >= len(findings):
             continue
-        seen.add(index)
+        if index in claimed:
+            continue
+        claimed.add(index)
         members.append(findings[index])
     return members
 
@@ -196,8 +314,15 @@ def _unique_id(candidate: str, taken: set[str]) -> str:
 
 
 def board_id(board: Issueboard) -> str:
-    """Content hash, matching the benchmark's own id convention (16 hex chars
-    over the board's content with the id field excluded)."""
+    """A 16-hex-char content hash of the board, id field excluded.
+
+    Same *shape* as the benchmark's `schemas.io.content_hash`, but NOT the same
+    value: that function hashes the board after it has been parsed into
+    `benchmark.schemas.issues.Issueboard`, whose `Issue` declares fields this
+    app does not (`injection_mode`, serialized as null), so the canonical JSON
+    differs. This id identifies the board the Engine produced; the benchmark
+    should re-stamp on ingest rather than assume the two agree.
+    """
     payload = board.model_dump(mode="json")
     payload.pop("board_id", None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))

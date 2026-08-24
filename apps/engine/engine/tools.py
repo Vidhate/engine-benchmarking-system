@@ -60,9 +60,14 @@ def build_trace_tools(index: TraceIndex) -> list[BaseTool]:
     @tool
     def search_text(query: str, trace_id: str | None = None) -> str:
         """Case-insensitive substring search over trace text (turn messages and
-        span inputs/outputs/attributes). Returns locations plus snippets. Use it
-        to check whether a claim in an answer is actually supported anywhere in
-        the trace.
+        span inputs/outputs/attributes). Use it to check whether a claim in an
+        answer is actually supported anywhere in the trace.
+
+        Returns one entry per matching field, each with a snippet and
+        `matches_here` (how many times the query occurs in THAT field), plus
+        `location_count` (fields that matched) and `total_matches` (occurrences
+        across all of them). `location_count` of 1 does not mean the text
+        appears only once.
 
         Args:
             query: substring to search for.

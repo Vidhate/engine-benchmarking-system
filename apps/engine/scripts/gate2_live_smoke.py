@@ -35,8 +35,31 @@ ANSWER_KEY = FIXTURES / "planted_errors.json"
 LAST_RUN = Path(__file__).resolve().parent / ".last_run.json"
 
 
+def recorded_models(client, thread_id: str) -> list[str]:
+    """Read back, from the server, the model each run on this thread was given.
+
+    The point of the model-swap gate is that the swap actually happened. Trusting
+    the request we just sent proves nothing — the config could be dropped on the
+    way in (LangGraph silently declines to inject a config whose node annotation
+    it does not recognise, which is exactly the bug this project already hit
+    once). So the assertion reads the run record the server persisted.
+    """
+    models = []
+    for run in client.runs.list(thread_id):
+        record = run if isinstance(run, dict) else getattr(run, "__dict__", {})
+        config = (record.get("kwargs") or {}).get("config") or record.get("config") or {}
+        configurable = config.get("configurable") or {}
+        if "model" in configurable:
+            models.append(configurable["model"])
+    return models
+
+
 def run_engine(model: str | None = None) -> dict:
-    """One Engine run through the LangGraph Server API. Returns the raw output."""
+    """One Engine run through the LangGraph Server API.
+
+    Returns {output, thread_id, recorded_models} — the last so callers can
+    verify server-side which model the run actually received.
+    """
     from langgraph_sdk import get_sync_client  # noqa: PLC0415
 
     contract = load_contract()
@@ -66,7 +89,13 @@ def run_engine(model: str | None = None) -> dict:
     if isinstance(result, dict) and result.get("__error__"):
         raise SystemExit(f"run failed: {result['__error__']}")
     print(f"  run finished in {time.time() - started:.1f}s")
-    return result
+
+    try:
+        seen = recorded_models(client, thread["thread_id"])
+    except Exception as exc:  # readback is best-effort; the run itself stands
+        print(f"  (could not read the run config back: {type(exc).__name__}: {exc})")
+        seen = []
+    return {"output": result, "thread_id": thread["thread_id"], "recorded_models": seen}
 
 
 def report_recall(board, model: str) -> dict:
@@ -116,7 +145,8 @@ def report_recall(board, model: str) -> dict:
 def smoke(model: str | None = None) -> dict:
     label = model or "(default)"
     banner(f"GATE 2 — live Engine run over the fixture traces  [model={label}]")
-    payload = run_engine(model)
+    run = run_engine(model)
+    payload = run["output"]
 
     assert "issues" in payload and "occurrences" in payload, f"unexpected output: {sorted(payload)}"
     assert "injection_mode" not in json.dumps(payload), "Engine output names an ablation field"
@@ -133,9 +163,30 @@ def smoke(model: str | None = None) -> dict:
     banner("planted-error recall")
     recall = report_recall(board, model or "default")
 
-    LAST_RUN.write_text(json.dumps({"model": model, "board": payload, "recall": recall}, indent=2))
+    # A hand-crafted clean trace has nothing to find. Anything reported against
+    # one is a false positive, and false positives are the half of the scoring
+    # picture that recall alone hides.
+    assert not recall["clean_traces_flagged"], (
+        f"issues reported against traces with nothing planted in them: "
+        f"{recall['clean_traces_flagged']}"
+    )
+
+    if model:
+        assert run["recorded_models"], "server kept no record of the run's model"
+        assert set(run["recorded_models"]) == {model}, (
+            f"requested model {model!r}, server recorded {run['recorded_models']}"
+        )
+        print(f"  server-side readback confirms model={model!r}")
+
+    LAST_RUN.write_text(
+        json.dumps(
+            {"model": model, "recorded_models": run["recorded_models"],
+             "board": payload, "recall": recall},
+            indent=2,
+        )
+    )
     print(f"\nOK — schema-valid Issueboard(source='engine_predicted'); board written to {LAST_RUN}")
-    return {"board": board, "recall": recall}
+    return {"board": board, "recall": recall, "recorded_models": run["recorded_models"]}
 
 
 def main() -> int:

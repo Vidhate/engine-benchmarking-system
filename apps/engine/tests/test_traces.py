@@ -99,24 +99,55 @@ def test_read_span_on_an_unknown_trace_reports_the_trace(index):
 
 def test_search_text_finds_the_contradiction_across_the_corpus(index):
     hits = json.loads(index.search_text("14 days"))
-    assert hits["hit_count"] >= 1
-    assert {h["trace_id"] for h in hits["hits"]} == {"trace-planted-refund"}
-    assert any(h["location"] == "span.outputs" for h in hits["hits"])
+    assert hits["location_count"] >= 1
+    assert {h["trace_id"] for h in hits["locations"]} == {"trace-planted-refund"}
+    assert any(h["location"] == "span.outputs" for h in hits["locations"])
 
 
 def test_search_text_scopes_to_one_trace(index):
     everywhere = json.loads(index.search_text("Nimbus"))
     scoped = json.loads(index.search_text("Nimbus", trace_id="trace-clean-pricing"))
-    assert everywhere["hit_count"] > scoped["hit_count"]
-    assert {h["trace_id"] for h in scoped["hits"]} == {"trace-clean-pricing"}
+    assert everywhere["location_count"] > scoped["location_count"]
+    assert {h["trace_id"] for h in scoped["locations"]} == {"trace-clean-pricing"}
 
 
 def test_search_text_is_case_insensitive(index):
-    assert json.loads(index.search_text("TICKETSERVICEERROR"))["hit_count"] >= 1
+    assert json.loads(index.search_text("TICKETSERVICEERROR"))["location_count"] >= 1
 
 
 def test_search_text_reports_a_miss_as_zero_hits(index):
-    assert json.loads(index.search_text("quantum entanglement"))["hit_count"] == 0
+    miss = json.loads(index.search_text("quantum entanglement"))
+    assert miss["location_count"] == 0
+    assert miss["total_matches"] == 0
+
+
+def test_search_text_separates_matching_fields_from_total_occurrences(index):
+    """`location_count` counts FIELDS that matched; a field mentioning the query
+    ten times is still one location. Conflating the two is how an agent decides
+    "only one mention" about a span that repeats it throughout."""
+    result = json.loads(index.search_text("Nimbus"))
+    assert result["total_matches"] > result["location_count"]
+    assert all(hit["matches_here"] >= 1 for hit in result["locations"])
+
+
+def test_the_counts_describe_the_corpus_not_the_returned_page(index):
+    """`locations` is capped by `limit`; both counts still report the truth
+    about the whole search, which is the point of reporting them separately."""
+    capped = json.loads(index.search_text("Nimbus", limit=2))
+    assert len(capped["locations"]) == 2
+    assert capped["location_count"] > 2
+    assert capped["total_matches"] >= capped["location_count"]
+
+    # With nothing dropped, the totals reconcile exactly.
+    whole = json.loads(index.search_text("Nimbus", trace_id="trace-clean-pricing"))
+    assert whole["location_count"] == len(whole["locations"])
+    assert whole["total_matches"] == sum(h["matches_here"] for h in whole["locations"])
+
+
+def test_matches_here_counts_every_occurrence_in_one_field(index):
+    """The refund answer's own span output repeats "refund" more than once."""
+    result = json.loads(index.search_text("refund", trace_id="trace-planted-refund"))
+    assert max(hit["matches_here"] for hit in result["locations"]) > 1
 
 
 def test_search_text_rejects_an_empty_query(index):
@@ -129,7 +160,7 @@ def test_search_text_on_an_unknown_trace_reports_it(index):
 
 def test_search_snippets_are_bounded(index):
     hits = json.loads(index.search_text("Nimbus"))
-    assert all(len(h["snippet"]) <= SNIPPET_CHARS for h in hits["hits"])
+    assert all(len(h["snippet"]) <= SNIPPET_CHARS for h in hits["locations"])
 
 
 def test_truncate_marks_what_it_dropped():
@@ -157,14 +188,14 @@ def test_oversized_tool_results_stay_valid_json_within_budget(index, multiplier)
 def test_item_shedding_reports_how_much_it_dropped(index):
     big = TraceIndex(index.traces * 40)
     payload = json.loads(big.search_text("Nimbus", limit=10_000))
-    assert payload["hit_count"] > len(payload["hits"])
-    assert "of" in payload["truncated"] and "hits" in payload["truncated"]
+    assert payload["location_count"] > len(payload["locations"])
+    assert "of" in payload["truncated"] and "locations" in payload["truncated"]
 
 
 def test_a_single_oversized_item_degrades_to_a_valid_envelope():
     from engine.traces import fit_json
 
-    payload = {"hits": [{"snippet": "x" * 20_000}]}
-    result = json.loads(fit_json(payload, "hits"))
+    payload = {"locations": [{"snippet": "x" * 20_000}]}
+    result = json.loads(fit_json(payload, "locations"))
     assert result["truncated"] is True
     assert isinstance(result["content"], str)

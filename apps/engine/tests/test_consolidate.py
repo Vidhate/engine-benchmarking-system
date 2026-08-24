@@ -10,11 +10,14 @@ from __future__ import annotations
 import pytest
 
 from engine.consolidate import (
+    apply_merge,
     assemble_board,
     board_id,
     complete_plan,
     fallback_plan,
+    fold_clusters,
     normalize_title,
+    offset_plan,
     slug,
     valid_category,
 )
@@ -352,3 +355,215 @@ def test_slug_and_normalize_title_helpers():
     assert slug("Tool error: reported as SUCCESS!") == "tool-error-reported-as-success"
     assert slug("!!!") == "issue"
     assert normalize_title("Tool  error!!  hidden") == normalize_title("tool error hidden")
+
+
+# -- review finding 4: each finding index belongs to exactly one cluster ---
+
+
+def test_a_double_claimed_index_yields_one_issue_not_two(categories):
+    """A model that files the same finding under two clusters must not be able
+    to inflate the board with a duplicate issue."""
+    plan = ConsolidationPlan(
+        clusters=[
+            Cluster(title="First", description="d", category_id="tool_misuse",
+                    severity="high", finding_indices=[0]),
+            Cluster(title="Second", description="d", category_id="formatting",
+                    severity="low", finding_indices=[0]),
+        ]
+    )
+    board = assemble_board(plan, [finding("t1")], None, categories)
+    assert [i.title for i in board.issues] == ["First"]
+    assert len(board.occurrences) == 1
+
+
+def test_first_claim_wins_and_later_clusters_keep_their_own_findings(categories):
+    findings = [finding("t1"), finding("t2")]
+    plan = ConsolidationPlan(
+        clusters=[
+            Cluster(title="First", description="d", category_id="tool_misuse",
+                    severity="high", finding_indices=[0]),
+            Cluster(title="Second", description="d", category_id="formatting",
+                    severity="low", finding_indices=[0, 1]),
+        ]
+    )
+    board = assemble_board(plan, findings, None, categories)
+    assert [i.title for i in board.issues] == ["First", "Second"]
+    assert {(o.error_id, o.trace_id) for o in board.occurrences} == {
+        ("ep-first", "t1"),
+        ("ep-second", "t2"),
+    }
+
+
+# -- review finding 5: one occurrence per (issue, trace) ------------------
+
+
+def test_a_seed_occurrence_and_a_new_finding_on_one_trace_do_not_duplicate(categories):
+    """Reproduces the reported case: the seed occurrence has no span_id, the
+    finding has one, and both name the same issue and the same trace."""
+    seed = SeedIssueboard(
+        issues=[Issue(error_id="s1", title="t", description="d",
+                      category_id="tool_misuse", severity="high")],
+        occurrences=[IssueOccurrence(error_id="s1", trace_id="t1")],
+    )
+    plan = ConsolidationPlan(
+        clusters=[Cluster(title="t", description="d", category_id="tool_misuse",
+                          severity="high", finding_indices=[0],
+                          matches_seed_error_id="s1")]
+    )
+    board = assemble_board(plan, [finding("t1", span_id="s-t-2", turn_index=0)], seed, categories)
+
+    assert len(board.occurrences) == 1
+    only = board.occurrences[0]
+    assert (only.error_id, only.trace_id) == ("s1", "t1")
+    # The bare seed occurrence gains the localization the finding supplied.
+    assert only.span_id == "s-t-2"
+    assert only.turn_index == 0
+    assert only.evidence
+
+
+def test_enrichment_never_overwrites_what_the_first_sighting_recorded(categories):
+    seed = SeedIssueboard(
+        issues=[Issue(error_id="s1", title="t", description="d",
+                      category_id="tool_misuse", severity="high")],
+        occurrences=[
+            IssueOccurrence(error_id="s1", trace_id="t1", span_id="original",
+                            turn_index=3, evidence="original evidence")
+        ],
+    )
+    plan = ConsolidationPlan(
+        clusters=[Cluster(title="t", description="d", category_id="tool_misuse",
+                          severity="high", finding_indices=[0],
+                          matches_seed_error_id="s1")]
+    )
+    board = assemble_board(plan, [finding("t1", span_id="new", turn_index=9)], seed, categories)
+    only = board.occurrences[0]
+    assert (only.span_id, only.turn_index, only.evidence) == ("original", 3, "original evidence")
+
+
+def test_two_findings_on_one_trace_in_one_cluster_collapse_to_one_occurrence(categories):
+    findings = [finding("t1", span_id="s-1"), finding("t1", span_id="s-2")]
+    plan = ConsolidationPlan(
+        clusters=[Cluster(title="t", description="d", category_id="tool_misuse",
+                          severity="high", finding_indices=[0, 1])]
+    )
+    board = assemble_board(plan, findings, None, categories)
+    assert len(board.occurrences) == 1
+    assert board.occurrences[0].span_id == "s-1"
+
+
+def test_distinct_issues_on_one_trace_each_keep_an_occurrence(categories):
+    findings = [finding("t1"), finding("t1", title="Other")]
+    plan = ConsolidationPlan(
+        clusters=[
+            Cluster(title="A", description="d", category_id="tool_misuse",
+                    severity="high", finding_indices=[0]),
+            Cluster(title="B", description="d", category_id="formatting",
+                    severity="low", finding_indices=[1]),
+        ]
+    )
+    board = assemble_board(plan, findings, None, categories)
+    assert len(board.occurrences) == 2
+
+
+# -- chunked-consolidation primitives (review finding 2) ------------------
+
+
+def test_offset_plan_rebases_indices_onto_the_global_list():
+    plan = ConsolidationPlan(
+        clusters=[Cluster(title="t", description="d", category_id="other",
+                          severity="low", finding_indices=[0, 2])]
+    )
+    assert offset_plan(plan, 80, chunk_size=3).clusters[0].finding_indices == [80, 82]
+
+
+def test_offset_plan_drops_indices_the_batch_never_contained():
+    plan = ConsolidationPlan(
+        clusters=[Cluster(title="t", description="d", category_id="other",
+                          severity="low", finding_indices=[0, 7, -1])]
+    )
+    assert offset_plan(plan, 10, chunk_size=3).clusters[0].finding_indices == [10]
+
+
+def test_fold_clusters_merges_same_title_and_category_across_batches():
+    plan = ConsolidationPlan(
+        clusters=[
+            Cluster(title="Tool error hidden", description="d", category_id="tool_misuse",
+                    severity="low", finding_indices=[0]),
+            Cluster(title="tool  error   hidden!", description="d", category_id="tool_misuse",
+                    severity="high", finding_indices=[5], matches_seed_error_id="s1"),
+            Cluster(title="Tool error hidden", description="d", category_id="formatting",
+                    severity="low", finding_indices=[9]),
+        ]
+    )
+    folded = fold_clusters(plan)
+    assert len(folded.clusters) == 2
+    head = folded.clusters[0]
+    assert head.finding_indices == [0, 5]
+    assert head.severity == "high"
+    assert head.matches_seed_error_id == "s1"
+
+
+def test_fold_clusters_leaves_distinct_modes_alone():
+    plan = ConsolidationPlan(
+        clusters=[
+            Cluster(title="A", description="d", category_id="tool_misuse",
+                    severity="low", finding_indices=[0]),
+            Cluster(title="B", description="d", category_id="tool_misuse",
+                    severity="low", finding_indices=[1]),
+        ]
+    )
+    assert len(fold_clusters(plan).clusters) == 2
+
+
+def test_apply_merge_unions_the_findings_of_grouped_clusters():
+    source = ConsolidationPlan(
+        clusters=[
+            Cluster(title="Tool error hidden", description="d", category_id="tool_misuse",
+                    severity="low", finding_indices=[0, 1]),
+            Cluster(title="Tool failure masked", description="d", category_id="tool_misuse",
+                    severity="high", finding_indices=[2], matches_seed_error_id="s1"),
+        ]
+    )
+    merge = ConsolidationPlan(
+        clusters=[Cluster(title="Tool failure hidden", description="canonical",
+                          category_id="tool_misuse", severity="medium", finding_indices=[0, 1])]
+    )
+    merged = apply_merge(merge, source)
+    assert len(merged.clusters) == 1
+    assert merged.clusters[0].finding_indices == [0, 1, 2]
+    assert merged.clusters[0].title == "Tool failure hidden"
+    assert merged.clusters[0].severity == "high"
+    assert merged.clusters[0].matches_seed_error_id == "s1"
+
+
+def test_apply_merge_keeps_clusters_the_merge_pass_forgot():
+    """A cluster the merge pass never mentions must not become a lost issue."""
+    source = ConsolidationPlan(
+        clusters=[
+            Cluster(title="A", description="d", category_id="other",
+                    severity="low", finding_indices=[0]),
+            Cluster(title="B", description="d", category_id="other",
+                    severity="low", finding_indices=[1]),
+        ]
+    )
+    merge = ConsolidationPlan(
+        clusters=[Cluster(title="A", description="d", category_id="other",
+                          severity="low", finding_indices=[0])]
+    )
+    assert sorted(c.title for c in apply_merge(merge, source).clusters) == ["A", "B"]
+
+
+def test_apply_merge_ignores_out_of_range_and_double_claimed_cluster_indices():
+    source = ConsolidationPlan(
+        clusters=[Cluster(title="A", description="d", category_id="other",
+                          severity="low", finding_indices=[0])]
+    )
+    merge = ConsolidationPlan(
+        clusters=[
+            Cluster(title="G1", description="d", category_id="other",
+                    severity="low", finding_indices=[0, 99]),
+            Cluster(title="G2", description="d", category_id="other",
+                    severity="low", finding_indices=[0]),
+        ]
+    )
+    assert [c.title for c in apply_merge(merge, source).clusters] == ["G1"]

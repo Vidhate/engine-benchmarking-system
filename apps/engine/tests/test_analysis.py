@@ -202,3 +202,258 @@ def test_the_fake_model_refuses_to_invent_structured_output(index, categories):
     with pytest.raises(AssertionError, match="no scripted structured output"):
         analyze_trace(model(responses=[AIMessage(content="ok")]), index,
                       "trace-clean-pricing", [], categories)
+
+
+# -- review finding 1: consolidation must survive a raised error ----------
+
+
+class ExplodingStructured:
+    """A model whose structured-output call raises, `times` times, then (if a
+    scripted plan is left) succeeds."""
+
+    def __init__(self, times: int, plans=None, error=None):
+        self.remaining = times
+        self.plans = list(plans or [])
+        self.error = error or RuntimeError("429 rate limited")
+        self.attempts = 0
+
+    def invoke(self, messages, **kwargs):
+        self.attempts += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise self.error
+        if not self.plans:
+            raise AssertionError("no scripted plan left")
+        return self.plans.pop(0)
+
+
+class ExplodingModel(FakeChatModel):
+    """FakeChatModel whose `with_structured_output` returns a scripted exploder."""
+
+    exploder: object = None
+
+    def with_structured_output(self, schema, **kwargs):
+        return self.exploder
+
+
+def exploding(times: int, plans=None, error=None):
+    model = ExplodingModel(responses=[], structured=[])
+    model.exploder = ExplodingStructured(times, plans, error)
+    return model
+
+
+def test_a_raising_consolidation_still_yields_a_valid_board(categories, capsys):
+    """The whole run has already been paid for by the time consolidation runs;
+    a 429 there must not discard it."""
+    findings = [
+        TICKET_FINDING.model_copy(update={"trace_id": "t1"}),
+        TICKET_FINDING.model_copy(update={"trace_id": "t2"}),
+    ]
+    model = exploding(times=99)  # never succeeds
+    board = consolidate(model, findings, None, categories)
+
+    assert board.source == "engine_predicted"
+    assert len(board.issues) == 1  # deterministic fallback grouped both findings
+    assert {o.trace_id for o in board.occurrences} == {"t1", "t2"}
+    assert "falling back to deterministic clustering" in capsys.readouterr().err
+
+
+def test_consolidation_retries_once_before_falling_back(categories, capsys):
+    findings = [TICKET_FINDING.model_copy(update={"trace_id": "t1"})]
+    plan = ConsolidationPlan(
+        clusters=[Cluster(title="Recovered on retry", description="d",
+                          category_id="tool_misuse", severity="high", finding_indices=[0])]
+    )
+    model = exploding(times=1, plans=[plan])
+    board = consolidate(model, findings, None, categories)
+
+    assert model.exploder.attempts == 2
+    assert [i.title for i in board.issues] == ["Recovered on retry"]
+    err = capsys.readouterr().err
+    assert "attempt 1 failed" in err
+    assert "falling back" not in err
+
+
+def test_a_persistently_failing_consolidation_does_not_lose_any_finding(categories):
+    findings = [
+        TICKET_FINDING.model_copy(update={"trace_id": f"t{i}", "title": f"Mode {i}"})
+        for i in range(5)
+    ]
+    board = consolidate(exploding(times=99), findings, None, categories)
+    assert len(board.issues) == 5
+    assert {o.trace_id for o in board.occurrences} == {f"t{i}" for i in range(5)}
+
+
+def test_the_seed_board_survives_a_failed_consolidation(seed_board_payload, categories):
+    findings = [TICKET_FINDING.model_copy(update={"trace_id": "t1"})]
+    seed = SeedIssueboard.model_validate(seed_board_payload)
+    board = consolidate(exploding(times=99), findings, seed, categories)
+    assert [i.error_id for i in board.issues][:2] == [
+        "seed-tool-failure-hidden",
+        "seed-answers-without-retrieval",
+    ]
+
+
+def test_malformed_structured_output_is_treated_as_a_failure_and_retried(categories, capsys):
+    """A dict that is not a plan, or a plan with no clusters, is as useless as
+    an exception and takes the same path."""
+    findings = [TICKET_FINDING.model_copy(update={"trace_id": "t1"})]
+    model = ExplodingModel(responses=[], structured=[])
+    model.exploder = ExplodingStructured(0, plans=[ConsolidationPlan(), ConsolidationPlan()])
+    board = consolidate(model, findings, None, categories)
+    assert model.exploder.attempts == 2
+    assert len(board.issues) == 1
+    assert "falling back to deterministic clustering" in capsys.readouterr().err
+
+
+# -- review finding 2: the large-N chunked path ---------------------------
+
+
+def big_findings(n: int, modes: int = 4) -> list[RawFinding]:
+    return [
+        TICKET_FINDING.model_copy(
+            update={
+                "trace_id": f"trace-{i:04d}",
+                "title": f"Failure mode {i % modes}",
+                "category_id": "tool_misuse",
+            }
+        )
+        for i in range(n)
+    ]
+
+
+def batch_sizes(model) -> list[int]:
+    """How many findings each consolidation prompt actually carried."""
+    sizes = []
+    for call in model.calls:
+        task = str(call[-1].content)
+        if "Raw findings from this run" in task:
+            sizes.append(task.count("] trace="))
+    return sizes
+
+
+def test_a_300_trace_run_consolidates_in_bounded_batches(categories):
+    findings = big_findings(300)
+    plans = []
+    # One plan per batch: each batch clusters its own findings by mode.
+    for start in range(0, 300, 80):
+        chunk = findings[start : start + 80]
+        plans.append(
+            ConsolidationPlan(
+                clusters=[
+                    Cluster(
+                        title=f"Failure mode {mode}",
+                        description="d",
+                        category_id="tool_misuse",
+                        severity="high",
+                        finding_indices=[i for i, f in enumerate(chunk)
+                                         if f.title == f"Failure mode {mode}"],
+                    )
+                    for mode in range(4)
+                ]
+            )
+        )
+    # Then the cross-batch merge pass over the folded cluster summaries.
+    plans.append(
+        ConsolidationPlan(
+            clusters=[
+                Cluster(title=f"Failure mode {mode}", description="d",
+                        category_id="tool_misuse", severity="high", finding_indices=[mode])
+                for mode in range(4)
+            ]
+        )
+    )
+    model = FakeChatModel(responses=[], structured=plans)
+    board = consolidate(model, findings, None, categories)
+
+    assert batch_sizes(model) == [80, 80, 80, 60]
+    assert all(size <= 80 for size in batch_sizes(model))
+    assert len(board.issues) == 4, "four modes across 300 findings -> four issues"
+    assert len(board.occurrences) == 300, "every trace keeps an occurrence"
+
+
+def test_the_merge_pass_prompt_carries_summaries_not_findings(categories):
+    findings = big_findings(160, modes=2)
+    plans = [
+        ConsolidationPlan(
+            clusters=[
+                Cluster(title=f"Failure mode {mode}", description="d",
+                        category_id="tool_misuse", severity="high",
+                        finding_indices=[i for i in range(80) if i % 2 == mode])
+                for mode in range(2)
+            ]
+        )
+        for _ in range(2)
+    ]
+    plans.append(ConsolidationPlan(clusters=[
+        Cluster(title="Unified", description="d", category_id="tool_misuse",
+                severity="high", finding_indices=[0, 1])
+    ]))
+    model = FakeChatModel(responses=[], structured=plans)
+    consolidate(model, findings, None, categories)
+
+    merge_prompt = str(model.calls[-1][-1].content)
+    assert "Candidate issues from this run" in merge_prompt
+    # Bounded by distinct failure modes, not by the 160 findings.
+    assert "trace-0000" not in merge_prompt
+    assert merge_prompt.count("[0]") == 1
+
+
+def test_one_failing_batch_does_not_cost_the_other_batches(categories, capsys):
+    """A 429 on batch 2 of 4 loses that batch's clustering, not the run."""
+    findings = big_findings(300, modes=2)
+
+    class FlakyBatch(ExplodingStructured):
+        def __init__(self):
+            super().__init__(0)
+            self.n = 0
+
+        def invoke(self, messages, **kwargs):
+            self.attempts += 1
+            self.n += 1
+            if 3 <= self.n <= 4:  # both attempts of the second batch
+                raise RuntimeError("429 rate limited")
+            return ConsolidationPlan(
+                clusters=[Cluster(title="Everything", description="d",
+                                  category_id="tool_misuse", severity="high",
+                                  finding_indices=list(range(80)))]
+            )
+
+    model = ExplodingModel(responses=[], structured=[])
+    model.exploder = FlakyBatch()
+    board = consolidate(model, findings, None, categories)
+
+    assert "falling back to deterministic clustering" in capsys.readouterr().err
+    # Every finding still reaches the board, however its batch was clustered.
+    assert len(board.occurrences) == 300
+    assert board.issues
+
+
+def test_a_small_run_still_uses_a_single_consolidation_call(categories):
+    findings = big_findings(10)
+    model = FakeChatModel(responses=[], structured=[ConsolidationPlan(
+        clusters=[Cluster(title="One", description="d", category_id="tool_misuse",
+                          severity="high", finding_indices=list(range(10)))]
+    )])
+    consolidate(model, findings, None, categories)
+    assert len(batch_sizes(model)) == 1
+    assert model.calls[-1][-1].content.count("Candidate issues") == 0
+
+
+def test_chunk_size_is_configurable_for_testing(categories):
+    findings = big_findings(6, modes=1)
+    plans = [
+        ConsolidationPlan(clusters=[Cluster(title="M", description="d",
+                                            category_id="tool_misuse", severity="high",
+                                            finding_indices=[0, 1])])
+        for _ in range(3)
+    ]
+    plans.append(ConsolidationPlan(clusters=[
+        Cluster(title="M", description="d", category_id="tool_misuse",
+                severity="high", finding_indices=[0])
+    ]))
+    model = FakeChatModel(responses=[], structured=plans)
+    board = consolidate(model, findings, None, categories, chunk_size=2)
+    assert batch_sizes(model) == [2, 2, 2]
+    assert len(board.issues) == 1
+    assert len(board.occurrences) == 6

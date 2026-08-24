@@ -235,16 +235,33 @@ class TraceIndex:
                                 "location": f"span.{field}",
                             },
                         )
-        result = {"query": query, "hit_count": len(hits), "hits": hits[:limit]}
-        return fit_json(result, "hits")
+        result = {
+            "query": query,
+            # Two different numbers, because they answer two different
+            # questions: how many places in the corpus mention this, and how
+            # many times in total. Reporting one under the other's name is how
+            # an agent concludes "only one mention" from a field that has ten.
+            "location_count": len(hits),
+            "total_matches": sum(hit["matches_here"] for hit in hits),
+            "locations": hits[:limit],
+        }
+        return fit_json(result, "locations")
 
     @staticmethod
     def _hits(needle: str, haystack: str, where: dict[str, Any]) -> list[dict[str, Any]]:
-        position = haystack.lower().find(needle)
+        """At most one entry per field, carrying that field's true match count."""
+        lowered = haystack.lower()
+        position = lowered.find(needle)
         if position < 0:
             return []
         start = max(0, position - SNIPPET_CHARS // 2)
-        return [{**where, "snippet": haystack[start : start + SNIPPET_CHARS]}]
+        return [
+            {
+                **where,
+                "matches_here": lowered.count(needle),
+                "snippet": haystack[start : start + SNIPPET_CHARS],
+            }
+        ]
 
     def _unknown_trace(self, trace_id: str) -> str:
         return _dumps(

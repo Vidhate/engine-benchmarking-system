@@ -33,12 +33,21 @@ MAX_TOOL_CALLS_ENV_VAR = "ENGINE_MAX_TOOL_CALLS_PER_TRACE"
 # `_runnable.KWARGS_CONFIG_KEYS` matches the annotation against a fixed list,
 # and because `from __future__ import annotations` turns annotations into
 # strings, only the literal strings "RunnableConfig" and
-# "Optional[RunnableConfig]" are accepted — the PEP-604 form
-# `RunnableConfig | None` is not, and a node annotated that way is silently
-# never given the run config. That failure is invisible: the node just sees no
-# model override and falls back to the default, so BOTH arms of the
-# Sol-vs-mini comparison would quietly run the same model.
+# "Optional[RunnableConfig]" are accepted. The PEP-604 form
+# `RunnableConfig | None` is not on that list, so LangGraph declines to inject
+# the config at all. Written as `config: RunnableConfig | None = None` that is
+# invisible — the node just sees no model override and uses the default, so
+# BOTH arms of the Sol-vs-mini comparison would quietly run the same model. The
+# bare annotation used below carries no default, so the same mistake raises
+# TypeError on the first superstep instead of corrupting a comparison.
 # Guarded by tests/test_graph.py::test_the_model_comes_from_the_run_configurable.
+
+# Fraction of traces whose analysis may fail before the run is called off.
+# Skip-and-continue below the line keeps a flaky trace from costing the other
+# N-1; above it, the far likelier explanation is systemic (bad key, unknown
+# model, rate limiting), and "the Engine barely ran" must never reach scoring
+# wearing the shape of "the Engine found almost nothing".
+MAX_TRACE_FAILURE_RATE = 0.2
 
 # Supersteps per run are 2 + one per trace, so the LangGraph default recursion
 # limit of 25 caps a run at ~23 traces. Raised on the compiled graph; callers
@@ -98,10 +107,14 @@ def trace_index(trace_file: str) -> TraceIndex:
     if not path.is_file():
         raise FileNotFoundError(f"trace_file not found: {path}")
     key = (str(path.resolve()), path.stat().st_mtime)
-    if key not in _INDEX_CACHE:
+    index = _INDEX_CACHE.get(key)
+    if index is None:
+        # Held in a local and returned from there: a concurrent run clearing the
+        # cache between the insert and a re-read would otherwise KeyError.
+        index = TraceIndex.from_file(path)
         _INDEX_CACHE.clear()
-        _INDEX_CACHE[key] = TraceIndex.from_file(path)
-    return _INDEX_CACHE[key]
+        _INDEX_CACHE[key] = index
+    return index
 
 
 def _categories(state: EngineState) -> list[Category]:
@@ -167,17 +180,21 @@ def more_traces(state: EngineState) -> str:
 def consolidate_node(state: EngineState, config: RunnableConfig) -> dict[str, Any]:
     trace_ids = state.get("trace_ids") or []
     errors = state.get("errors") or []
-    if trace_ids and len(errors) == len(trace_ids):
-        # Every trace failed the same way: that is infrastructure, not analysis.
-        # Emitting an empty board here would silently report "no errors found".
+    if errors:
+        print(
+            f"[engine] {len(errors)}/{len(trace_ids)} traces failed analysis; "
+            f"first: {errors[0]}",
+            file=sys.stderr,
+        )
+    if trace_ids and len(errors) / len(trace_ids) > MAX_TRACE_FAILURE_RATE:
         raise RuntimeError(
-            f"analysis failed on all {len(trace_ids)} traces; first: {errors[0]}"
+            f"analysis failed on {len(errors)} of {len(trace_ids)} traces "
+            f"(> {MAX_TRACE_FAILURE_RATE:.0%}); refusing to emit a board that would "
+            f"read as 'few errors found'. First failure: {errors[0]}"
         )
     findings = [RawFinding.model_validate(f) for f in (state.get("findings") or [])]
     model = build_model(resolve_model_name(config))
     board = consolidate(model, findings, _seed(state), _categories(state))
-    if errors:
-        print(f"[engine] {len(errors)}/{len(trace_ids)} traces failed analysis", file=sys.stderr)
     return {
         "board_id": board.board_id,
         "source": board.source,

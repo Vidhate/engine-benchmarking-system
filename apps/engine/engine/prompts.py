@@ -115,6 +115,51 @@ Produce the clustering.
 """
 
 
+MERGE_SYSTEM = """\
+You are Engine's cross-batch merge step. The findings from this run were \
+clustered in batches, so the same failure mode may have been written up once per \
+batch under different wording. Merge the duplicates.
+
+Rules:
+1. Group the candidate issues below by failure mode. Two candidates belong \
+together when the same underlying defect in the app produced them, even if their \
+titles differ. Candidates that would need different fixes stay separate.
+2. Put each candidate's index in `finding_indices` — here those are CANDIDATE \
+indices, not raw finding indices.
+3. A candidate that has no duplicate still gets its own single-member group.
+4. For each group write the canonical `title`, `description`, `category_id` and \
+`severity` (the highest among its members).
+5. If a group is a failure mode the EXISTING issueboard already names, set \
+`matches_seed_error_id` to that issue's error_id.
+
+Category vocabulary:
+{categories}
+
+Existing issueboard:
+{seed_issues}
+"""
+
+MERGE_TASK = """\
+Candidate issues from this run, indexed:
+
+{clusters}
+
+Produce the merged grouping.
+"""
+
+
+def format_clusters(clusters) -> str:
+    if not clusters:
+        return "  (no candidates)"
+    return "\n".join(
+        f"  [{index}] category={c.category_id} | severity={c.severity} | "
+        f"findings={len(c.finding_indices)}\n"
+        f"      title: {c.title}\n"
+        f"      description: {c.description}"
+        for index, c in enumerate(clusters)
+    )
+
+
 def format_categories(categories) -> str:
     if not categories:
         return "  (no categories supplied)"

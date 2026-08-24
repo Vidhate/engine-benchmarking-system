@@ -79,7 +79,7 @@ def test_no_ablation_marker_survives_into_any_tool_result(extra_fields_file):
 
     # search_text echoes its own query, so assert on the hits instead.
     for probe in ("abl-001", "injected", "replay_edit", "injection_mode"):
-        assert json.loads(index.search_text(probe))["hit_count"] == 0
+        assert json.loads(index.search_text(probe))["location_count"] == 0
 
 
 def test_span_level_markers_are_dropped_too(extra_fields_file):

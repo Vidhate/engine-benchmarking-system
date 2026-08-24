@@ -155,18 +155,70 @@ def test_one_failing_trace_does_not_abandon_the_rest(traces_file, monkeypatch, c
     assert len(result["occurrences"]) == 5
 
 
+def fail_traces(monkeypatch, failing: set[str]):
+    """Make analysis raise for the named traces and succeed for the rest."""
+
+    def selective(model, index, trace_id, running_titles, categories, max_tool_calls):
+        if trace_id in failing:
+            raise RuntimeError("401 Unauthorized")
+        return [TICKET_FINDING.model_copy(update={"trace_id": trace_id})]
+
+    monkeypatch.setattr(graph_module, "build_model", lambda name: FakeChatModel())
+    monkeypatch.setattr(graph_module, "analyze_trace", selective)
+    monkeypatch.setattr(graph_module, "consolidate", lambda m, f, s, c: _board_from(f))
+
+
 def test_a_failure_on_every_trace_raises_instead_of_reporting_no_errors(
     traces_file, monkeypatch, categories
 ):
     """An expired key must not be indistinguishable from a clean corpus."""
-
-    def always_fails(*args, **kwargs):
-        raise RuntimeError("401 Unauthorized")
-
-    monkeypatch.setattr(graph_module, "build_model", lambda name: FakeChatModel())
-    monkeypatch.setattr(graph_module, "analyze_trace", always_fails)
+    fail_traces(monkeypatch, set(ALL_TRACE_IDS))
     with pytest.raises(Exception, match="401 Unauthorized"):
         run(traces_file, categories=categories)
+
+
+def test_a_failure_rate_above_the_threshold_calls_the_run_off(
+    traces_file, monkeypatch, categories
+):
+    """2 of 6 is 33% — well past the point where 'the Engine found little' is a
+    less likely story than 'the Engine barely ran'."""
+    fail_traces(monkeypatch, {"trace-clean-pricing", "trace-planted-refund"})
+    with pytest.raises(Exception, match="analysis failed on 2 of 6 traces"):
+        run(traces_file, categories=categories)
+
+
+def test_a_failure_rate_at_or_below_the_threshold_completes(
+    traces_file, monkeypatch, categories
+):
+    """1 of 6 is under 20%: skip the flaky trace, keep the other five."""
+    fail_traces(monkeypatch, {"trace-planted-refund"})
+    result = run(traces_file, categories=categories)
+    assert len(result["occurrences"]) == 5
+    assert "trace-planted-refund" not in {o["trace_id"] for o in result["occurrences"]}
+
+
+def test_the_failure_count_is_always_reported_on_stderr(
+    traces_file, monkeypatch, categories, capsys
+):
+    """Below the threshold the run still succeeds — but silently succeeding is
+    what made 299/300 failures look like 'found nothing'."""
+    fail_traces(monkeypatch, {"trace-planted-refund"})
+    run(traces_file, categories=categories)
+    err = capsys.readouterr().err
+    assert "1/6 traces failed analysis" in err
+    assert "401 Unauthorized" in err
+
+
+def test_a_clean_run_says_nothing_about_failures(traces_file, monkeypatch, categories, capsys):
+    fail_traces(monkeypatch, set())
+    run(traces_file, categories=categories)
+    assert "failed analysis" not in capsys.readouterr().err
+
+
+def test_the_threshold_is_a_rate_not_a_count(traces_file, monkeypatch, categories):
+    """The same absolute count that is fatal at N=6 is tolerable at larger N;
+    guard the constant so a future edit cannot silently make it a count."""
+    assert 0 < graph_module.MAX_TRACE_FAILURE_RATE < 1
 
 
 def test_a_missing_trace_file_fails_loudly(tmp_path, scripted):
@@ -222,3 +274,25 @@ def test_input_schema_is_the_declared_surface_only():
     schema = graph_module.EngineInput.__annotations__
     assert set(schema) == {"trace_file", "seed_issueboard", "categories"}
     assert "ablation" not in json.dumps(list(schema))
+
+
+# -- review finding 6: the index cache -------------------------------------
+
+
+def test_the_index_cache_survives_being_cleared_between_calls(traces_file, monkeypatch):
+    """The cache is cleared before each insert; the loaded index must come from
+    a local, or a concurrent clear turns into a KeyError mid-run."""
+    graph_module._INDEX_CACHE.clear()
+    first = graph_module.trace_index(str(traces_file))
+    assert graph_module.trace_index(str(traces_file)) is first
+
+    real_from_file = graph_module.TraceIndex.from_file
+
+    def clear_after_load(path):
+        index = real_from_file(path)
+        graph_module._INDEX_CACHE.clear()
+        return index
+
+    graph_module._INDEX_CACHE.clear()
+    monkeypatch.setattr(graph_module.TraceIndex, "from_file", staticmethod(clear_after_load))
+    assert graph_module.trace_index(str(traces_file)).trace_ids == ALL_TRACE_IDS
