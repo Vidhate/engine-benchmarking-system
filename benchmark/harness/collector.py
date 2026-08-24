@@ -95,7 +95,10 @@ NOISE_NAME_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r".*\.wrap_(model|tool)_call",
         r".*_middleware(\..*)?",
         r".*OutputParser",
-        r"(Chat)?PromptTemplate",
+        # `Prompt` is what create_react_agent names its prompt-assembly run;
+        # its payload is the message list the very next llm span already
+        # carries, so keeping it doubles the trace for no information.
+        r"Prompt|(Chat)?PromptTemplate",
         r"should_continue|route|_route",
     )
 )

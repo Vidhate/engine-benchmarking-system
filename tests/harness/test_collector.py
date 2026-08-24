@@ -70,6 +70,38 @@ def test_framework_noise_spans_are_dropped_and_survivors_reparented():
     assert [s.name for s in spans if s.parent_span_id is None] == ["target_app"]
 
 
+@pytest.mark.parametrize(
+    "name,run_type,noise",
+    [
+        # Framework plumbing — dropped.
+        ("RunnableSequence", "chain", True),
+        ("RunnableAssign<messages>", "chain", True),
+        ("ChannelWrite<messages>", "chain", True),
+        ("__start__", "chain", True),
+        ("should_continue", "chain", True),
+        ("Prompt", "chain", True),
+        ("ChatPromptTemplate", "chain", True),
+        ("StrOutputParser", "parser", True),
+        ("AgentMiddleware.wrap_model_call", "chain", True),
+        ("some_middleware", "chain", True),
+        ("mystery", "annotation_queue", True),  # unknown run type
+        # App semantics — kept.
+        ("ChatOpenAI", "llm", False),
+        ("rag_search", "tool", False),
+        ("corpus_search", "retriever", False),
+        ("agent", "chain", False),
+        ("tools", "chain", False),
+        ("call_model", "chain", False),
+    ],
+)
+def test_the_documented_noise_filter_rule(name, run_type, noise):
+    from benchmark.harness.collector import is_noise_span
+
+    assert is_noise_span(name, run_type, is_root=False) is noise
+    # The root run is always kept, whatever the framework called it.
+    assert is_noise_span(name, run_type, is_root=True) is False
+
+
 def test_span_attributes_are_allowlisted_never_copied_wholesale():
     runs = react_agent_runs("s-abc", leak_metadata=True)
     collector = make_collector(FakeLangSmithClient(runs))
