@@ -380,3 +380,50 @@ def test_run_harness_is_the_documented_top_level_entrypoint(tmp_path):
     assert len(traces.traces) == 2
     assert traces.parent_dataset_id == inputs.dataset_id
     assert all(o.responses for o in outputs.outputs)
+
+
+def test_a_persistent_bare_langsmith_error_quarantines_that_input_not_the_batch(tmp_path):
+    """The live 502-at-75/400 regression: a transient failure the SDK wraps in
+    the BASE LangSmithError must, after exhausted retries, quarantine only the
+    affected input while the rest of the batch completes."""
+    from langsmith.utils import LangSmithError
+
+    inputs = make_inputs(3)
+    failing = session_id_for(inputs.dataset_id, "safe-1")
+    harness, _app, store, quarantine, _ = build(
+        tmp_path,
+        inputs,
+        ls_kwargs={
+            "rate_limit_calls": 1000,
+            "rate_limit_error": LangSmithError,
+            "rate_limit_target": failing,
+        },
+        collector_kwargs={"max_retries": 2, "retry_base_delay_s": 0.0},
+    )
+
+    _outputs, traces = harness.run_batch(inputs)
+
+    assert {t.input_id for t in traces.traces} == {"safe-0", "safe-2"}
+    assert quarantine.list_ids() == [failing]
+    assert "LangSmithError" in quarantine.get(failing)["reason"]
+    assert harness.stats == {"ran": 2, "skipped": 0, "quarantined": 1, "app_error": 0}
+
+
+def test_an_auth_error_still_aborts_the_whole_batch(tmp_path):
+    """Fail-fast preserved: an invalid API key must abort immediately, never
+    degrade into one quarantine per input."""
+    from langsmith.utils import LangSmithAuthError
+
+    inputs = make_inputs(3)
+    harness, _app, _store, quarantine, _ = build(
+        tmp_path,
+        inputs,
+        ls_kwargs={"rate_limit_calls": 1000, "rate_limit_error": LangSmithAuthError},
+        collector_kwargs={"max_retries": 2, "retry_base_delay_s": 0.0},
+    )
+
+    import pytest
+
+    with pytest.raises(LangSmithAuthError):
+        harness.run_batch(inputs)
+    assert quarantine.list_ids() == []

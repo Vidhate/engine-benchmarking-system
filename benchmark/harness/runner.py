@@ -28,12 +28,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from langsmith.utils import LangSmithAPIError, LangSmithRateLimitError
+from langsmith.utils import LangSmithError
 from pydantic import ValidationError
 
 from benchmark.harness.client import LangGraphAppClient, TargetAppClient
 from benchmark.harness.client import message_text as _text_of
 from benchmark.harness.collector import (
+    FAIL_FAST_LANGSMITH_ERRORS,
     IngestionTimeout,
     LangSmithCollector,
     TurnHint,
@@ -66,18 +67,21 @@ class AmbiguousCheckpoint(LookupError):
     """Several turns end with the same assistant response — say which one."""
 
 # Collection problems: our bug, so the result is quarantined rather than stored.
-# LangSmithRateLimitError/LangSmithAPIError land here only after the
-# collector's own bounded backoff (benchmark.harness.collector) has already
-# exhausted its retries — a persistent 429/5xx is then this input's problem,
-# not a reason to kill the rest of the batch.
+# LangSmith errors land here only after the collector's own bounded backoff
+# (benchmark.harness.collector) has already exhausted its retries — a
+# persistent 429/5xx is then this input's problem, not a reason to kill the
+# rest of the batch. The BASE LangSmithError is included because the SDK
+# wraps some transient failures (e.g. a 502 on /runs/query, observed live)
+# in the base class rather than a subclass — but every handler that catches
+# this tuple must first re-raise FAIL_FAST_LANGSMITH_ERRORS (auth/user/
+# not-found/conflict), which are config problems that must abort the batch.
 COLLECTION_FAILURES = (
     IngestionTimeout,
     LeakDetected,
     ValidationError,
     ValueError,
     KeyError,
-    LangSmithRateLimitError,
-    LangSmithAPIError,
+    LangSmithError,
 )
 
 
@@ -257,6 +261,8 @@ class Harness:
                     extra_leak_tokens=extra_leak_tokens,
                 )
             except COLLECTION_FAILURES as exc:
+                if isinstance(exc, FAIL_FAST_LANGSMITH_ERRORS):
+                    raise
                 trace = self._error_only_trace(
                     session_id, spec.input_id, "single_turn", hints, f"{type(exc).__name__}: {exc}"
                 )
@@ -362,7 +368,9 @@ class Harness:
                 extra_metadata=metadata,
                 extra_leak_tokens=extra_leak_tokens,
             )
-        except COLLECTION_FAILURES:
+        except COLLECTION_FAILURES as exc:
+            if isinstance(exc, FAIL_FAST_LANGSMITH_ERRORS):
+                raise
             if not error:
                 raise
             trace = self._error_only_trace(
@@ -421,6 +429,8 @@ class Harness:
             else:
                 trace = self.run_single_turn(spec, session_id=session_id)
         except COLLECTION_FAILURES as exc:
+            if isinstance(exc, FAIL_FAST_LANGSMITH_ERRORS):
+                raise
             self.quarantine.put(
                 session_id,
                 reason=f"{type(exc).__name__}: {exc}",

@@ -604,3 +604,35 @@ def test_trace_metadata_is_an_allowlist_of_harness_facts():
     assert trace.metadata["thread_id"] == "th-1"
     assert trace.metadata["langsmith_project"] == "engine-bench-target"
     assert not any(k.startswith("fault_") for k in trace.metadata)
+
+
+def test_a_bare_langsmith_error_is_retried_like_any_transient_5xx():
+    """The SDK wraps some transient failures (a live 502 on /runs/query) in the
+    BASE LangSmithError, not a subclass — observed killing a 400-trace batch
+    at 75/400. The retry net must catch it."""
+    from langsmith.utils import LangSmithError
+
+    runs = react_agent_runs("s-abc")
+    client = FakeLangSmithClient(runs, rate_limit_calls=2, rate_limit_error=LangSmithError)
+    collector = make_collector(client, max_retries=6, retry_base_delay_s=0.01)
+
+    trace = collector.collect("s-abc", input_id="i", mode="single_turn")
+
+    assert trace.status == "ok"
+    assert client.rate_limit_raises == 2
+
+
+def test_fail_fast_langsmith_errors_are_never_retried():
+    """Auth/user/not-found/conflict are config problems: zero retries, raised
+    immediately, even though they subclass the now-retried base error."""
+    from langsmith.utils import LangSmithAuthError
+
+    runs = react_agent_runs("s-abc")
+    client = FakeLangSmithClient(
+        runs, rate_limit_calls=1000, rate_limit_error=LangSmithAuthError
+    )
+    collector = make_collector(client, max_retries=6, retry_base_delay_s=0.01)
+
+    with pytest.raises(LangSmithAuthError):
+        collector.collect("s-abc", input_id="i", mode="single_turn")
+    assert client.rate_limit_raises == 1, "an auth error must not be retried"

@@ -53,7 +53,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
-from langsmith.utils import LangSmithAPIError, LangSmithRateLimitError
+from langsmith.utils import (
+    LangSmithAPIError,
+    LangSmithAuthError,
+    LangSmithConflictError,
+    LangSmithError,
+    LangSmithNotFoundError,
+    LangSmithRateLimitError,
+    LangSmithUserError,
+)
 
 from benchmark.harness.ids import trace_id_for
 from benchmark.harness.scrub import assert_no_leak, leak_tokens
@@ -138,6 +146,23 @@ _ALLOWED_ATTRIBUTES = ("run_type", "model", "tokens", "error", "duration_ms")
 RETRYABLE_LANGSMITH_ERRORS: tuple[type[BaseException], ...] = (
     LangSmithRateLimitError,  # 429 — the reason this retry helper exists
     LangSmithAPIError,  # LangSmith's mapping of a transient 5xx response
+    # The SDK does NOT map every transient failure onto a subclass: a 502
+    # Bad Gateway on /runs/query surfaces as the BASE LangSmithError from
+    # request_with_retries (observed live, 2026-08-24, killing a 400-trace
+    # batch at 75/400). So the retry net catches the base class and
+    # re-raises the deliberate fail-fast subclasses below.
+    LangSmithError,
+)
+
+# Configuration problems a retry cannot fix — these must FAIL FAST (an invalid
+# API key aborting the batch immediately, never one quarantine per input).
+# All are LangSmithError subclasses, so the retry/quarantine nets that catch
+# the base class must check this tuple first and re-raise.
+FAIL_FAST_LANGSMITH_ERRORS: tuple[type[BaseException], ...] = (
+    LangSmithAuthError,
+    LangSmithUserError,
+    LangSmithNotFoundError,
+    LangSmithConflictError,
 )
 
 _T = TypeVar("_T")
@@ -407,7 +432,9 @@ class LangSmithCollector:
         while True:
             try:
                 return fetch()
-            except RETRYABLE_LANGSMITH_ERRORS:
+            except RETRYABLE_LANGSMITH_ERRORS as exc:
+                if isinstance(exc, FAIL_FAST_LANGSMITH_ERRORS):
+                    raise
                 attempt += 1
                 if attempt > self.max_retries:
                     raise
