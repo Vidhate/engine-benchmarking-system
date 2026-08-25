@@ -26,6 +26,7 @@ import benchmark
 from benchmark.pipeline.contracts import (
     ABLATION_RESULT_FIELDS,
     AblationResult,
+    AblationStage,
     AblationStageUnavailable,
     assert_ablation_result,
     load_ablation_stage,
@@ -176,6 +177,59 @@ def test_a_wrongly_typed_field_is_caught_at_the_seam():
 
 def test_the_result_protocol_is_runtime_checkable():
     assert isinstance(_complete_result(), AblationResult)
+
+
+# ------------------------------------------------------- the REAL Phase-5 stage
+#
+# Phase 5 has merged, so the pinned contract stops being a promise and becomes
+# a checkable fact. These import `benchmark.ablation` on purpose — inside the
+# test bodies, so the module-graph property above is not quietly broken by an
+# import at the top of this file.
+
+def test_the_seam_loads_the_real_run_ablation():
+    import benchmark.ablation  # noqa: PLC0415
+
+    assert load_ablation_stage() is benchmark.ablation.run_ablation
+
+
+def test_the_real_signature_is_the_pinned_one():
+    """Same parameter NAMES in the same ORDER as `AblationStage.__call__`.
+
+    The runner calls the stage with keywords, so the names are load-bearing on
+    their own; the order matters because the pinned contract is also what the
+    ablation package's own callers and docs quote positionally.
+    """
+    import inspect  # noqa: PLC0415
+
+    pinned = [p for p in inspect.signature(AblationStage.__call__).parameters if p != "self"]
+    actual = list(inspect.signature(load_ablation_stage()).parameters)
+    assert actual == pinned
+
+
+@pytest.mark.parametrize("field", list(ABLATION_RESULT_FIELDS))
+def test_the_real_result_type_declares_every_pinned_field(field):
+    from benchmark.ablation import AblationResult as RealAblationResult  # noqa: PLC0415
+
+    assert field in RealAblationResult.model_fields
+
+
+def test_the_real_result_passes_the_seam_check():
+    """`assert_ablation_result` over an actual Phase-5 `AblationResult`.
+
+    The fake satisfying the contract only ever proved the fake was written to
+    match it. This is the check that matters at integration time, and it runs
+    in CI without a server or a model because the shape is the whole claim.
+    """
+    from benchmark.ablation import AblationResult as RealAblationResult  # noqa: PLC0415
+
+    result = RealAblationResult(
+        ablated=TraceDataset(),
+        ground_truth=Issueboard(source="ground_truth"),
+        split=AblationSplit(seed=0, control_fraction=0.3),
+        export_path="/tmp/traces.json",
+    )
+    assert assert_ablation_result(result) is result
+    assert isinstance(result, AblationResult), "the runtime-checkable Protocol disagrees"
 
 
 # ------------------------------------------------------------- the fake stage

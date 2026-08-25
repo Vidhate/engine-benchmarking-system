@@ -25,6 +25,7 @@ per run.
 
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from benchmark.pipeline.contracts import EngineInvocation
-from benchmark.pipeline.export import write_leak_stripped_export
+from benchmark.pipeline.export import export_traces, write_leak_stripped_export
 from benchmark.schemas import (
     AblationConfig,
     AblationRecord,
@@ -367,7 +368,12 @@ class FakeEngineInvoker:
                 "engine": engine,
             }
         )
-        exported = TraceDataset.model_validate_json(Path(trace_file).read_text())
+        # `export_traces`, not `TraceDataset.model_validate_json`: the real
+        # ablation stage writes a bare list of stripped traces, so a double
+        # that only read the envelope shape would pass CI and die on the
+        # first integrated run. This is the Engine's reader, so it reads what
+        # the Engine reads.
+        exported = export_traces(json.loads(Path(trace_file).read_text()))
         gt = self.ground_truth or Issueboard(source="ground_truth")
         keep = int(round(len(gt.issues) * self.recall))
         issues = [
@@ -392,7 +398,7 @@ class FakeEngineInvoker:
         # with its own guard, and this double should not manufacture one.
         first_trace = next(
             (o.trace_id for o in gt.occurrences),
-            exported.traces[0].trace_id if exported.traces else "tr-unknown",
+            exported[0]["trace_id"] if exported else "tr-unknown",
         )
         issues.append(
             Issue(
@@ -416,5 +422,5 @@ class FakeEngineInvoker:
             seconds=1.5,
             thread_id="thread-fake",
             recorded_models=[engine.model],
-            trace_count=len(exported.traces),
+            trace_count=len(exported),
         )

@@ -14,6 +14,7 @@ import pytest
 from benchmark.pipeline.export import (
     ExportLeak,
     assert_export_file_clean,
+    export_traces,
     write_leak_stripped_export,
 )
 from benchmark.pipeline.fakes import fake_run_ablation, split_inputs
@@ -166,3 +167,45 @@ def test_a_fault_key_echo_in_the_export_is_caught(tmp_path):
     )
     with pytest.raises(ExportLeak, match="fault_retriever"):
         assert_export_file_clean(path)
+
+
+# ------------------------------- the shape the REAL Phase-5 export arrives in
+
+def test_the_pipeline_reads_the_export_phase_5_actually_writes(tmp_path, tiny_traces):
+    """`benchmark.ablation.write_engine_export` writes a BARE LIST of traces.
+
+    The pipeline's own stand-in writes `{dataset_id, parent_dataset_id,
+    traces: [...]}`, so every reader on this side was built around a dict and
+    a real export would have died on `payload.get`. The Engine app has always
+    accepted both shapes (`apps/engine/engine/traces.py::load_traces`); the
+    audit, the deliverables check and the invoker now do too, because the
+    format the ground-truth side writes is the one that has to be read.
+    """
+    from benchmark.ablation.export import write_engine_export  # noqa: PLC0415
+
+    path = write_engine_export(tiny_traces, tmp_path / "traces.json")
+    payload = json.loads(path.read_text())
+    assert isinstance(payload, list), "this test is worthless if Phase 5 writes a dict"
+
+    audited = assert_export_file_clean(path)
+    assert [t["trace_id"] for t in export_traces(audited)] == [
+        t.trace_id for t in tiny_traces.traces
+    ]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ([{"trace_id": "a"}], ["a"]),
+        ({"traces": [{"trace_id": "a"}]}, ["a"]),
+        ({"dataset_id": "d", "traces": []}, []),
+        ([], []),
+    ],
+)
+def test_both_export_shapes_yield_the_same_trace_list(payload, expected):
+    assert [t["trace_id"] for t in export_traces(payload)] == expected
+
+
+def test_an_export_that_is_neither_shape_says_so():
+    with pytest.raises(ExportLeak, match="unsupported"):
+        export_traces("not a trace corpus")

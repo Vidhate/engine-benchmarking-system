@@ -1,44 +1,37 @@
 #!/usr/bin/env python3
 """Live miniature end-to-end run of the Phase 7 pipeline. NOT run by scripts/ci.sh.
 
-Drives the REAL path with BOTH real servers and the real Engine on the mini
-model, over ~7 inputs:
+Drives the REAL path, with both real servers, the real ablation engine and the
+real Engine on the mini model, over ~7 inputs:
 
     generate_inputs (real OpenAI expander)
       -> harness batch      (real target app on :2024, real LangSmith collection)
-      -> [FAKE ablation]    (Phase 5 has not merged — see below)
+      -> run_ablation       (real LLM ablation agent, real injection, real replay)
       -> Engine             (real engine app on :2025, mini model)
       -> score()            -> BenchmarkReport + report.md + manifest.json
 
-It proves every integration seam EXCEPT ablation.
+Every integration seam, none faked. That is what the gates below are checking:
+the run's numbers are still miniature-scale and not worth much on their own,
+but the *shape* of the run — a real injected ground truth, a leak-stripped
+export the Engine can read, a score computed against errors somebody actually
+planted — is the thing this script exists to prove.
 
---------------------------------------------------------------------------
-WHEN PHASE 5 MERGES: ONE LINE CHANGES.
---------------------------------------------------------------------------
-Replace
-
-    from benchmark.pipeline.fakes import fake_run_ablation
-    ...
-    ablation_stage=fake_run_ablation,
-
-with
-
-    from benchmark.pipeline.contracts import load_ablation_stage
-    ...
-    ablation_stage=load_ablation_stage(),
-
-and drop `--fake-ablation` from the CLI invocation. Nothing else in this
-script, and nothing in `benchmark/pipeline/`, needs to change: the pipeline
-calls the stage through the pinned contract
-(`run_ablation(traces, inputs, categories, cfg, harness, store, export_path)`)
-and re-checks the returned shape at the seam. The only assertions below that
-loosen are the ones marked FAKE-ONLY.
+**The absence of a FAKED warning in manifest.json is the signal that the run
+was real.** Gate 4 asserts on it. Any stand-in anywhere in the assembly puts
+that warning back, so it cannot be lost by accident.
 
 Note the ordering the pipeline enforces and this script depends on: the
 harness batch and the ablation stage run inside ONE target-app server
 lifetime, because Mode-A replay forks a LangGraph thread created during the
-batch and `langgraph dev` loses thread state on restart. The Engine's server
-starts only after the target app is down.
+batch and `langgraph dev` loses thread state on restart. A restart between
+them shows up as `DeadThreadRefs` out of `assert_threads_alive`, so a run that
+reaches gate 3 is evidence the choreography held. The Engine's server starts
+only after the target app is down.
+
+`benchmark/pipeline/fakes.py` stays where it is: CI cannot spend an LLM agent
+and two servers per run, and `python -m benchmark.pipeline run --fake-harness
+--fake-ablation --fake-engine` is the offline path. This script is the one
+that pays for the real thing.
 
 Usage:
     uv run python scripts/pipeline_smoke.py                 # manages both servers
@@ -53,7 +46,9 @@ Usage:
 driving the target app, so the Engine / scoring / report / manifest seams can
 be verified without LangSmith in the loop — useful when the trace-collection
 backend is unavailable or its per-account rate limit is being shared with
-another run. It proves strictly less than a full pass and says so.
+another run. With no live target app there is nothing to inject against, so it
+falls back to the stand-in ablation stage and the FAKED warning comes back. It
+proves strictly less than a full pass and says so, twice.
 
 `--target-port` / `--engine-port` exist because :2024 and :2025 are one machine's
 worth of ports and more than one of these runs can want them — a parallel
@@ -68,12 +63,14 @@ Requires OPENAI_API_KEY and LANGSMITH_API_KEY (read from a repo-root .env).
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import shutil
 import socket
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -224,8 +221,8 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     from benchmark.generation.expander import OpenAIPromptExpander
     from benchmark.harness.config import load_target_app_config
     from benchmark.pipeline.config import load_engine_app_config, load_pipeline_config
-
-    # FAKE-ONLY IMPORT — see the header: swap for `load_ablation_stage()`.
+    from benchmark.pipeline.contracts import assert_ablation_result, load_ablation_stage
+    from benchmark.pipeline.export import export_traces
     from benchmark.pipeline.fakes import fake_run_ablation
     from benchmark.pipeline.runner import run_pipeline
     from benchmark.pipeline.servers import ServerLifetime
@@ -278,7 +275,30 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     print(f"engine knobs    : analysis_concurrency={cfg.engine.analysis_concurrency}, "
           f"recursion_limit={cfg.engine.recursion_limit}")
     print(f"artifacts       : {cfg.run_dir}")
-    print("ablation stage  : FAKE (Phase 5 not merged) — see this script's header")
+
+    # --engine-only has no live target app, so there is nothing for the real
+    # stage to replay or fault-inject against; it gets the stand-in, and the
+    # FAKED warning that comes with it.
+    if args.engine_only:
+        real_stage = fake_run_ablation
+        print("ablation stage  : FAKE (--engine-only: no target app to inject against)")
+    else:
+        real_stage = load_ablation_stage()
+        print(f"ablation stage  : REAL ({real_stage.__module__}.{real_stage.__qualname__})")
+
+    # The runner already runs `assert_ablation_result` at the seam, but it does
+    # not hand the raw result back, and gate 2 wants to check the object Phase 5
+    # returned rather than the fields the runner chose to keep. `functools.wraps`
+    # keeps the wrapped function's `__module__`/`__qualname__`, so the manifest
+    # still records `benchmark.ablation.engine.run_ablation` — which is the
+    # truth: this closure adds an observation, not an implementation.
+    captured: dict = {}
+
+    @functools.wraps(real_stage)
+    def observed_stage(**kwargs):
+        result = real_stage(**kwargs)
+        captured["result"] = result
+        return result
 
     # --engine-only owns the Engine's server and nothing else: the target app
     # is not started because it is not driven.
@@ -301,9 +321,7 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     started = time.time()
     run = run_pipeline(
         cfg,
-        # ---- THE ONE LINE THAT CHANGES WHEN PHASE 5 MERGES --------------
-        ablation_stage=fake_run_ablation,
-        # -----------------------------------------------------------------
+        ablation_stage=observed_stage,
         expander=OpenAIPromptExpander(),
         servers=servers,
         harness_factory=StoredTraceHarness if args.engine_only else None,
@@ -327,26 +345,82 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     print("PASS — every trace is schema-valid with spans, lineage intact")
 
     # --------------------------------------------------------------- gate 2
-    banner("GATE 2 — ablation stage (FAKE) -> ground truth + leak-stripped export")
+    banner("GATE 2 — real ablation -> injected ground truth + leak-stripped export")
+    result = captured["result"]
+    print(f"stage    : {type(result).__module__}.{type(result).__name__}")
     print(f"ablated  : {len(run.ablated.traces)} traces ({run.ablated.dataset_id}) "
           f"<- parent {run.ablated.parent_dataset_id}")
     print(f"split    : {len(run.split.control_input_ids)} control / "
-          f"{len(run.split.ablate_input_ids)} ablate, seed={run.split.seed}")
+          f"{len(run.split.ablate_input_ids)} ablate, seed={run.split.seed}, "
+          f"strata={run.split.strata}")
     print(f"E_K      : {len(run.ground_truth.issues)} issue(s), "
           f"{len(run.ground_truth.occurrences)} occurrence(s)")
+    for issue in run.ground_truth.issues:
+        print(f"  {issue.error_id}: [{issue.injection_mode}] {issue.category_id} "
+              f"/ {issue.severity} — {issue.title}")
+    print(f"records  : {len(run.records)}")
+    print(f"dropped  : {run.manifest.dropped_errors}")
     print(f"export   : {run.export_path}")
-    assert run.ablated.parent_dataset_id == run.traces.dataset_id
-    assert run.export_path.exists()
+
+    # The pinned contract, re-checked on the object Phase 5 actually returned.
+    assert_ablation_result(result)
+    print(f"  assert_ablation_result: OK on {type(result).__name__}")
+
+    # The path the stage CLAIMS it wrote is the path the Engine will be given.
+    assert Path(result.export_path) == run.export_path, (
+        f"the stage reported {result.export_path!r} but the run used {run.export_path}"
+    )
+    assert run.export_path.exists(), "the claimed export path is not on disk"
+    assert run.ablated.parent_dataset_id == run.traces.dataset_id, "lineage broken"
+
+    # Leak audit, run again here with the ablation package's OWN auditor (field
+    # allowlist + token scan) rather than only the pipeline's token scan. Two
+    # implementations of the same boundary, and the export has to survive both.
+    from benchmark.ablation.export import EXPORT_EPOCH, audit_export  # noqa: PLC0415
+
     blob = run.export_path.read_text()
+    exported = export_traces(json.loads(blob))
+    audit_export(exported, target_app)
     for token in ("ablation_ids", "injection_mode", "replay_edit", "dependency_fault", "fault_"):
         assert token not in blob, f"the Engine's trace file names {token!r}"
-    # FAKE-ONLY: a pass-through stage leaves the trace bytes untouched. With
-    # the real Phase 5 stage this equality does NOT hold (that is the point of
-    # ablation) — delete this assertion at integration time.
-    assert [t["trace_id"] for t in json.loads(blob)["traces"]] == [
-        t.trace_id for t in run.traces.traces
-    ], "FAKE-ONLY invariant: the stand-in must pass traces through unchanged"
-    print("PASS — export written, leak-free, ground truth + split recorded")
+    print(f"  leak audit: OK over {len(exported)} exported trace(s) "
+          f"(allowlist + token scan, both auditors)")
+
+    # No time separator: ablation runs after collection, so an un-normalized
+    # export would let the Engine sort control from ablated by the clock alone
+    # — no trace reading required. Every exported trace must start at the same
+    # synthetic origin.
+    origins = {
+        min(span["start_time"] for turn in trace["turns"] for span in turn["spans"])
+        for trace in exported
+        if any(turn["spans"] for turn in trace["turns"])
+    }
+    assert len(origins) <= 1, f"exported traces start at {len(origins)} distinct clocks: {origins}"
+    if origins:
+        origin = next(iter(origins))
+        assert datetime.fromisoformat(origin.replace("Z", "+00:00")) == EXPORT_EPOCH, (
+            f"the export's origin is {origin}, not the fixed EXPORT_EPOCH {EXPORT_EPOCH}"
+        )
+        print(f"  no time separator: all {len(exported)} trace(s) re-based to {origin}")
+
+    # And the inverse of the assertion this gate used to make: a real ablation
+    # CHANGES the corpus. A pass-through would leave the bytes identical.
+    source_by_id = {t.trace_id: t for t in run.traces.traces}
+    changed = [
+        t.trace_id
+        for t in run.ablated.traces
+        if t.trace_id not in source_by_id
+        or t.model_dump(mode="json", exclude={"ablation_ids"})
+        != source_by_id[t.trace_id].model_dump(mode="json", exclude={"ablation_ids"})
+    ]
+    assert changed, (
+        "the ablated corpus is byte-identical to the collected one — nothing was injected"
+    )
+    print(f"  {len(changed)} of {len(run.ablated.traces)} trace(s) differ from the collected "
+          f"corpus (a pass-through stage would differ in none)")
+    print(f"  injection modes in E_K: "
+          f"{sorted({i.injection_mode for i in run.ground_truth.issues if i.injection_mode})}")
+    print("PASS — real injection, contract honoured, export written and leak-free")
 
     # --------------------------------------------------------------- gate 3
     banner("GATE 3 — real Engine run over the export")
@@ -401,12 +475,30 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     assert {t.stage for t in run.manifest.timings} >= {
         "generation", "harness", "ablation", "engine", "scoring"
     }
-    print(f"\nmanifest timings: "
+    print(f"\nmanifest stages: {run.manifest.stages}")
+    print(f"manifest timings: "
           f"{ {t.stage: round(t.seconds, 1) for t in run.manifest.timings} }")
     print(f"manifest warnings: {run.manifest.warnings}")
-    assert any("FAKED" in w for w in run.manifest.warnings), (
-        "a faked ablation stage must be recorded in the manifest"
+    print(f"base_rates: control_fraction={run.report.base_rates['control_fraction']}, "
+          f"injection_modes={run.report.base_rates['injection_modes']}, "
+          f"per_error_injection_counts={run.report.base_rates['per_error_injection_counts']}")
+    assert run.report.base_rates["injection_modes"], (
+        "no injection mode was recorded — the report cannot say how errors were planted"
     )
+    assert run.split.strata, "the split records no strata — it is not provenance-based"
+
+    faked = [w for w in run.manifest.warnings if "FAKED" in w]
+    if args.engine_only:
+        assert faked, "--engine-only uses the stand-in ablation stage and must say so"
+        print(f"  --engine-only: FAKED warning present as expected — {faked}")
+    else:
+        # THE signal that this run was real. Every stand-in in the assembly
+        # sets it, so its absence is not something that can be arranged.
+        assert not faked, f"a stage was faked: {faked}"
+        assert run.manifest.stages["ablation"] == "benchmark.ablation.engine.run_ablation", (
+            f"the manifest records {run.manifest.stages['ablation']!r} as the ablation stage"
+        )
+        print("  no FAKED warning — every stage in this run was the real one")
     print("PASS — BenchmarkReport, markdown summary and manifest written with lineage")
 
     # --------------------------------------------------------------- gate 5
@@ -437,11 +529,21 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
 
     banner(f"PHASE 7 SMOKE OK — every gate green ({elapsed:.1f}s wall clock)")
     print(f"artifacts under {run.run_dir}")
-    print(
-        "\nREMINDER: the ablation stage was FAKED. Scores here are evidence about "
-        "wiring, not about the Engine. Swap in benchmark.ablation.run_ablation "
-        "(one line, see this script's header) once Phase 5 merges."
-    )
+    print("\nper-stage seconds (the basis for the submission-run estimate):")
+    for timing in run.manifest.timings:
+        print(f"  {timing.stage:<12} {timing.seconds:8.1f}s")
+    if args.engine_only:
+        print(
+            "\nREMINDER: --engine-only replayed stored traces and FAKED the ablation "
+            "stage. This proves the Engine/scoring/report seams only."
+        )
+    else:
+        print(
+            "\nThis was a fully integrated run: real generation, real harness, real "
+            "ablation, real Engine. The numbers are still miniature-scale — seven "
+            "inputs is a wiring corpus, not a measurement — but nothing in the chain "
+            "was a stand-in."
+        )
     return 0
 
 

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from benchmark.pipeline.export import ExportLeak, assert_export_file_clean
+from benchmark.pipeline.export import ExportLeak, assert_export_file_clean, export_traces
 from benchmark.pipeline.manifest import ArtifactPaths, RunManifest
 from benchmark.pipeline.scoring import score_engine_delta
 from benchmark.schemas import BenchmarkReport, Issueboard, ScoringConfig, TraceDataset
@@ -108,7 +108,7 @@ def check_deliverables(
 
     def trace_file_scale() -> str:
         payload = json.loads((run_dir / paths.engine_input).read_text())
-        traces = payload.get("traces", [])
+        traces = export_traces(payload)
         if len(traces) < min_traces:
             raise AssertionError(
                 f"{paths.engine_input} carries {len(traces)} traces, the deliverable "
@@ -118,7 +118,8 @@ def check_deliverables(
 
     def trace_file_schema() -> str:
         payload = assert_export_file_clean(run_dir / paths.engine_input)
-        return f"{len(payload['traces'])} traces parse as Trace and name no ground truth"
+        n = len(export_traces(payload))
+        return f"{n} traces parse as Trace and name no ground truth"
 
     def issueboard_in() -> str:
         board = _load(Issueboard, run_dir / paths.seed_issueboard)
