@@ -29,6 +29,20 @@
                 python -m benchmark.pipeline run \\
                     --config configs/pipeline/mini.yaml \\
                     --fake-harness --fake-ablation --fake-engine
+
+            `--resume <run_dir>` picks a killed run back up. Each of
+            generation / harness / ablation / engine is skipped when that
+            directory already holds its artifacts AND they are the ones this
+            config would have produced; everything else runs, and scoring and
+            rendering always do. Skipped stages print
+            `↻ stage (resumed from disk)` and are named in the manifest and the
+            report header. A config that does not match the directory's own
+            record of itself is refused outright rather than mixed into it —
+            see benchmark/pipeline/resume.py.
+
+                python -m benchmark.pipeline run \\
+                    --config configs/pipeline/submission.yaml \\
+                    --resume data/pipeline/submission
 * `score` — the standalone scoring entrypoint: re-runs `score()` over a
             finished run's artifacts, reading nothing but files.
 * `check` — the assignment-deliverables checklist over a finished run.
@@ -53,6 +67,7 @@ from benchmark.pipeline.fakes import (
     fake_run_ablation,
 )
 from benchmark.pipeline.progress import Progress
+from benchmark.pipeline.resume import ResumeMismatch
 from benchmark.pipeline.runner import run_pipeline
 from benchmark.pipeline.servers import ServerLifetime
 
@@ -105,6 +120,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="a canned issueboard instead of the Engine server (benchmark.pipeline.fakes)",
     )
     run.add_argument(
+        "--resume",
+        metavar="RUN_DIR",
+        help=(
+            "reuse a previous run's artifacts. Each of generation/harness/ablation/engine "
+            "is skipped when RUN_DIR already holds its artifacts AND they are the ones "
+            "this config would have produced; everything else runs. Scoring and rendering "
+            "always re-run. Hard-fails if the config does not match RUN_DIR's own record "
+            "of itself"
+        ),
+    )
+    run.add_argument(
         "--quiet",
         action="store_true",
         help="suppress stage-progress lines on stderr (banners, heartbeats, per-item counts)",
@@ -126,6 +152,18 @@ def _cmd_run(args) -> int:
 
     cfg = load_pipeline_config(config_path)
     overrides = {}
+    if args.resume:
+        # `--resume` takes a run DIRECTORY, which is `<artifacts_root>/<run_id>`.
+        # Splitting it back into those two fields is what makes the rest of the
+        # pipeline — every `cfg.run_dir` in the runner — point at it, with no
+        # second notion of "where the artifacts are" to keep in sync.
+        # `main()` has already refused the combination with --run-id/--artifacts-root.
+        resume_dir = Path(args.resume).resolve()
+        if not resume_dir.is_dir():
+            print(f"BLOCKED: --resume {args.resume} is not a directory", file=sys.stderr)
+            return 3
+        overrides["artifacts_root"] = str(resume_dir.parent)
+        overrides["run_id"] = resume_dir.name
     if args.run_id:
         overrides["run_id"] = args.run_id
     if args.artifacts_root:
@@ -196,15 +234,22 @@ def _cmd_run(args) -> int:
 
     servers = ServerLifetime(cfg.root, managed, enabled=not args.no_serve)
     progress = Progress(quiet=args.quiet)
-    run = run_pipeline(
-        cfg,
-        ablation_stage=stage,
-        engine_invoker=engine_invoker,
-        harness_factory=harness_factory,
-        expander=expander,
-        servers=servers,
-        progress=progress,
-    )
+    try:
+        run = run_pipeline(
+            cfg,
+            ablation_stage=stage,
+            engine_invoker=engine_invoker,
+            harness_factory=harness_factory,
+            expander=expander,
+            servers=servers,
+            progress=progress,
+            resume=bool(args.resume),
+        )
+    except ResumeMismatch as exc:
+        # Never a traceback: this is a user-facing "you pointed it at the wrong
+        # directory", and the message already names the hashes that differ.
+        print(f"BLOCKED: {exc}", file=sys.stderr)
+        return 3
 
     print(run.markdown)
     print(f"artifacts: {run.run_dir}")
@@ -230,6 +275,14 @@ def _cmd_check(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "resume", None) and (args.run_id or args.artifacts_root):
+        # `--resume` sets both of those from the directory it is given. Letting
+        # a second source of truth win would resume artifacts out of one
+        # directory and write the report into another.
+        parser.error(
+            "--resume already determines the run directory (and with it --run-id and "
+            "--artifacts-root); pass one or the other, not both"
+        )
     if getattr(args, "fake_harness", False) and not args.fake_ablation:
         # The two fakes are not independent. `--fake-harness` alone leaves the
         # REAL benchmark.ablation.run_ablation driving the stand-in harness,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import random
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,7 @@ from benchmark.pipeline.manifest import (
 )
 from benchmark.pipeline.progress import Progress
 from benchmark.pipeline.render import render_markdown
+from benchmark.pipeline.resume import ResumeState
 from benchmark.pipeline.scoring import ScoredBoard, score_engine_delta
 from benchmark.pipeline.servers import ServerLifetime
 from benchmark.schemas import (
@@ -319,6 +321,7 @@ def run_pipeline(
     judge: DescriptionJudge | None = None,
     artifact_paths: ArtifactPaths | None = None,
     progress: Progress | None = None,
+    resume: bool = False,
 ) -> PipelineRun:
     """Configs -> BenchmarkReport, with every artifact and its lineage on disk.
 
@@ -330,6 +333,17 @@ def run_pipeline(
     `progress` defaults to a live `Progress()` (stderr, timestamped, on) so the
     CLI is followable out of the box; pass `Progress(quiet=True)` to silence it
     or a stream-backed one to capture it. It never writes to an artifact.
+
+    `resume=True` (the CLI's `--resume <run_dir>`) lets each expensive stage
+    load its artifacts from `cfg.run_dir` instead of executing, when they are
+    already there and are the artifacts THIS config would have produced. See
+    `benchmark.pipeline.resume`, which owns every one of those decisions —
+    including the hard failure when the config does not describe the directory.
+    Scoring and rendering always re-run: they cost seconds, and re-running them
+    is what makes a resumed run's report describe the code that is running now.
+
+    Checkpoints are written whether or not `resume` is set. The run that needs
+    resuming is by definition the one that was not started with the flag.
     """
     timings: list[StageTiming] = []
     warnings: list[str] = []
@@ -337,6 +351,12 @@ def run_pipeline(
     progress = progress or Progress()
 
     artifacts = RunArtifacts(cfg.run_dir, artifact_paths)
+    checkpoints = ResumeState(
+        cfg.run_dir, artifacts.paths, enabled=resume, progress=progress
+    )
+    # Before anything is written: a config that does not match this directory
+    # must not get as far as overwriting the directory's own record of itself.
+    checkpoints.assert_same_run(cfg)
     artifacts.write_json("pipeline_config", cfg.model_dump(mode="json"))
 
     categories: list[ErrorCategory] = load_taxonomy(cfg.resolve(cfg.taxonomy))
@@ -350,14 +370,17 @@ def run_pipeline(
     servers = servers or ServerLifetime(cfg.root, {}, enabled=False)
 
     # ------------------------------------------------------- Stage I: inputs
-    with progress.stage("generation") as stg, stage_timer("generation", timings):
-        generation_cfg = load_generation_config(cfg.resolve(cfg.generation_config))
-        inputs = generate_inputs(
-            generation_cfg, expander, cache_dir=cfg.resolve(cfg.expansion_cache)
-        )
-        inputs = slice_inputs(inputs, cfg)
-        stg.set_detail(f"{len(inputs.inputs)} inputs, dataset_id={inputs.dataset_id[:12]}")
-    artifacts.write_model("inputs", inputs)
+    inputs = checkpoints.try_generation(cfg)
+    if inputs is None:
+        with progress.stage("generation") as stg, stage_timer("generation", timings):
+            generation_cfg = load_generation_config(cfg.resolve(cfg.generation_config))
+            inputs = generate_inputs(
+                generation_cfg, expander, cache_dir=cfg.resolve(cfg.expansion_cache)
+            )
+            inputs = slice_inputs(inputs, cfg)
+            stg.set_detail(f"{len(inputs.inputs)} inputs, dataset_id={inputs.dataset_id[:12]}")
+        artifacts.write_model("inputs", inputs)
+        checkpoints.record("generation", inputs_dataset_id=inputs.dataset_id)
     log.info("inputs: %s specs, dataset_id=%s", len(inputs.inputs), inputs.dataset_id)
 
     target_app = load_target_app_config(cfg.resolve(cfg.target_app_config))
@@ -368,42 +391,89 @@ def run_pipeline(
     export_path = artifacts.claim("engine_input")
 
     # ------------ Stages II + III: ONE target-app server lifetime, in order --
-    with servers.running("target_app"):
-        n_inputs = len(inputs.inputs)
+    resumed_batch = checkpoints.try_harness(inputs, store)
+    # Both stages resumed means nothing in this run talks to the target app, so
+    # the server is not started at all — which is most of the point of a resume
+    # that only needs the Engine re-run. Decided BEFORE the harness stage rather
+    # than around it, because the server lifetime has to span both stages: the
+    # ablation stage's Mode-A replay forks a thread the batch created, and
+    # `langgraph dev` loses thread state on restart.
+    resumed_ablation = (
+        checkpoints.try_ablation(resumed_batch[1], export_path)
+        if resumed_batch is not None
+        else None
+    )
+    app_lifetime = (
+        nullcontext()
+        if resumed_batch is not None and resumed_ablation is not None
+        else servers.running("target_app")
+    )
 
-        def _harness_done() -> int:
-            stats = harness.stats
-            return sum(stats.get(k, 0) for k in ("ran", "skipped", "quarantined"))
+    with app_lifetime:
+        if resumed_batch is not None:
+            outputs, traces = resumed_batch
+        else:
+            n_inputs = len(inputs.inputs)
 
-        with progress.stage("harness") as stg:
-            with progress.poll("harness batch", _harness_done, n_inputs, interval=2.0):
-                with stage_timer("harness", timings):
-                    outputs, traces = harness.run_batch(inputs)
-            stg.set_detail(f"{len(traces.traces)} traces, stats={harness.stats}")
-        artifacts.write_model("outputs", outputs)
-        artifacts.write_model("traces", traces)
+            def _harness_done() -> int:
+                stats = harness.stats
+                return sum(stats.get(k, 0) for k in ("ran", "skipped", "quarantined"))
+
+            with progress.stage("harness") as stg:
+                with progress.poll("harness batch", _harness_done, n_inputs, interval=2.0):
+                    with stage_timer("harness", timings):
+                        outputs, traces = harness.run_batch(inputs)
+                stg.set_detail(f"{len(traces.traces)} traces, stats={harness.stats}")
+            artifacts.write_model("outputs", outputs)
+            artifacts.write_model("traces", traces)
+            checkpoints.record(
+                "harness",
+                inputs_dataset_id=inputs.dataset_id,
+                outputs_dataset_id=outputs.dataset_id,
+                traces_dataset_id=traces.dataset_id,
+                stats=dict(getattr(harness, "stats", {}) or {}),
+                implementation=_qualname(harness),
+                # Recorded so that resuming cannot launder a faked run into a
+                # clean-looking one: this process has no way to tell, from the
+                # artifacts alone, that they came from a stand-in.
+                faked=_is_faked(harness),
+            )
         log.info("traces: %s collected, harness stats=%s", len(traces.traces), harness.stats)
 
-        # `run_ablation`'s signature is pinned (benchmark/pipeline/contracts.py)
-        # and exposes no progress callback or partial-result hook, so this
-        # stage only gets a banner — there is no clean per-error signal to
-        # poll the way `harness.stats` gives the batch one.
-        with progress.stage("ablation") as stg, stage_timer("ablation", timings):
-            result = assert_ablation_result(
-                ablation_stage(
-                    traces=traces,
-                    inputs=inputs,
-                    categories=categories,
-                    cfg=cfg.ablation,
-                    harness=harness,
-                    store=store,
-                    export_path=export_path,
+        # The ablation resume could only be attempted above when the harness
+        # itself resumed; a harness that re-ran produces fresh traces, so the
+        # lineage check gets the dataset that actually exists now.
+        if resumed_ablation is None:
+            resumed_ablation = checkpoints.try_ablation(traces, export_path)
+
+        if resumed_ablation is not None:
+            # Checked against the pinned contract exactly as a live result is:
+            # an artifact set rebuilt from disk crosses the same seam, and
+            # skipping the check for it would leave the one path nobody looks at
+            # as the only unguarded one.
+            result: Any = assert_ablation_result(resumed_ablation)
+        else:
+            # `run_ablation`'s signature is pinned
+            # (benchmark/pipeline/contracts.py) and exposes no progress callback
+            # or partial-result hook, so this stage only gets a banner — there
+            # is no clean per-error signal to poll the way `harness.stats` gives
+            # the batch one.
+            with progress.stage("ablation") as stg, stage_timer("ablation", timings):
+                result = assert_ablation_result(
+                    ablation_stage(
+                        traces=traces,
+                        inputs=inputs,
+                        categories=categories,
+                        cfg=cfg.ablation,
+                        harness=harness,
+                        store=store,
+                        export_path=export_path,
+                    )
                 )
-            )
-            stg.set_detail(
-                f"{len(result.records)} records, {len(result.ground_truth.issues)} "
-                f"ground-truth issue(s)"
-            )
+                stg.set_detail(
+                    f"{len(result.records)} records, {len(result.ground_truth.issues)} "
+                    f"ground-truth issue(s)"
+                )
 
     ablated: TraceDataset = result.ablated
     # Idempotent (the hash excludes the id field itself): stamping a board that
@@ -412,12 +482,25 @@ def run_pipeline(
     ground_truth: Issueboard = stamp_dataset_id(result.ground_truth)
     records: list[AblationRecord] = list(result.records)
     split: AblationSplit = result.split
-    artifacts.write_model("ablated_traces", ablated)
-    artifacts.write_model("ablation_split", split)
-    artifacts.write_json(
-        "ablation_records", [r.model_dump(mode="json") for r in records]
-    )
-    artifacts.write_model("ground_truth_issueboard", ground_truth)
+    if resumed_ablation is None:
+        artifacts.write_model("ablated_traces", ablated)
+        artifacts.write_model("ablation_split", split)
+        artifacts.write_json(
+            "ablation_records", [r.model_dump(mode="json") for r in records]
+        )
+        artifacts.write_model("ground_truth_issueboard", ground_truth)
+        # Recorded only after every artifact is on disk — including the export,
+        # which the stage itself writes. A checkpoint that outran its artifacts
+        # is the one failure this file cannot recover from.
+        checkpoints.record(
+            "ablation",
+            traces_dataset_id=traces.dataset_id,
+            ablated_dataset_id=ablated.dataset_id,
+            ground_truth_board_id=ground_truth.board_id,
+            dropped_errors=list(result.dropped_errors),
+            implementation=_qualname(ablation_stage),
+            faked=_is_faked(ablation_stage) or _is_faked(result),
+        )
     if result.dropped_errors:
         warnings.append(
             f"the ablation stage dropped {len(result.dropped_errors)} proposed error(s): "
@@ -450,47 +533,74 @@ def run_pipeline(
     n_traces = len(ablated.traces)
     concurrency = max(1, cfg.engine.analysis_concurrency)
     projected_batches = -(-n_traces // concurrency)  # ceil division
-    try:
-        with servers.running("engine"), progress.stage("engine") as stg:
-            progress.note(
-                f"    engine: {n_traces} trace(s), analysis_concurrency={concurrency}, "
-                f"~{projected_batches} batch(es) projected"
-            )
-            with (
-                stage_timer("engine", timings),
-                progress.heartbeat(f"engine run ({cfg.engine.model})", interval=30.0),
-            ):
-                invocation = engine_invoker(
-                    trace_file=written_export,
-                    seed_board=seed_board,
-                    categories=categories,
-                    engine=cfg.engine,
+    resumed_engine = checkpoints.try_engine(ablated)
+    if resumed_engine is not None:
+        invocation = resumed_engine
+        predicted = invocation.board
+    else:
+        try:
+            with servers.running("engine"), progress.stage("engine") as stg:
+                progress.note(
+                    f"    engine: {n_traces} trace(s), analysis_concurrency={concurrency}, "
+                    f"~{projected_batches} batch(es) projected"
                 )
-            stg.set_detail(
-                f"{len(invocation.board.issues)} issue(s), "
-                f"{len(invocation.board.occurrences)} occurrence(s), "
-                f"{invocation.seconds:.0f}s server time"
-            )
-    except EngineRunFailed as exc:
-        # The run is lost; the response must not be. A full-scale pass is
-        # ~25 minutes of model time, and "it did not validate" is unactionable
-        # without the payload that did not validate.
-        if exc.raw_output is not None:
-            path = artifacts.write_json("engine_raw_output", exc.raw_output)
-            log.error("engine run failed; its raw output is at %s", path)
-        raise
+                with (
+                    stage_timer("engine", timings),
+                    progress.heartbeat(f"engine run ({cfg.engine.model})", interval=30.0),
+                ):
+                    invocation = engine_invoker(
+                        trace_file=written_export,
+                        seed_board=seed_board,
+                        categories=categories,
+                        engine=cfg.engine,
+                    )
+                stg.set_detail(
+                    f"{len(invocation.board.issues)} issue(s), "
+                    f"{len(invocation.board.occurrences)} occurrence(s), "
+                    f"{invocation.seconds:.0f}s server time"
+                )
+        except EngineRunFailed as exc:
+            # The run is lost; the response must not be. A full-scale pass is
+            # ~25 minutes of model time, and "it did not validate" is
+            # unactionable without the payload that did not validate.
+            if exc.raw_output is not None:
+                path = artifacts.write_json("engine_raw_output", exc.raw_output)
+                log.error("engine run failed; its raw output is at %s", path)
+            raise
 
-    # Idempotent re-stamp: the Engine's board_id is its own label, computed over
-    # a model that has no `injection_mode` field, and is not byte-compatible
-    # with ours. Never compared for equality — replaced.
-    predicted = stamp_dataset_id(invocation.board)
-    artifacts.write_model("predicted_issueboard", predicted)
-    artifacts.write_json("engine_raw_output", invocation.raw_output)
+        # Idempotent re-stamp: the Engine's board_id is its own label, computed
+        # over a model that has no `injection_mode` field, and is not
+        # byte-compatible with ours. Never compared for equality — replaced.
+        predicted = stamp_dataset_id(invocation.board)
+        artifacts.write_model("predicted_issueboard", predicted)
+        artifacts.write_json("engine_raw_output", invocation.raw_output)
+        checkpoints.record(
+            "engine",
+            ablated_dataset_id=ablated.dataset_id,
+            predicted_board_id=predicted.board_id,
+            trace_count=invocation.trace_count,
+            seconds=invocation.seconds,
+            thread_id=invocation.thread_id,
+            recorded_models=invocation.recorded_models,
+            implementation=_qualname(engine_invoker),
+            faked=_is_faked(engine_invoker),
+        )
 
     # Comparison integrity: what the SERVER recorded, not what we sent. A run
     # config LangGraph declined to inject looks exactly like a successful one.
     requested = cfg.engine.model
-    if invocation.recorded_models is None:
+    if resumed_engine is not None:
+        # The check belongs to the process that made the call. This one did
+        # not, and re-asserting the original run's finding as if it were ours
+        # would be exactly the kind of unearned confirmation the check exists
+        # to prevent. Said out loud instead, in the report and the manifest.
+        warnings.append(
+            f"the engine stage was resumed from disk, so {requested!r} is what the loaded "
+            f"board was ASKED for; the server-side model confirmation belongs to the "
+            f"original run "
+            f"(recorded then: {checkpoints.checkpoints()['engine'].get('recorded_models')})"
+        )
+    elif invocation.recorded_models is None:
         # Unreadable records: a server/SDK capability gap, not evidence of a
         # swap. The run stands, but the report must not claim a confirmation
         # it does not have.
@@ -527,8 +637,27 @@ def run_pipeline(
     # A stage wrapped in a closure loses its own identity; its RESULT does not.
     if "ablation" not in faked and _is_faked(result):
         faked = sorted([*faked, "ablation"])
+    # A RESUMED stage was not executed by this process, so what this process
+    # happens to be wired with says nothing about it — and, crucially, the
+    # artifacts on disk carry no mark of having come from a stand-in. The
+    # checkpoint does. Without this, resuming a `--fake-*` run would quietly
+    # launder it into a report with no FAKED warning at all.
+    for stage, key in (
+        ("harness", "harness"),
+        ("ablation", "ablation"),
+        ("engine", "engine_invoker"),
+    ):
+        if not checkpoints.resumed(stage):
+            continue
+        entry = checkpoints.checkpoints().get(stage) or {}
+        implementations[key] = f"{entry.get('implementation') or 'unknown'} (resumed from disk)"
+        if entry.get("faked") and key not in faked:
+            faked = sorted([*faked, key])
     if faked:
         warnings.insert(0, _fake_warning(faked, implementations))
+    resume_warning = checkpoints.warning()
+    if resume_warning:
+        warnings.insert(0, resume_warning)
 
     # ---------------------------------------------------------- Stage V: score
     with progress.stage("scoring") as stg, stage_timer("scoring", timings):
@@ -599,9 +728,13 @@ def run_pipeline(
         models={
             "engine": cfg.engine.model,
             # "unreadable" rather than "" so the manifest distinguishes a
-            # readback that could not happen from one that came back empty.
+            # readback that could not happen from one that came back empty —
+            # and "resumed" so it never claims a confirmation this process did
+            # not obtain (the original run's finding is on the checkpoint).
             "engine_recorded": (
-                "unreadable"
+                "resumed (not re-verified by this process)"
+                if resumed_engine is not None
+                else "unreadable"
                 if invocation.recorded_models is None
                 else ",".join(invocation.recorded_models)
             ),
@@ -632,8 +765,16 @@ def run_pipeline(
         timings=timings,
         artifacts=artifacts.paths,
         stages=implementations,
-        harness_stats=dict(getattr(harness, "stats", {}) or {}),
+        # A resumed harness never ran, so its live `stats` are all zeros; the
+        # numbers that describe this corpus are the ones the batch recorded.
+        harness_stats=(
+            checkpoints.harness_stats
+            if checkpoints.resumed("harness")
+            else dict(getattr(harness, "stats", {}) or {})
+        ),
         dropped_errors=list(result.dropped_errors),
+        resumed_stages=list(checkpoints.loaded),
+        resume_notes=list(checkpoints.notes),
         warnings=warnings,
     )
 

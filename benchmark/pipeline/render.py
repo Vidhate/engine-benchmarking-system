@@ -98,6 +98,16 @@ def render_markdown(
             lines.append(f"**Run started**: {manifest.created_at.isoformat()}  ")
         for stage, implementation in sorted(manifest.stages.items()):
             lines.append(f"**{stage} stage**: `{implementation}`  ")
+        if manifest.resumed_stages:
+            # In the header, next to the stage implementations, because it is
+            # the same kind of fact: it says which parts of this report were
+            # produced by the process that wrote it. The Runtime table below
+            # lists timings only for the stages that actually ran, and without
+            # this line a reader would read those gaps as zero-cost stages.
+            lines.append(
+                f"**Resumed from disk**: {', '.join(manifest.resumed_stages)} — loaded from "
+                f"a previous run's artifacts, not executed here (no timings below)  "
+            )
     lines.append("")
 
     warnings = list(manifest.warnings) if manifest else []

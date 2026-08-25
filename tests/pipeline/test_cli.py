@@ -235,6 +235,91 @@ def test_the_fake_flags_run_the_whole_pipeline_offline(tmp_path):
     assert "FAKE" in proc.stderr
 
 
+# ------------------------------------------------------------------ --resume
+
+def test_resume_points_the_run_at_the_directory_it_is_given(spy, tmp_path):
+    run_dir = tmp_path / "arm-a"
+    run_dir.mkdir()
+    cli.main(["run", "--config", MINI, "--fake-ablation", "--resume", str(run_dir)])
+    assert spy[0]["cfg"].run_dir == run_dir
+    assert spy[0]["resume"] is True
+
+
+def test_a_run_without_resume_does_not_ask_for_one(spy):
+    cli.main(["run", "--config", MINI, "--fake-ablation"])
+    assert spy[0]["resume"] is False
+
+
+def test_resume_refuses_to_share_the_wheel_with_run_id_or_artifacts_root(tmp_path):
+    """Both would name the run directory, and the loser is silent."""
+    for extra in (["--run-id", "x"], ["--artifacts-root", str(tmp_path)]):
+        with pytest.raises(SystemExit):
+            cli.main(["run", "--config", MINI, "--resume", str(tmp_path), *extra])
+
+
+def test_resume_needs_a_directory_that_exists(spy, tmp_path):
+    assert cli.main(["run", "--config", MINI, "--fake-ablation",
+                     "--resume", str(tmp_path / "nope")]) == 3
+    assert spy == [], "the pipeline started against a directory that is not there"
+
+
+def test_a_mismatched_resume_is_a_blocked_message_not_a_traceback(spy, monkeypatch, capsys):
+    from benchmark.pipeline.resume import ResumeMismatch
+
+    def refusing(cfg, **kwargs):
+        raise ResumeMismatch("the config does not describe this run directory")
+
+    monkeypatch.setattr(cli, "run_pipeline", refusing)
+    run_dir = REPO_ROOT / "configs"  # any existing directory
+    assert cli.main(["run", "--config", MINI, "--fake-ablation", "--resume", str(run_dir)]) == 3
+    assert "BLOCKED" in capsys.readouterr().err
+
+
+def test_the_offline_run_can_be_resumed_end_to_end(tmp_path):
+    """The demo, as a terminal would do it: one offline run, then a resume of
+    the same directory, with the skips visible in the progress output."""
+    env = {
+        **os.environ,
+        "OPENAI_API_KEY": "",
+        "LANGSMITH_API_KEY": "",
+        "LANGSMITH_TRACING": "false",
+    }
+    fakes = ["--fake-harness", "--fake-ablation", "--fake-engine"]
+    first = subprocess.run(
+        [
+            sys.executable, "-m", "benchmark.pipeline", "run",
+            "--config", MINI, *fakes,
+            "--artifacts-root", str(tmp_path), "--run-id", "offline",
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True, env=env, timeout=600,
+    )
+    assert first.returncode == 0, f"stdout:\n{first.stdout}\n\nstderr:\n{first.stderr}"
+    run_dir = tmp_path / "offline"
+    assert (run_dir / "stage_checkpoints.json").exists()
+    # The first run executed every stage: no resume banners at all.
+    assert "↻" not in first.stderr
+
+    second = subprocess.run(
+        [
+            sys.executable, "-m", "benchmark.pipeline", "run",
+            "--config", MINI, *fakes, "--resume", str(run_dir),
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True, env=env, timeout=600,
+    )
+    assert second.returncode == 0, f"stdout:\n{second.stdout}\n\nstderr:\n{second.stderr}"
+    for stage in ("generation", "harness", "ablation", "engine"):
+        assert f"↻ {stage} (resumed from disk)" in second.stderr, second.stderr
+    # …and the stages that are never resumable still ran.
+    assert "▶ scoring" in second.stderr
+    assert "▶ render/deliverables" in second.stderr
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["resumed_stages"] == ["generation", "harness", "ablation", "engine"]
+    assert "Resumed from disk" in (run_dir / "report.md").read_text()
+    # The FAKED warning survives the resume — the artifacts alone do not carry it.
+    assert [w for w in manifest["warnings"] if "FAKED" in w]
+
+
 def test_a_failing_deliverable_makes_the_run_exit_nonzero(spy, monkeypatch):
     from benchmark.pipeline.deliverables import DeliverableCheck
 

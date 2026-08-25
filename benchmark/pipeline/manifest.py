@@ -52,6 +52,11 @@ class ArtifactPaths(BaseModel):
     summary: str = "report.md"
     deliverables: str = "deliverables.json"
     manifest: str = "manifest.json"
+    #: Which stages have completed, and what each consumed and produced. Written
+    #: incrementally, stage by stage, so a run that dies leaves a usable record;
+    #: read only by `--resume` (benchmark/pipeline/resume.py). Not a dataset and
+    #: not a deliverable — an interrupted run's bookmark.
+    stage_checkpoints: str = "stage_checkpoints.json"
 
 
 class RunManifest(BaseModel):
@@ -69,6 +74,14 @@ class RunManifest(BaseModel):
     stages: dict[str, str] = Field(default_factory=dict)
     harness_stats: dict[str, int] = Field(default_factory=dict)
     dropped_errors: list[str] = Field(default_factory=list)
+    #: Stages this run loaded from disk instead of executing (`--resume`), in
+    #: pipeline order. A resumed run's timings describe the stages that actually
+    #: ran, so a reader needs this list to know which numbers are missing — and
+    #: which artifacts were produced by an earlier process.
+    resumed_stages: list[str] = Field(default_factory=list)
+    #: One line per resumable stage: resumed (and why it matched) or re-run (and
+    #: why it did not). Present only on a `--resume` run.
+    resume_notes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
     @property
