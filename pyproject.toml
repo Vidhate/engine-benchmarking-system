@@ -11,6 +11,14 @@ dependencies = [
     # backend (see docs/execution-plan.md, "Tracing backend").
     "langgraph-sdk>=0.4",
     "langsmith>=0.11",
+    # Benchmark-side LLM transport (the ablation agent and the prompt expander).
+    # Not a tracing coupling: it buys bounded retries with 429 backoff and a real
+    # per-request timeout, which hand-rolled urllib gave us neither of. Every
+    # call site wraps its invocation in `langsmith.tracing_context(enabled=False)`
+    # and passes empty callbacks, so these calls emit NO LangSmith runs — see
+    # tests/test_tracing_boundary.py, which allowlists exactly the two files and
+    # asserts the suppression is there.
+    "langchain-openai>=0.3",
     # Phase 7 pipeline: the Engine invocation is one blocking request spanning
     # the whole pass, so it must pass its own httpx.Timeout (the SDK default
     # read timeout is 300s). Imported directly, so declared directly.

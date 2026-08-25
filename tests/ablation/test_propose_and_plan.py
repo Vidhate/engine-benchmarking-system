@@ -7,6 +7,7 @@ import pytest
 from benchmark.ablation.agent import BEHAVIOR_VOCABULARY, ScriptedAblationAgent
 from benchmark.ablation.plan import mode_preconditions, plan_ablation, rotate_behavior
 from benchmark.ablation.propose import (
+    DEFAULT_MIN_PER_MODE,
     allowed_modes,
     available_shims,
     build_digest,
@@ -109,7 +110,10 @@ def test_the_agent_is_only_offered_the_modes_the_app_supports(
     store, traces, categories, target_cfg
 ):
     agent = ScriptedAblationAgent({})
-    propose_errors(store, [t.trace_id for t in traces.traces], categories, 2, target_cfg, agent)
+    propose_errors(
+        store, [t.trace_id for t in traces.traces], categories, 2, target_cfg, agent,
+        min_per_mode={},
+    )
     assert agent.propose_calls == [(c.category_id, 2) for c in categories]
 
 
@@ -207,8 +211,12 @@ class _ExplodingAgent:
 
 
 def _propose(agent, store, traces, categories, cfg):
+    # `min_per_mode={}` turns the mode-coverage pass off: these tests are about
+    # the FIRST pass's retry and drop policy, and a second round of calls would
+    # make the call counts below measure two things at once. Coverage has its
+    # own tests further down.
     return propose_errors(
-        store, [t.trace_id for t in traces.traces], categories, 1, cfg, agent
+        store, [t.trace_id for t in traces.traces], categories, 1, cfg, agent, min_per_mode={}
     )
 
 
@@ -340,3 +348,177 @@ def test_a_proposal_with_no_injection_mode_cannot_be_planned():
     proposal.issue.injection_mode = None
     with pytest.raises(ValueError, match="injection_mode"):
         plan_ablation(proposal)
+
+
+# ------------------------------------------------------ step 1: mode coverage
+#
+# Measured need: across two live mini runs the agent proposed `replay_edit` for
+# all seven categories and zero `dependency_fault`. Each category is drafted in
+# its own call with no view of the run's mode balance, and most of a support
+# taxonomy is content-shaped, so that is the natural draw — but the report's
+# content-vs-mechanism half has nothing behind it without both modes.
+
+SHIMLESS = TargetAppConfig(
+    base_url="http://127.0.0.1:2024",
+    assistant_id="target_app",
+    langsmith_project="p",
+    fault_configurable_keys={},
+)
+
+
+def _coverage(agent, store, traces, categories, cfg, n=1):
+    return propose_errors(
+        store, [t.trace_id for t in traces.traces], categories, n, cfg, agent
+    )
+
+
+def test_a_first_pass_with_no_mechanism_error_is_re_prompted_for_one(
+    store, traces, categories, target_cfg
+):
+    """The path the live runs needed: content-only draw -> one narrow re-ask."""
+    agent = ScriptedAblationAgent(
+        {
+            # Each category can draft either, but only the replay_edit one fits
+            # in the n=1 first pass — exactly the live behaviour.
+            c.category_id: [
+                make_proposal(f"c-{c.category_id}", c.category_id, mode="replay_edit"),
+                make_proposal(f"m-{c.category_id}", c.category_id, mode="dependency_fault"),
+            ]
+            for c in categories
+        }
+    )
+    proposals, _digest, dropped = _coverage(agent, store, traces, categories, target_cfg)
+
+    modes = [p.issue.injection_mode for p in proposals]
+    assert modes.count("replay_edit") == len(categories), "the first pass is unchanged"
+    assert modes.count("dependency_fault") >= 1, "the coverage floor was not met"
+    assert not [k for k in dropped if k.endswith("-coverage")], dropped
+
+
+def test_the_coverage_pass_asks_for_the_missing_mode_and_nothing_else(
+    store, traces, categories, target_cfg
+):
+    """The re-prompt narrows `allowed_modes`, which IS the "specifically" part.
+
+    It needs no new agent method: the existing `propose(category, n, digest,
+    allowed_modes)` already carries the restriction, so a scripted agent and
+    the live one both honour it the same way.
+    """
+    seen: list[list[str]] = []
+
+    class ModeRecordingAgent(ScriptedAblationAgent):
+        def propose(self, category, n, digest, allowed_modes):
+            seen.append(list(allowed_modes))
+            return super().propose(category, n, digest, allowed_modes)
+
+    agent = ModeRecordingAgent(
+        {
+            c.category_id: [
+                make_proposal(f"c-{c.category_id}", c.category_id, mode="replay_edit"),
+                make_proposal(f"m-{c.category_id}", c.category_id, mode="dependency_fault"),
+            ]
+            for c in categories
+        }
+    )
+    _coverage(agent, store, traces, categories, target_cfg)
+
+    first_pass = seen[: len(categories)]
+    assert all(set(m) == set(allowed_modes(target_cfg)) for m in first_pass)
+    assert seen[len(categories):], "no coverage call was made"
+    assert all(m == ["dependency_fault"] for m in seen[len(categories):])
+
+
+def test_the_coverage_pass_stops_as_soon_as_the_floor_is_met(
+    store, traces, categories, target_cfg
+):
+    """Bounded cost: one extra call in the ordinary case, not one per category."""
+    agent = ScriptedAblationAgent(
+        {
+            c.category_id: [
+                make_proposal(f"c-{c.category_id}", c.category_id, mode="replay_edit"),
+                make_proposal(f"m-{c.category_id}", c.category_id, mode="dependency_fault"),
+            ]
+            for c in categories
+        }
+    )
+    _coverage(agent, store, traces, categories, target_cfg)
+    assert len(agent.propose_calls) == len(categories) + 1
+
+
+def test_a_first_pass_that_already_covers_both_modes_is_not_re_prompted(
+    store, traces, categories, target_cfg
+):
+    agent = ScriptedAblationAgent(
+        {
+            categories[0].category_id: [
+                make_proposal("m-0", categories[0].category_id, mode="dependency_fault")
+            ],
+            **{
+                c.category_id: [make_proposal(f"c-{c.category_id}", c.category_id)]
+                for c in categories[1:]
+            },
+        }
+    )
+    _coverage(agent, store, traces, categories, target_cfg)
+    assert len(agent.propose_calls) == len(categories), "an unnecessary agent call was spent"
+
+
+def test_a_shimless_app_takes_no_coverage_pass_and_does_not_fail(store, traces, categories):
+    """No declared shim means no fault is injectable — asking would be theatre.
+
+    Locked decision #1: with no shim surface the benchmark degrades to
+    replay_edit-only. That is a documented downgrade, not a failure, so it must
+    not spend calls and must not record a coverage shortfall.
+    """
+    agent = ScriptedAblationAgent(
+        {
+            c.category_id: [
+                make_proposal(f"c-{c.category_id}", c.category_id, mode="replay_edit"),
+                make_proposal(f"m-{c.category_id}", c.category_id, mode="dependency_fault"),
+            ]
+            for c in categories
+        }
+    )
+    assert allowed_modes(SHIMLESS) == ["replay_edit"]
+    proposals, _digest, dropped = _coverage(agent, store, traces, categories, SHIMLESS)
+
+    assert len(agent.propose_calls) == len(categories), "a shimless app was re-prompted"
+    assert {p.issue.injection_mode for p in proposals} == {"replay_edit"}
+    assert dropped == {}, dropped
+
+
+def test_a_corpus_that_cannot_carry_a_mechanism_error_is_reported_not_forced(
+    store, traces, categories, target_cfg
+):
+    """No forced fault. The floor is a target; the shortfall is surfaced."""
+    agent = ScriptedAblationAgent(
+        {c.category_id: [make_proposal(f"c-{c.category_id}", c.category_id)] for c in categories}
+    )
+    proposals, _digest, dropped = _coverage(agent, store, traces, categories, target_cfg)
+
+    assert {p.issue.injection_mode for p in proposals} == {"replay_edit"}
+    assert len(agent.propose_calls) == 2 * len(categories), "every category should be offered"
+    shortfall = dropped.get("dependency_fault-coverage", "")
+    assert "0/1" in shortfall and "one-sided" in shortfall, dropped
+
+
+def test_coverage_proposals_do_not_collide_with_first_pass_error_ids(
+    store, traces, categories, target_cfg
+):
+    """Both passes stamp `E-<category>-NN`; the second must not reuse an index."""
+    agent = ScriptedAblationAgent(
+        {
+            c.category_id: [
+                make_proposal(f"c-{c.category_id}", c.category_id, mode="replay_edit"),
+                make_proposal(f"m-{c.category_id}", c.category_id, mode="dependency_fault"),
+            ]
+            for c in categories
+        }
+    )
+    proposals, _digest, _dropped = _coverage(agent, store, traces, categories, target_cfg)
+    ids = [p.issue.error_id for p in proposals]
+    assert len(ids) == len(set(ids)), ids
+
+
+def test_the_shipped_floor_asks_for_one_mechanism_error():
+    assert DEFAULT_MIN_PER_MODE == {"dependency_fault": 1}

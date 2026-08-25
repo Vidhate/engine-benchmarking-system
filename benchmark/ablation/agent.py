@@ -34,16 +34,41 @@ specifics absent from the doc store — never contradictions of retrievable
 facts. `Corruption.marker` is the unfalsifiable token step-3 validation looks
 for in `T*`, and `retraction_patterns` are the phrases that would mean the app
 took it back downstream.
+
+## Transport: ChatOpenAI, and why it emits no LangSmith runs
+
+The live agent used to speak raw `urllib` at the chat-completions endpoint.
+That worked, and gave us neither of the two things this call actually needs: a
+retry budget (a single 429 during a full-scale ablation dropped a whole error
+category) and a timeout that is not the SDK's 600 s default. `ChatOpenAI`
+brings both for free, so the transport is now its, and only its.
+
+Importing `langchain_openai` here is an exception to the Phase-0 tracing
+boundary (tests/test_tracing_boundary.py), granted to this file by name and to
+`benchmark/generation/expander.py`, and granted on ONE condition: these calls
+must never produce a LangSmith run. LangChain traces by default whenever
+`LANGSMITH_TRACING` is set, and it is set — the harness needs it to collect the
+target app's traces. A benchmark-side proposal call landing in that project
+would pollute the collector's own trace corpus and publish, in a place the
+Engine's operator can read, exactly which errors are about to be injected.
+
+So every invocation goes through `_invoke_untraced`: `tracing_context(enabled
+=False)` for the ambient LangSmith context, and `callbacks: []` in the run
+config so no inherited handler can re-attach one. Both, not either — the
+context flag governs LangChain's own tracer, and the empty callback list
+governs anything a caller might have installed. The boundary test asserts this
+wrapper is present in this file; do not inline a bare `.invoke()`.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import urllib.request
 from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
+from langchain_openai import ChatOpenAI
+from langsmith import tracing_context
 from pydantic import BaseModel, Field, ValidationError
 
 from benchmark.models import ABLATION_AGENT_MODEL
@@ -227,20 +252,46 @@ You are given: one error category, a digest of REAL traces from the app under
 test, and the injection modes available. Draft concrete errors this app could
 genuinely produce — never a generic error list.
 
-Two injection modes:
+Two injection modes. They are EQUALLY IMPORTANT and the benchmark needs both:
+one plants the error in the *content*, the other in the *mechanism*, and a
+report built on only one of them cannot say whether the system under test finds
+errors by reading answers or by reading machinery. Do not treat replay_edit as
+the default.
 
-* replay_edit — you author the corrupted assistant response for one turn, and
-  the app organically regenerates everything after it. Author the corruption
-  around facts the app's document corpus CANNOT refute: invented case or ticket
-  references, fabricated internal specifics, numbers with no source. Do NOT
-  contradict a fact the app can look up again — it will re-search and correct
-  you, and the injection is then not in the trace. Every corruption needs a
-  `marker`: a short, unique, invented literal string (like a case id) that
-  appears verbatim in the replacement and could not appear by chance.
-* dependency_fault — an external dependency is made to misbehave and the whole
-  trace is regenerated with the fault active. Only mechanism-shaped errors:
-  retrieval returning wrong/empty/stale documents, a tool erroring or timing
-  out, a truncated model output.
+* replay_edit — CONTENT-LEVEL. You author the corrupted assistant response for
+  one turn, and the app organically regenerates everything after it. Author the
+  corruption around facts the app's document corpus CANNOT refute: invented
+  case or ticket references, fabricated internal specifics, numbers with no
+  source. Do NOT contradict a fact the app can look up again — it will
+  re-search and correct you, and the injection is then not in the trace. Every
+  corruption needs a `marker`: a short, unique, invented literal string (like a
+  case id) that appears verbatim in the replacement and could not appear by
+  chance.
+* dependency_fault — MECHANISM-LEVEL. An external dependency is made to
+  misbehave and the whole trace is regenerated with the fault active, so the
+  app's own failure is genuine rather than authored. Pick the shim whose
+  misbehaviour would *cause* this category's symptom:
+    - retriever — irrelevant_docs, empty, stale. The app answers from wrong,
+      missing or out-of-date documents.
+    - tool — error, timeout, corrupted_result. A tool call fails or returns
+      garbage and the app has to cope with it.
+    - llm_proxy — truncate_output. The model's own output is cut short.
+  `fault.target` names the concrete span this app actually runs (the digest's
+  `tool_names` and retriever span names are the real vocabulary — use one).
+
+Choosing between them: if the category's symptom is something the app SAYS
+(invented facts, ignored instructions, lost context), replay_edit is the honest
+route. If the symptom is something that happens TO the app (bad documents, a
+broken tool, a cut-off answer), a dependency_fault produces a far more
+realistic trace than authoring the consequence by hand — and the app's real
+reaction to a real fault is exactly what a mechanism-level error should look
+like. When both routes fit the category, prefer dependency_fault: authored
+content is cheap and abundant, genuine mechanism failures are neither.
+
+If only one mode is listed as available, draft in that mode only. If you
+genuinely cannot make the available mode fit this category, return an empty
+"errors" list rather than forcing one — an honest empty draft is better than a
+proposal that cannot be injected.
 
 Also draft a `filter`: 1-3 predicate steps that select traces where this error
 could plausibly exist. Keep it LOOSE — an over-specific filter matches nothing
@@ -293,63 +344,92 @@ Return STRICT JSON only:
 """
 
 
+#: Passed as the run config on every invocation below. An empty callback list
+#: is the second half of the tracing suppression: `tracing_context(enabled=
+#: False)` turns off LangChain's own tracer, and this stops any handler a
+#: caller installed from re-attaching one. See the module docstring.
+NO_TRACING_CONFIG: dict[str, Any] = {"callbacks": []}
+
+
 class OpenAIAblationAgent:
     """Live agent on `ABLATION_AGENT_MODEL`, via the chat completions API.
 
-    Standard library only (urllib), and the network is reached only when a
-    method is actually called — never at import or construction — so pytest
-    collection never triggers a request.
+    The model object is built lazily on first use, and the network is reached
+    only when a method is actually called — never at import or construction —
+    so pytest collection never triggers a request (nor requires a key).
     """
-
-    _ENDPOINT = "https://api.openai.com/v1/chat/completions"
 
     def __init__(
         self,
         model: str = ABLATION_AGENT_MODEL,
         api_key: str | None = None,
         timeout: float = 120.0,
+        max_retries: int = 4,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.timeout = timeout
+        # Four, where the Engine's own transport takes two: the failure this
+        # budget is spent on is a 429, and the ablation stage is the one place
+        # that fans a mid-tier model out across every category at once. A
+        # dropped retry here does not cost a request, it drops the whole
+        # category's proposal — `propose_errors` has nothing to fall back on.
+        self.max_retries = max_retries
+        self._model: ChatOpenAI | None = None
 
-    def _chat(self, system: str, user: str) -> dict:
+    def _client(self) -> ChatOpenAI:
         if not self.api_key:
             raise RuntimeError(
                 "OPENAI_API_KEY not set — required for live OpenAIAblationAgent calls"
             )
-        body = json.dumps(
-            {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "response_format": {"type": "json_object"},
-            }
-        ).encode()
-        request = urllib.request.Request(
-            self._ENDPOINT,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+        if self._model is None:
+            self._model = ChatOpenAI(
+                model=self.model,
+                api_key=self.api_key,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+                # Chat Completions, with the same `response_format` the raw
+                # HTTP body carried: this is a transport swap, and the request
+                # on the wire is meant to be the one that was there before.
+                use_responses_api=False,
+                model_kwargs={"response_format": {"type": "json_object"}},
+            )
+        return self._model
+
+    def _invoke_untraced(self, system: str, user: str) -> str:
+        """The ONLY call path to the model. Never emits a LangSmith run.
+
+        Both suppressions are load-bearing; see the module docstring. If this
+        is ever inlined into a bare `.invoke()`, tests/test_tracing_boundary.py
+        fails, which is the point.
+        """
+        model = self._client()
+        messages = [("system", system), ("user", user)]
+        with tracing_context(enabled=False):
+            reply = model.invoke(messages, config=NO_TRACING_CONFIG)
+        return reply.content
+
+    def _chat(self, system: str, user: str) -> dict:
+        # Resolved BEFORE the try: a missing key raises a plain RuntimeError and
+        # must stay one. Swallowing it into `AgentTransportError` would tell the
+        # caller to retry a call that no amount of retrying can make happen.
+        self._client()
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
-                raw = response.read()
+            content = self._invoke_untraced(system, user)
         except Exception as exc:  # noqa: BLE001 - any transport failure is retryable
+            # Unchanged taxonomy: everything the transport raises is an
+            # `AgentTransportError`. ChatOpenAI has already spent `max_retries`
+            # on the retryable half (429s, dropped connections, 5xx) by the time
+            # anything reaches here, so the caller's own retry is now the second
+            # line rather than the first.
             raise AgentTransportError(f"{type(exc).__name__}: {exc}") from exc
-        try:
-            payload = json.loads(raw)
-            content = payload["choices"][0]["message"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
+        if not isinstance(content, str):
+            # A non-string content block (the SDK's multimodal shape) is the
+            # v0 equivalent of the old "response was not the expected shape".
             raise AgentResponseError(
-                f"the completions response was not the expected shape: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+                f"the completions response was not the expected shape: message content is "
+                f"{type(content).__name__}, not str"
+            )
         try:
             return json.loads(content)
         except ValueError as exc:

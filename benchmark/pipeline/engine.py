@@ -44,6 +44,7 @@ import httpx
 
 from benchmark.pipeline.config import EngineStageConfig
 from benchmark.pipeline.contracts import EngineInvocation
+from benchmark.pipeline.export import export_traces
 from benchmark.schemas import EngineAppConfig, ErrorCategory, Issueboard
 from benchmark.schemas.io import stamp_dataset_id
 
@@ -168,7 +169,7 @@ class LangGraphEngineInvoker:
         trace_file = Path(trace_file).resolve()
         if not trace_file.exists():
             raise FileNotFoundError(f"engine trace file not found: {trace_file}")
-        trace_count = len(json.loads(trace_file.read_text()).get("traces", []))
+        trace_count = len(export_traces(json.loads(trace_file.read_text())))
 
         if self._client is None:
             self._client = self._build_client(engine)

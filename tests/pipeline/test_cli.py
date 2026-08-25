@@ -9,12 +9,15 @@ choice, and the exit codes a CI job would branch on.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
 from benchmark.pipeline import __main__ as cli
 from benchmark.pipeline.contracts import AblationStageUnavailable
-from tests.pipeline.conftest import MINI_PIPELINE_CONFIG
+from tests.pipeline.conftest import MINI_PIPELINE_CONFIG, REPO_ROOT
 
 
 @pytest.fixture
@@ -99,6 +102,222 @@ def test_the_run_id_and_artifacts_root_can_be_overridden(spy, tmp_path):
 def test_overrides_keep_the_repo_root(spy):
     cli.main(["run", "--config", MINI, "--fake-ablation", "--run-id", "x"])
     assert (spy[0]["cfg"].root / "pyproject.toml").exists()
+
+
+def test_each_fake_flag_substitutes_its_own_seam(spy):
+    cli.main(["run", "--config", MINI, "--fake-harness", "--fake-ablation", "--fake-engine"])
+    call = spy[0]
+    assert isinstance(call["harness_factory"], cli.FakeHarnessFactory)
+    assert isinstance(call["engine_invoker"], cli.FakeEngineInvoker)
+    assert isinstance(call["expander"], cli.FakeExpander)
+    assert call["ablation_stage"] is cli.fake_run_ablation
+
+
+def test_fake_engine_alone_leaves_the_other_two_seams_real(spy):
+    """--fake-engine is independent: the harness and the ablation stay real."""
+    cli.main(["run", "--config", MINI, "--fake-engine"])
+    call = spy[0]
+    assert isinstance(call["engine_invoker"], cli.FakeEngineInvoker)
+    assert call["harness_factory"] is None
+    assert call["expander"] is None
+    assert call["ablation_stage"] is not cli.fake_run_ablation
+
+
+def test_a_fake_harness_without_a_fake_ablation_is_refused(capsys):
+    """The one combination that cannot work, refused before anything is paid for.
+
+    `--fake-harness` alone leaves the REAL `benchmark.ablation.run_ablation`
+    driving `FakeHarness`, which implements `run_batch` and nothing else — no
+    `replay`, `run_with_faults`, `turn_boundaries`, `activation_evidence` or
+    `locate_checkpoint`. The run would die on a raw `AttributeError` in the
+    ablation stage, minutes in, with generation and the whole batch already
+    spent.
+    """
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["run", "--config", MINI, "--fake-harness"])
+    assert exit_info.value.code != 0
+
+    message = capsys.readouterr().err
+    assert "--fake-harness requires --fake-ablation" in message
+    # It has to say WHY, and name the way out — a bare "invalid combination"
+    # sends the reader to the source to find out which flag to add.
+    assert "run_with_faults" in message
+    assert "--fake-ablation" in message
+
+
+def test_a_fake_harness_without_a_fake_ablation_never_reaches_the_runner(spy):
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--config", MINI, "--fake-harness", "--fake-engine"])
+    assert spy == [], "the pipeline started despite an unusable flag combination"
+
+
+def test_the_fake_harness_run_starts_no_target_app(spy):
+    """Nothing in an offline run talks to the target app, so none is managed."""
+    cli.main(["run", "--config", MINI, "--fake-harness", "--fake-ablation", "--fake-engine"])
+    assert spy[0]["servers"].describe() == {}
+
+
+def test_the_fake_expander_never_writes_to_the_shared_expansion_cache(spy):
+    """The cache key does not name the expander, so the fake must not share it.
+
+    `(config_hash, kind, dim_id, variation, persona_id, seed)` is the whole
+    key. An offline run pointed at the shared cache would write
+    "[topic/x] please help me with x" under exactly the keys the real expander
+    uses, and the next real run — the timed one — would build its entire input
+    corpus out of them without a word.
+    """
+    cli.main(["run", "--config", MINI, "--fake-harness", "--fake-ablation", "--fake-engine"])
+    cfg = spy[0]["cfg"]
+    assert cfg.resolve(cfg.expansion_cache) == cfg.run_dir / "fake_expansion_cache"
+
+
+def test_a_real_run_keeps_the_shared_expansion_cache(spy):
+    cli.main(["run", "--config", MINI, "--fake-ablation", "--fake-engine"])
+    cfg = spy[0]["cfg"]
+    assert cfg.resolve(cfg.expansion_cache) != cfg.run_dir / "fake_expansion_cache"
+
+
+def test_the_default_run_fakes_nothing(spy):
+    """Every seam is real unless a flag says otherwise."""
+    cli.main(["run", "--config", MINI])
+    call = spy[0]
+    assert call["harness_factory"] is None
+    assert call["engine_invoker"] is None
+    assert call["expander"] is None
+
+
+# ------------------------------------------------- the offline end-to-end run
+
+def test_the_fake_flags_run_the_whole_pipeline_offline(tmp_path):
+    """The exact command a developer types, with no servers, keys or network.
+
+    A subprocess rather than `cli.main(...)`: the claim under test is about the
+    process a terminal starts, and the environment it inherits is half of it.
+    Both API keys are blanked — present-but-empty, so the repo-root `.env` that
+    `load_dotenv` reads cannot put them back — which means any seam that had
+    NOT been faked would fail loudly instead of quietly reaching the network.
+    """
+    env = {
+        **os.environ,
+        "OPENAI_API_KEY": "",
+        "LANGSMITH_API_KEY": "",
+        "LANGSMITH_TRACING": "false",
+    }
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "benchmark.pipeline", "run",
+            "--config", MINI,
+            "--fake-harness", "--fake-ablation", "--fake-engine",
+            "--artifacts-root", str(tmp_path),
+            "--run-id", "offline",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
+
+    run_dir = tmp_path / "offline"
+    for name in ("inputs.json", "raw_traces.json", "ablated_traces.json", "traces.json",
+                 "predicted_issueboard.json", "report.json", "report.md", "manifest.json"):
+        assert (run_dir / name).exists(), f"{name} missing from {run_dir}"
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    faked = [w for w in manifest["warnings"] if "FAKED" in w]
+    assert faked, f"no FAKED warning in {manifest['warnings']}"
+    # All three, named — a run that faked the harness and said only "ablation"
+    # would read as three-quarters real.
+    for stage in ("ablation", "engine_invoker", "harness"):
+        assert stage in faked[0], f"{stage} is faked but the warning does not say so"
+    assert "FAKED" in (run_dir / "report.md").read_text()
+    assert "FAKE" in proc.stderr
+
+
+# ------------------------------------------------------------------ --resume
+
+def test_resume_points_the_run_at_the_directory_it_is_given(spy, tmp_path):
+    run_dir = tmp_path / "arm-a"
+    run_dir.mkdir()
+    cli.main(["run", "--config", MINI, "--fake-ablation", "--resume", str(run_dir)])
+    assert spy[0]["cfg"].run_dir == run_dir
+    assert spy[0]["resume"] is True
+
+
+def test_a_run_without_resume_does_not_ask_for_one(spy):
+    cli.main(["run", "--config", MINI, "--fake-ablation"])
+    assert spy[0]["resume"] is False
+
+
+def test_resume_refuses_to_share_the_wheel_with_run_id_or_artifacts_root(tmp_path):
+    """Both would name the run directory, and the loser is silent."""
+    for extra in (["--run-id", "x"], ["--artifacts-root", str(tmp_path)]):
+        with pytest.raises(SystemExit):
+            cli.main(["run", "--config", MINI, "--resume", str(tmp_path), *extra])
+
+
+def test_resume_needs_a_directory_that_exists(spy, tmp_path):
+    assert cli.main(["run", "--config", MINI, "--fake-ablation",
+                     "--resume", str(tmp_path / "nope")]) == 3
+    assert spy == [], "the pipeline started against a directory that is not there"
+
+
+def test_a_mismatched_resume_is_a_blocked_message_not_a_traceback(spy, monkeypatch, capsys):
+    from benchmark.pipeline.resume import ResumeMismatch
+
+    def refusing(cfg, **kwargs):
+        raise ResumeMismatch("the config does not describe this run directory")
+
+    monkeypatch.setattr(cli, "run_pipeline", refusing)
+    run_dir = REPO_ROOT / "configs"  # any existing directory
+    assert cli.main(["run", "--config", MINI, "--fake-ablation", "--resume", str(run_dir)]) == 3
+    assert "BLOCKED" in capsys.readouterr().err
+
+
+def test_the_offline_run_can_be_resumed_end_to_end(tmp_path):
+    """The demo, as a terminal would do it: one offline run, then a resume of
+    the same directory, with the skips visible in the progress output."""
+    env = {
+        **os.environ,
+        "OPENAI_API_KEY": "",
+        "LANGSMITH_API_KEY": "",
+        "LANGSMITH_TRACING": "false",
+    }
+    fakes = ["--fake-harness", "--fake-ablation", "--fake-engine"]
+    first = subprocess.run(
+        [
+            sys.executable, "-m", "benchmark.pipeline", "run",
+            "--config", MINI, *fakes,
+            "--artifacts-root", str(tmp_path), "--run-id", "offline",
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True, env=env, timeout=600,
+    )
+    assert first.returncode == 0, f"stdout:\n{first.stdout}\n\nstderr:\n{first.stderr}"
+    run_dir = tmp_path / "offline"
+    assert (run_dir / "stage_checkpoints.json").exists()
+    # The first run executed every stage: no resume banners at all.
+    assert "↻" not in first.stderr
+
+    second = subprocess.run(
+        [
+            sys.executable, "-m", "benchmark.pipeline", "run",
+            "--config", MINI, *fakes, "--resume", str(run_dir),
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True, env=env, timeout=600,
+    )
+    assert second.returncode == 0, f"stdout:\n{second.stdout}\n\nstderr:\n{second.stderr}"
+    for stage in ("generation", "harness", "ablation", "engine"):
+        assert f"↻ {stage} (resumed from disk)" in second.stderr, second.stderr
+    # …and the stages that are never resumable still ran.
+    assert "▶ scoring" in second.stderr
+    assert "▶ render/deliverables" in second.stderr
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["resumed_stages"] == ["generation", "harness", "ablation", "engine"]
+    assert "Resumed from disk" in (run_dir / "report.md").read_text()
+    # The FAKED warning survives the resume — the artifacts alone do not carry it.
+    assert [w for w in manifest["warnings"] if "FAKED" in w]
 
 
 def test_a_failing_deliverable_makes_the_run_exit_nonzero(spy, monkeypatch):

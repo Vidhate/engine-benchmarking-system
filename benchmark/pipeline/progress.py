@@ -33,6 +33,7 @@ from typing import TextIO
 ENTER = "▶"  # ▶
 DONE = "✓"  # ✓
 FAILED = "✗"  # ✗
+RESUMED = "↻"  # ↻ — loaded from disk, never executed (see pipeline/resume.py)
 
 
 def _clock() -> str:
@@ -76,6 +77,17 @@ class Progress:
     def note(self, message: str) -> None:
         """A standalone, timestamped line outside any stage banner."""
         self._emit(message)
+
+    def resumed(self, name: str, detail: str = "") -> None:
+        """`↻ name (resumed from disk)` — a stage that was skipped, not run.
+
+        Deliberately NOT a `stage()` banner with a zero elapsed time: a reader
+        skimming a resumed run's output has to be able to tell "this took no
+        time" from "this did not happen", and a `✓ harness (elapsed 0s)` says
+        the first when the truth is the second.
+        """
+        suffix = f" — {detail}" if detail else ""
+        self._emit(f"{RESUMED} {name} (resumed from disk){suffix}")
 
     @contextmanager
     def stage(self, name: str) -> Iterator[StageHandle]:

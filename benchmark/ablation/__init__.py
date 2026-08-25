@@ -51,7 +51,12 @@ from benchmark.ablation.inject import (
     assert_threads_alive,
 )
 from benchmark.ablation.plan import plan_ablation
-from benchmark.ablation.propose import allowed_modes, build_digest, propose_errors
+from benchmark.ablation.propose import (
+    DEFAULT_MIN_PER_MODE,
+    allowed_modes,
+    build_digest,
+    propose_errors,
+)
 from benchmark.ablation.split import make_split, stratum_of
 from benchmark.ablation.validate import ValidationFailure, ValidationOutcome, validate_specs
 
@@ -62,6 +67,7 @@ __all__ = [
     "ApplyOutcome",
     "CorpusDigest",
     "Corruption",
+    "DEFAULT_MIN_PER_MODE",
     "CorruptionLost",
     "DeadThreadRefs",
     "ExportLeak",

@@ -44,6 +44,32 @@ class ExportLeak(Exception):
     """The file bound for the Engine names the ground truth."""
 
 
+def export_traces(payload: Any) -> list[dict[str, Any]]:
+    """The trace list out of an Engine export, whichever shape it arrived in.
+
+    There are two, and both are legitimate. `benchmark.ablation.export` — the
+    module that owns the leak boundary — writes a **bare list** of stripped
+    traces, because a dataset envelope would be one more place for a
+    ground-truth field to ride along. `write_leak_stripped_export` below writes
+    a `{dataset_id, parent_dataset_id, traces: [...]}` envelope, because the CI
+    double has no leak boundary to defend and the lineage is worth keeping.
+
+    The Engine app has read both since it was written
+    (`apps/engine/engine/traces.py::load_traces`). This side had not, so every
+    reader here assumed a dict and the first real export would have failed on
+    `payload.get`. Reading both is the fix, in one place, so the audit, the
+    deliverables check and the invoker cannot disagree about it.
+    """
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, dict):
+        return list(payload.get("traces", []))
+    raise ExportLeak(
+        f"unsupported Engine export payload: {type(payload).__name__} — expected a list "
+        f"of traces or a dataset object with a 'traces' key"
+    )
+
+
 def strip_trace(trace: Trace) -> dict[str, Any]:
     """One trace as the Engine may see it: everything except `ablation_ids`."""
     return trace.model_dump(mode="json", exclude={"ablation_ids"})
@@ -84,8 +110,11 @@ def assert_export_clean(payload: Any, *, where: str) -> None:
         )
 
 
-def assert_export_file_clean(path: str | Path) -> dict[str, Any]:
+def assert_export_file_clean(path: str | Path) -> Any:
     """Audit an export file on disk and return its parsed payload.
+
+    The payload is whichever shape the writer chose — pass it through
+    `export_traces` to get the trace list.
 
     Also validates that every trace still parses as a `Trace` — an export the
     Engine cannot load is a failed run that would otherwise be discovered
@@ -96,6 +125,6 @@ def assert_export_file_clean(path: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"engine export not found: {path}")
     payload = json.loads(path.read_text())
     assert_export_clean(payload, where=str(path))
-    for raw in payload.get("traces", []):
+    for raw in export_traces(payload):
         Trace.model_validate(raw)
     return payload

@@ -11,14 +11,37 @@ shapes:
 expander unit tests may use (see docs/execution-plan.md ground rule 5:
 "No OpenAI calls in unit tests."). `OpenAIPromptExpander` is a live-model
 skeleton exercised only by benchmark/generation/smoke.py.
+
+## Transport: ChatOpenAI, and why it emits no LangSmith runs
+
+The live expander used to speak raw `urllib` at the chat-completions endpoint.
+A full-scale generation pass is ~400 sequential calls against a mid-tier model,
+which is precisely the shape that trips a rate limit — and a 429 with no retry
+budget does not slow the run down, it kills it partway through and leaves a
+half-warmed cache. `ChatOpenAI` brings bounded retries with 429 backoff and a
+real per-request timeout, so the transport is now its.
+
+Importing `langchain_openai` here is an exception to the Phase-0 tracing
+boundary (tests/test_tracing_boundary.py), granted to this file by name and to
+`benchmark/ablation/agent.py`, on ONE condition: these calls must never produce
+a LangSmith run. LangChain traces by default whenever `LANGSMITH_TRACING` is
+set, and it is set — the harness needs it to collect the target app's traces. A
+benchmark-side expansion landing in that project would pollute the collector's
+own corpus with runs that are not traces of the app under test.
+
+So every invocation goes through `_invoke_untraced`: `tracing_context(enabled
+=False)` for the ambient LangSmith context, AND `callbacks: []` in the run
+config so no inherited handler can re-attach one. The boundary test asserts
+this wrapper is present in this file; do not inline a bare `.invoke()`.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import urllib.request
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+
+from langchain_openai import ChatOpenAI
+from langsmith import tracing_context
 
 from benchmark.models import GENERATION_MODEL
 from benchmark.schemas.inputs import Dimension, Persona
@@ -77,55 +100,80 @@ class MockPromptExpander:
         )
 
 
+#: Passed as the run config on every invocation below. An empty callback list
+#: is the second half of the tracing suppression: `tracing_context(enabled=
+#: False)` turns off LangChain's own tracer, and this stops any handler a
+#: caller installed from re-attaching one. See the module docstring.
+NO_TRACING_CONFIG: dict[str, Any] = {"callbacks": []}
+
+
 class OpenAIPromptExpander:
     """Live-model expander skeleton, backed by the OpenAI chat completions API.
 
-    Uses only the standard library (urllib) so no new project dependency is
-    required to keep this skeleton importable. Reaches the network only when
-    `.expand()`/`.expand_scenario()` are actually called — never at import or
-    construction time — so pytest collection/import never triggers a request.
-    Exercised only by benchmark/generation/smoke.py, which is not run in CI.
+    The model object is built lazily on first use, so the network is reached
+    only when `.expand()`/`.expand_scenario()` are actually called — never at
+    import or construction time — and pytest collection/import never triggers a
+    request or requires a key. Exercised only by scripts/generation_smoke.py
+    and a real generation run; never by CI.
     """
-
-    _ENDPOINT = "https://api.openai.com/v1/chat/completions"
 
     def __init__(
         self,
         model: str = GENERATION_MODEL,
         api_key: str | None = None,
-        timeout: float = 30.0,
+        # Was 30 s. A mid-tier reasoning model answering a 120-word expansion
+        # can legitimately take longer than that, and a timeout fired at 30 s
+        # bills for the call and throws the answer away.
+        timeout: float = 120.0,
+        # Rate limits are the concern, not flakiness: a generation pass is
+        # hundreds of sequential calls, and a 429 with no retry budget ends the
+        # run rather than slowing it. ChatOpenAI's backoff is exponential.
+        max_retries: int = 4,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.timeout = timeout
+        self.max_retries = max_retries
+        self._model: ChatOpenAI | None = None
 
-    def _chat(self, system: str, user: str) -> str:
+    def _client(self) -> ChatOpenAI:
         if not self.api_key:
             raise RuntimeError(
                 "OPENAI_API_KEY not set — required for live OpenAIPromptExpander calls"
             )
-        body = json.dumps(
-            {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.7,
-            }
-        ).encode()
-        request = urllib.request.Request(
-            self._ENDPOINT,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
-            payload = json.loads(response.read())
-        return payload["choices"][0]["message"]["content"].strip()
+        if self._model is None:
+            self._model = ChatOpenAI(
+                model=self.model,
+                api_key=self.api_key,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+                # Chat Completions, and the same `temperature` the raw HTTP
+                # body carried — this is a transport swap, and the request on
+                # the wire is meant to be the one that was there before.
+                # NOTE: langchain_openai drops `temperature` for gpt-5-family
+                # models, which only accept the default. That is a fix, not a
+                # regression: the old hand-rolled body sent it unconditionally
+                # and the API rejected the request outright.
+                use_responses_api=False,
+                temperature=0.7,
+            )
+        return self._model
+
+    def _invoke_untraced(self, system: str, user: str) -> str:
+        """The ONLY call path to the model. Never emits a LangSmith run.
+
+        Both suppressions are load-bearing; see the module docstring. If this
+        is ever inlined into a bare `.invoke()`, tests/test_tracing_boundary.py
+        fails, which is the point.
+        """
+        model = self._client()
+        messages = [("system", system), ("user", user)]
+        with tracing_context(enabled=False):
+            reply = model.invoke(messages, config=NO_TRACING_CONFIG)
+        return reply.content
+
+    def _chat(self, system: str, user: str) -> str:
+        return str(self._invoke_untraced(system, user)).strip()
 
     @staticmethod
     def _context_block(app_context: str) -> str:

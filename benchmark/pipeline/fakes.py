@@ -1,43 +1,57 @@
-"""Development stand-ins for stages that are not on main yet.
+"""The offline stand-ins for every stage the pipeline does not own.
 
-**This module is temporary scaffolding, not product.** `fake_run_ablation`
-exists because Phase 5 (`benchmark/ablation/`) is being built in parallel: it
-lets the miniature run and the CI integration test exercise every *other*
-integration seam today, against the exact call shape the real stage will have.
-It ships inside the package rather than in `tests/` because the live smoke
-script needs it too, and a test double that two callers import from two places
-drifts.
+Three of the pipeline's stages reach outside the process: the Phase-4 harness
+(a live LangGraph target app plus LangSmith), the Phase-5 ablation engine (an
+LLM agent driving that same app), and the Engine under test (a second live
+server). This module holds one stand-in for each, plus a network-free prompt
+expander, so the whole assembly runs end to end with no servers, no API keys
+and no network at all.
 
-**At integration time it is deleted**, and the single line
-`ablation_stage=fake_run_ablation` becomes
-`ablation_stage=load_ablation_stage()`. Nothing else in the pipeline changes —
-that is the property this module is designed to prove.
+They ship inside the package rather than in `tests/` because three callers
+need them — `tests/pipeline/`, the `--fake-harness/--fake-ablation/--fake-engine`
+CLI flags, and `scripts/pipeline_smoke.py` — and a test double defined twice
+drifts. Every object here carries `is_pipeline_fake`, which is what makes the
+runner stamp a FAKED warning onto the manifest and the rendered report: a run
+that used any of them is evidence about *wiring*, never about the Engine.
 
-What the fake does NOT do: it does not ablate anything. Traces pass through
-untouched, and the ground truth it plants is a label over unmodified traces.
-So a run using it produces *wiring* evidence, never *quality* evidence: the
-Engine is being scored against errors nobody injected, and low scores are the
-expected outcome, not a finding.
+`fake_run_ablation` is the one with a sharper edge. It does not ablate
+anything: traces pass through untouched and the ground truth it plants is a
+label over unmodified content, so the Engine is being scored against errors
+nobody injected and low scores are the expected outcome, not a finding. The
+real `benchmark.ablation.run_ablation` is the default everywhere now; this
+stays as the CI double, because CI cannot spend an LLM agent and two servers
+per run.
 """
 
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from benchmark.pipeline.export import write_leak_stripped_export
+from benchmark.pipeline.contracts import EngineInvocation
+from benchmark.pipeline.export import export_traces, write_leak_stripped_export
 from benchmark.schemas import (
     AblationConfig,
     AblationRecord,
     AblationSplit,
+    Dimension,
     ErrorCategory,
     Issue,
     Issueboard,
     IssueOccurrence,
+    OutputDataset,
+    OutputRecord,
+    Persona,
+    Span,
+    Trace,
     TraceDataset,
+    Turn,
 )
+from benchmark.schemas.configs import TargetAppConfig
 from benchmark.schemas.inputs import InputDataset
 from benchmark.schemas.io import derive, stamp_dataset_id
 from benchmark.schemas.issues import OTHER_CATEGORY_ID
@@ -206,3 +220,207 @@ def fake_run_ablation(
 #: on the word "fake" surviving in somebody's wrapper name.
 fake_run_ablation.is_pipeline_fake = True  # type: ignore[attr-defined]
 FakeAblationResult.is_pipeline_fake = True  # type: ignore[attr-defined]
+
+
+# ============================================================================
+# The other three offline seams: generation, the harness, the Engine.
+# ============================================================================
+
+#: One fixed instant for every canned span. Trace content has to be a pure
+#: function of its input for a run's dataset_id to be reproducible, and a
+#: wall clock is the usual way that quietly stops being true.
+_T0 = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+
+
+class FakeExpander:
+    """A network-free `PromptExpander`: no OpenAI call, same call shape."""
+
+    is_pipeline_fake = True
+
+    def expand(self, dim: Dimension, variation: str, seed: int, app_context: str = "") -> str:
+        return f"[{dim.dim_id}/{variation}] please help me with {variation}"
+
+    def expand_scenario(
+        self, persona: Persona, dim_id: str, variation: str, seed: int, app_context: str = ""
+    ) -> str:
+        return f"[{persona.persona_id}/{dim_id}/{variation}] a conversation about {variation}"
+
+
+def make_trace(trace_id: str, input_id: str, *, text: str = "answer", turns: int = 1) -> Trace:
+    """One schema-valid canned `Trace`, with a span per turn."""
+    return Trace(
+        trace_id=trace_id,
+        input_id=input_id,
+        mode="single_turn" if turns == 1 else "multi_turn",
+        turns=[
+            Turn(
+                turn_index=i,
+                user_message=f"question {i} for {input_id}",
+                final_response=f"{text} {i}",
+                spans=[
+                    Span(
+                        span_id=f"{trace_id}-s{i}",
+                        name="ChatOpenAI",
+                        span_type="llm",
+                        start_time=_T0,
+                        end_time=_T0,
+                        inputs={"messages": [f"question {i}"]},
+                        outputs={"content": f"{text} {i}"},
+                    )
+                ],
+            )
+            for i in range(turns)
+        ],
+        metadata={"session_id": f"sess-{trace_id}", "thread_id": f"thread-{trace_id}"},
+    )
+
+
+class FakeHarness:
+    """A `HarnessLike` that fabricates one canned trace per input.
+
+    Stands in for the whole Phase-4 harness: no LangGraph server, no LangSmith,
+    but the same `(OutputDataset, TraceDataset)` return and the same lineage.
+    Traces are written through to the store when there is one, so a downstream
+    stage that reads the store rather than the dataset still finds them.
+    """
+
+    is_pipeline_fake = True
+
+    def __init__(self, cfg=None, store=None, *, app_error_inputs: tuple[str, ...] = ()):
+        self.cfg = cfg
+        self.store = store
+        self.stats: dict[str, int] = {}
+        self.app_error_inputs = app_error_inputs
+        self.batches: list[InputDataset] = []
+
+    def run_batch(self, inputs: InputDataset) -> tuple[OutputDataset, TraceDataset]:
+        self.batches.append(inputs)
+        traces = []
+        outputs = []
+        for spec in inputs.inputs:
+            trace = make_trace(f"tr-{spec.input_id}", spec.input_id)
+            if spec.input_id in self.app_error_inputs:
+                trace = trace.model_copy(update={"status": "app_error"})
+            if self.store is not None:
+                self.store.put(trace)
+            traces.append(trace)
+            outputs.append(
+                OutputRecord(
+                    input_id=spec.input_id,
+                    trace_id=trace.trace_id,
+                    responses=[t.final_response for t in trace.turns],
+                )
+            )
+        self.stats = {
+            "ran": len(traces),
+            "skipped": 0,
+            "quarantined": 0,
+            "app_error": len(self.app_error_inputs),
+        }
+        return (
+            derive(OutputDataset(outputs=outputs), inputs),
+            derive(TraceDataset(traces=traces), inputs),
+        )
+
+
+class FakeHarnessFactory:
+    """A `HarnessFactory` producing `FakeHarness`es, remembering each one."""
+
+    is_pipeline_fake = True
+
+    def __init__(self) -> None:
+        self.made: list[FakeHarness] = []
+
+    def __call__(self, cfg: TargetAppConfig, store: TraceStore) -> FakeHarness:
+        harness = FakeHarness(cfg, store)
+        self.made.append(harness)
+        return harness
+
+
+class FakeEngineInvoker:
+    """An `EngineInvoker` that returns a board derived from the ground truth.
+
+    `recall` picks how much of the ground truth it reproduces, so a caller can
+    ask for a perfect Engine, a blind one, or anything between — without a
+    model. It also always adds one unmatched issue, which is what an E_h
+    candidate looks like coming back from a real run.
+
+    `ground_truth` is settable after construction because that is the only
+    order that works: the ablation stage has to run before there is a ground
+    truth to mirror. Left unset (the CLI's `--fake-engine`, which has no way to
+    reach inside the run), it predicts nothing but the unmatched issue — a
+    blind Engine, which still exercises every seam downstream of it.
+    """
+
+    is_pipeline_fake = True
+
+    def __init__(self, ground_truth: Issueboard | None = None, *, recall: float = 1.0):
+        self.ground_truth = ground_truth
+        self.recall = recall
+        self.calls: list[dict] = []
+
+    def __call__(self, *, trace_file, seed_board, categories, engine) -> EngineInvocation:
+        self.calls.append(
+            {
+                "trace_file": Path(trace_file),
+                "seed_board": seed_board,
+                "categories": categories,
+                "engine": engine,
+            }
+        )
+        # `export_traces`, not `TraceDataset.model_validate_json`: the real
+        # ablation stage writes a bare list of stripped traces, so a double
+        # that only read the envelope shape would pass CI and die on the
+        # first integrated run. This is the Engine's reader, so it reads what
+        # the Engine reads.
+        exported = export_traces(json.loads(Path(trace_file).read_text()))
+        gt = self.ground_truth or Issueboard(source="ground_truth")
+        keep = int(round(len(gt.issues) * self.recall))
+        issues = [
+            Issue(
+                error_id=f"P{n}",
+                title=issue.title,
+                description=issue.description,
+                category_id=issue.category_id,
+                severity=issue.severity,
+            )
+            for n, issue in enumerate(gt.issues[:keep])
+        ]
+        renamed = {issue.error_id: f"P{n}" for n, issue in enumerate(gt.issues[:keep])}
+        occurrences = [
+            IssueOccurrence(error_id=renamed[o.error_id], trace_id=o.trace_id)
+            for o in gt.occurrences
+            if o.error_id in renamed
+        ]
+        # An unmatched prediction: every real run produces some, and the report
+        # has an E_h appendix precisely for them. It is pinned to a trace that
+        # is actually in the export — a phantom trace id is a different defect
+        # with its own guard, and this double should not manufacture one.
+        first_trace = next(
+            (o.trace_id for o in gt.occurrences),
+            exported[0]["trace_id"] if exported else "tr-unknown",
+        )
+        issues.append(
+            Issue(
+                error_id="P-extra",
+                title="unclassified oddity",
+                description="something the Engine flagged that no injection explains",
+                category_id="other",
+                severity="low",
+            )
+        )
+        occurrences.append(IssueOccurrence(error_id="P-extra", trace_id=first_trace))
+        board = Issueboard(
+            board_id="engine-side-hash-not-ours",
+            source="engine_predicted",
+            issues=list(seed_board.issues) + issues,
+            occurrences=occurrences,
+        )
+        return EngineInvocation(
+            board=board,
+            raw_output=board.model_dump(mode="json"),
+            seconds=1.5,
+            thread_id="thread-fake",
+            recorded_models=[engine.model],
+            trace_count=len(exported),
+        )
