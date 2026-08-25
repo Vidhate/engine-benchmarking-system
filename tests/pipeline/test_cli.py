@@ -115,6 +115,26 @@ def test_fake_harness_and_fake_engine_reach_the_runner(spy):
     assert call["ablation_stage"] is not cli.fake_run_ablation
 
 
+def test_the_fake_expander_never_writes_to_the_shared_expansion_cache(spy):
+    """The cache key does not name the expander, so the fake must not share it.
+
+    `(config_hash, kind, dim_id, variation, persona_id, seed)` is the whole
+    key. An offline run pointed at the shared cache would write
+    "[topic/x] please help me with x" under exactly the keys the real expander
+    uses, and the next real run — the timed one — would build its entire input
+    corpus out of them without a word.
+    """
+    cli.main(["run", "--config", MINI, "--fake-harness", "--fake-ablation", "--fake-engine"])
+    cfg = spy[0]["cfg"]
+    assert cfg.resolve(cfg.expansion_cache) == cfg.run_dir / "fake_expansion_cache"
+
+
+def test_a_real_run_keeps_the_shared_expansion_cache(spy):
+    cli.main(["run", "--config", MINI, "--fake-ablation", "--fake-engine"])
+    cfg = spy[0]["cfg"]
+    assert cfg.resolve(cfg.expansion_cache) != cfg.run_dir / "fake_expansion_cache"
+
+
 def test_the_default_run_fakes_nothing(spy):
     """Every seam is real unless a flag says otherwise."""
     cli.main(["run", "--config", MINI])

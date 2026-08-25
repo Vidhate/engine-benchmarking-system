@@ -62,6 +62,30 @@ target_app_config: configs/target_app.yaml
 engine_app_config: configs/engine.yaml
 seed_issueboard: null
 artifacts_root: data/pipeline
+# WARM THIS BEFORE THE TIMED RUN. Generation is the only stage whose cost is
+# fully recoverable in advance: expansions are pure functions of (config hash,
+# dim, variation, persona, seed), so pre-computing them moves ~300 OpenAI calls
+# out of the measured window and makes the timed run's generation stage ~0s
+# (measured: the mini smoke reports 0.0s against a warm cache).
+#
+# There is NO generation-only CLI subcommand, and the `--fake-*` flags are NOT
+# a warming trick — `--fake-harness` substitutes the network-free FakeExpander,
+# so nothing real is computed (and, since the cache key does not name the
+# expander, that run is redirected to a per-run scratch cache precisely so it
+# cannot poison this one). `scripts/generation_smoke.py` does not warm it
+# either: it calls the expander directly, uncached, three times.
+#
+# Warm it with the generation stage on its own:
+#
+#   uv run python -c "
+#   from benchmark.generation.config_loader import load_generation_config
+#   from benchmark.generation.generators import generate_inputs
+#   cfg = load_generation_config('configs/generation/v0.yaml')
+#   d = generate_inputs(cfg, cache_dir='data/expansion_cache')
+#   print(len(d.inputs), 'inputs cached')"
+#
+# It is idempotent and resumable — a second call is all cache hits, and an
+# interrupted one keeps whatever it already wrote.
 expansion_cache: data/expansion_cache
 
 # Single-turn only: exactly 300 of the grid's 310 single-turn inputs, a seeded

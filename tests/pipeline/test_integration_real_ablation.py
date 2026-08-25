@@ -74,25 +74,36 @@ class BatchableAblationHarness(AblationFakeHarness):
 
 @pytest.fixture
 def scripted_agent(taxonomy):
-    """One proposal per taxonomy category, alternating the two injection modes.
+    """A content-only first draw, with a mechanism error available on re-ask.
 
-    Alternating is deliberate: `replay_edit` and `dependency_fault` take
-    completely different routes through the ablation engine (a forked thread
-    versus a re-run under a fault shim), and a run that exercised one of them
-    would leave the other's hand-off to the pipeline unproven.
+    This is the shape the two live runs actually produced: asked for one error
+    per category with both modes on the table, the agent reached for
+    `replay_edit` every time. Scripting the `replay_edit` draft FIRST reproduces
+    that — `ScriptedAblationAgent.propose` filters by `allowed_modes` and takes
+    the first `n` — so the pipeline only ever sees a `dependency_fault` if the
+    mode-coverage pass in `propose_errors` re-asks with the mode narrowed.
+
+    Both modes matter downstream: they take completely different routes through
+    the engine (a forked thread versus a re-run under a fault shim), and the
+    report's content-vs-mechanism commentary needs data from each.
     """
-    modes = ("replay_edit", "dependency_fault")
     return ScriptedAblationAgent(
         {
             category.category_id: [
                 make_proposal(
-                    f"E-{category.category_id}",
+                    f"C-{category.category_id}",
                     category.category_id,
-                    mode=modes[index % len(modes)],
+                    mode="replay_edit",
                     target_count=2,
-                )
+                ),
+                make_proposal(
+                    f"M-{category.category_id}",
+                    category.category_id,
+                    mode="dependency_fault",
+                    target_count=2,
+                ),
             ]
-            for index, category in enumerate(taxonomy)
+            for category in taxonomy
         }
     )
 
@@ -161,6 +172,40 @@ def test_the_report_records_how_the_errors_were_planted(real_ablation_run):
     assert rates["injection_modes"], "the report cannot say how errors were planted"
     assert set(rates["injection_modes"]) <= {"replay_edit", "dependency_fault"}
     assert rates["per_error_injection_counts"]
+
+
+def test_both_injection_modes_reach_the_report(real_ablation_run):
+    """The end-to-end proof of the mode-coverage pass.
+
+    The scripted agent draws `replay_edit` for every category on the first
+    pass — the live behaviour. A `dependency_fault` appearing in `base_rates`
+    means `propose_errors` noticed the shortfall, re-asked with the mode
+    narrowed, and the resulting mechanism error survived planning, validation,
+    injection and the base-rate assembly all the way into the report. The
+    report's content-vs-mechanism commentary has nothing to stand on otherwise.
+    """
+    modes = real_ablation_run.report.base_rates["injection_modes"]
+    assert set(modes) == {"replay_edit", "dependency_fault"}, modes
+    assert all(count >= 1 for count in modes.values()), modes
+
+
+def test_the_mechanism_error_really_went_through_the_fault_route(real_ablation_run):
+    """Not just labelled `dependency_fault` — planned as one.
+
+    A `dependency_fault` carries a `FaultConfig` and no rewrite actions, so its
+    records are the ones produced by re-running the app under a shim rather
+    than by editing a reply. Asserting on the ground-truth issue alone would
+    pass for a mislabelled replay edit.
+    """
+    fault_ids = {
+        issue.error_id
+        for issue in real_ablation_run.ground_truth.issues
+        if issue.injection_mode == "dependency_fault"
+    }
+    assert fault_ids, "no mechanism error survived into the ground truth"
+    assert {r.error_id for r in real_ablation_run.records} & fault_ids, (
+        "the mechanism error has no ablation record — nothing was actually injected"
+    )
 
 
 def test_the_ablation_stage_is_not_flagged_as_faked(real_ablation_run):

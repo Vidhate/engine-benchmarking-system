@@ -227,20 +227,46 @@ You are given: one error category, a digest of REAL traces from the app under
 test, and the injection modes available. Draft concrete errors this app could
 genuinely produce — never a generic error list.
 
-Two injection modes:
+Two injection modes. They are EQUALLY IMPORTANT and the benchmark needs both:
+one plants the error in the *content*, the other in the *mechanism*, and a
+report built on only one of them cannot say whether the system under test finds
+errors by reading answers or by reading machinery. Do not treat replay_edit as
+the default.
 
-* replay_edit — you author the corrupted assistant response for one turn, and
-  the app organically regenerates everything after it. Author the corruption
-  around facts the app's document corpus CANNOT refute: invented case or ticket
-  references, fabricated internal specifics, numbers with no source. Do NOT
-  contradict a fact the app can look up again — it will re-search and correct
-  you, and the injection is then not in the trace. Every corruption needs a
-  `marker`: a short, unique, invented literal string (like a case id) that
-  appears verbatim in the replacement and could not appear by chance.
-* dependency_fault — an external dependency is made to misbehave and the whole
-  trace is regenerated with the fault active. Only mechanism-shaped errors:
-  retrieval returning wrong/empty/stale documents, a tool erroring or timing
-  out, a truncated model output.
+* replay_edit — CONTENT-LEVEL. You author the corrupted assistant response for
+  one turn, and the app organically regenerates everything after it. Author the
+  corruption around facts the app's document corpus CANNOT refute: invented
+  case or ticket references, fabricated internal specifics, numbers with no
+  source. Do NOT contradict a fact the app can look up again — it will
+  re-search and correct you, and the injection is then not in the trace. Every
+  corruption needs a `marker`: a short, unique, invented literal string (like a
+  case id) that appears verbatim in the replacement and could not appear by
+  chance.
+* dependency_fault — MECHANISM-LEVEL. An external dependency is made to
+  misbehave and the whole trace is regenerated with the fault active, so the
+  app's own failure is genuine rather than authored. Pick the shim whose
+  misbehaviour would *cause* this category's symptom:
+    - retriever — irrelevant_docs, empty, stale. The app answers from wrong,
+      missing or out-of-date documents.
+    - tool — error, timeout, corrupted_result. A tool call fails or returns
+      garbage and the app has to cope with it.
+    - llm_proxy — truncate_output. The model's own output is cut short.
+  `fault.target` names the concrete span this app actually runs (the digest's
+  `tool_names` and retriever span names are the real vocabulary — use one).
+
+Choosing between them: if the category's symptom is something the app SAYS
+(invented facts, ignored instructions, lost context), replay_edit is the honest
+route. If the symptom is something that happens TO the app (bad documents, a
+broken tool, a cut-off answer), a dependency_fault produces a far more
+realistic trace than authoring the consequence by hand — and the app's real
+reaction to a real fault is exactly what a mechanism-level error should look
+like. When both routes fit the category, prefer dependency_fault: authored
+content is cheap and abundant, genuine mechanism failures are neither.
+
+If only one mode is listed as available, draft in that mode only. If you
+genuinely cannot make the available mode fit this category, return an empty
+"errors" list rather than forcing one — an honest empty draft is better than a
+proposal that cannot be injected.
 
 Also draft a `filter`: 1-3 predicate steps that select traces where this error
 could plausibly exist. Keep it LOOSE — an over-specific filter matches nothing

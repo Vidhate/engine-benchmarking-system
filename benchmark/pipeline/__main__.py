@@ -148,6 +148,17 @@ def _cmd_run(args) -> int:
     # so expanding prompts for real would be a paid OpenAI call whose output is
     # discarded — and it would also stop this being an offline run.
     expander = FakeExpander() if args.fake_harness else None
+    if expander is not None:
+        # ...but the expansion cache is keyed on (config hash, dim, variation,
+        # persona, seed) and NOT on which expander produced the text. Left
+        # pointing at the shared cache, one offline run would write
+        # "[topic/x] please help me with x" under exactly the keys the real
+        # expander uses, and the next real run would silently generate its
+        # entire corpus from those. Fake expansions get their own scratch
+        # directory inside the run, so the shared cache is read-only here.
+        cfg = cfg.model_copy(
+            update={"expansion_cache": str(cfg.run_dir / "fake_expansion_cache")}
+        ).with_root(cfg.root)
     engine_invoker = FakeEngineInvoker() if args.fake_engine else None
 
     faked = [

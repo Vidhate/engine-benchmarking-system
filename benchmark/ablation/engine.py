@@ -34,7 +34,7 @@ from benchmark.ablation.agent import AblationAgent, CorpusDigest, OpenAIAblation
 from benchmark.ablation.apply import apply_ablations
 from benchmark.ablation.export import write_engine_export
 from benchmark.ablation.inject import assert_threads_alive
-from benchmark.ablation.propose import build_digest, propose_errors
+from benchmark.ablation.propose import DEFAULT_MIN_PER_MODE, build_digest, propose_errors
 from benchmark.ablation.split import make_split
 from benchmark.ablation.validate import ValidationOutcome, validate_specs
 from benchmark.schemas.ablation import AblationRecord, AblationSplit
@@ -159,6 +159,10 @@ class AblationEngine:
             self.harness.cfg,
             self.agent,
             digest=digest,
+            # The engine owns the floor, not AblationConfig: one mechanism
+            # error is what the report's content-vs-mechanism half needs, on
+            # every run, and a knob would only invite it being turned off.
+            min_per_mode=DEFAULT_MIN_PER_MODE,
         )
         log.info(
             "proposed %d error(s): %s",
