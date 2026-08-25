@@ -26,6 +26,7 @@ Zero network, zero servers, zero model calls, and the ablation stage is real.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 
@@ -193,17 +194,26 @@ def test_the_export_names_no_ground_truth(real_ablation_run):
 
 
 def test_the_export_carries_no_time_separator(real_ablation_run):
-    """Ablation runs after collection; an un-normalized clock sorts the corpus."""
+    """Ablation runs after collection; an un-normalized clock sorts the corpus.
+
+    Parsed rather than string-compared: a zero microsecond field is dropped on
+    serialization, so the epoch is `...T00:00:00Z` while its neighbours carry
+    `.00xxxx` — and `.` sorts before `Z`, which makes a lexicographic minimum
+    name the wrong span and report a violation that does not exist.
+    """
     from benchmark.ablation.export import EXPORT_EPOCH
 
     traces = export_traces(json.loads(real_ablation_run.export_path.read_text()))
     origins = {
-        min(span["start_time"] for turn in trace["turns"] for span in turn["spans"])
+        min(
+            datetime.fromisoformat(span["start_time"].replace("Z", "+00:00"))
+            for turn in trace["turns"]
+            for span in turn["spans"]
+        )
         for trace in traces
         if any(turn["spans"] for turn in trace["turns"])
     }
-    assert len(origins) == 1, f"exported traces start at {len(origins)} distinct clocks"
-    assert origins.pop().startswith(EXPORT_EPOCH.date().isoformat())
+    assert origins == {EXPORT_EPOCH}, f"exported traces start at {sorted(origins)}"
 
 
 def test_every_deliverable_passes_over_a_real_ablation_run(real_ablation_run):

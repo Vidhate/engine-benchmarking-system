@@ -390,15 +390,23 @@ def main() -> int:  # noqa: PLR0915 - a linear gate script reads better in one p
     # export would let the Engine sort control from ablated by the clock alone
     # — no trace reading required. Every exported trace must start at the same
     # synthetic origin.
+    # PARSED, not compared as strings: pydantic drops a zero microsecond field,
+    # so the epoch serializes as "...T00:00:00Z" while its neighbours keep a
+    # ".00xxxx" — and "." sorts before "Z", which makes a lexicographic min
+    # pick the wrong span and report a violation that is not there.
     origins = {
-        min(span["start_time"] for turn in trace["turns"] for span in turn["spans"])
+        min(
+            datetime.fromisoformat(span["start_time"].replace("Z", "+00:00"))
+            for turn in trace["turns"]
+            for span in turn["spans"]
+        )
         for trace in exported
         if any(turn["spans"] for turn in trace["turns"])
     }
     assert len(origins) <= 1, f"exported traces start at {len(origins)} distinct clocks: {origins}"
     if origins:
-        origin = next(iter(origins))
-        assert datetime.fromisoformat(origin.replace("Z", "+00:00")) == EXPORT_EPOCH, (
+        origin = origins.pop()
+        assert origin == EXPORT_EPOCH, (
             f"the export's origin is {origin}, not the fixed EXPORT_EPOCH {EXPORT_EPOCH}"
         )
         print(f"  no time separator: all {len(exported)} trace(s) re-based to {origin}")
