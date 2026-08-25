@@ -7,56 +7,66 @@
 # ---------------------------------------------------------------------------
 # Scope
 # ---------------------------------------------------------------------------
-# Same generation config as full.yaml (configs/generation/v0.yaml, `mixed`),
-# but this run takes NONE of the multi-turn tail: `input_modes` admits only
-# `single_turn`, and `max_inputs_per_mode` caps that at exactly 300 out of the
-# 310 single-turn cells the grid produces (D x V_D + A_c x V_AC + A_F = 150 +
-# 80 + 80 = 310) — a seeded sample of 10 dropped, deterministic across reruns
-# via `slice_seed`. `multi_turn: 0` makes the exclusion explicit in the config
-# itself rather than leaving it implied by an absent key.
+# Its own generation config — configs/generation/submission.yaml, NOT v0.yaml.
+# v0's grid is only 310 single-turn cells, so a 400-trace run cannot be sliced
+# out of it; the submission grid is 420:
 #
-#     300 traces, exactly the assignment's own >=300 deliverable.
+#     D x V_D + A_c x V_AC + A_F = 180 + 120 + 120 = 420
 #
-# Why single-turn only, where full.yaml keeps a 30-conversation multi-turn
-# tail: this config is the one meant to produce the assignment's actual
-# deliverable file at exactly the requested scale, with nothing to explain
-# about a sampled tail. full.yaml stays the config that puts multi-turn
-# traces in the corpus at all — see Phase 8's use of it.
+# `input_modes` admits only `single_turn`, and `max_inputs_per_mode` caps that
+# at exactly 400 of the 420 — a seeded sample of 20 dropped, deterministic
+# across reruns via `slice_seed`. `multi_turn: 0` makes the exclusion explicit
+# in the config itself rather than leaving it implied by an absent key; the
+# submission generation config is `mode: single_turn` anyway, so there is no
+# multi-turn tail being generated and thrown away either (v0 is where the
+# multi-turn grid lives — see configs/pipeline/full.yaml).
+#
+#     400 traces, against a deliverable of >=300.
+#
+# The 100-trace margin is the reason for 400 rather than 300. Traces the
+# collector cannot retrieve are quarantined rather than stored (they are our
+# bug, not signal), and each one comes out of that margin. At 300/300 the run
+# had NO slack at all: a single quarantined trace meant a re-run. 400 traces
+# against `min_traces: 300` is 25% quarantine slack — a quarter of the corpus
+# can fail collection and the deliverable still stands.
 #
 # ---------------------------------------------------------------------------
 # What it costs (first run; a re-run is far cheaper, see below)
 # ---------------------------------------------------------------------------
-#   generation  ~1230 mid-tier LLM calls, ~30-40 min. NOTE: the whole grid is
-#               expanded before the slice is applied — expansion belongs to
-#               benchmark/generation/, slicing is a pipeline concern — so this
-#               pays for the 920 multi-turn conversations it then drops, same
-#               as full.yaml. Cached on disk and keyed by config hash, so only
-#               the first run pays at all.
-#   harness     300 single-turn runs at concurrency 8, plus LangSmith
-#               span-ingestion polling: ~15-25 min (no multi-turn tail, so no
-#               user-simulator calls and no multi-invocation conversations —
-#               this is the part of full.yaml's harness estimate that scales
-#               down the most).
-#   ablation    Phase 5, single-turn-only corpus. Every trace here is the
-#               `M = 1` degenerate case (docs/architecture/04-ablation-engine.md,
-#               "Single-turn degenerate case"): Mode A reduces to a post-hoc
-#               edit of the one response span, done directly by the ablation
-#               engine WITHOUT calling `Harness.replay` — so this stage makes
-#               no app calls at all. What is left is proposal/plan LLM calls
-#               plus Mode-C fault re-runs through the app for the ablate
-#               subset: single-digit minutes, well under full.yaml's
-#               multi-turn-inclusive estimate.
-#   engine      300 traces at analysis_concurrency 16 = 19 batches at ~49 s
-#               per batch plus consolidation: ~21 min (apps/engine/README.md,
-#               "Analysis concurrency" — this is the ruled 300-trace figure
-#               the setting is chosen for).
+#   generation  420 mid-tier LLM calls (one per single-turn cell), ~15-20 min.
+#               The whole grid is expanded before the slice is applied —
+#               expansion belongs to benchmark/generation/, slicing is a
+#               pipeline concern — so this pays for the 20 cells it then drops
+#               and nothing else. Cached on disk and keyed by config hash, so
+#               only the first run pays at all: PRE-WARM IT (see below) and the
+#               timed run's generation stage is ~0 s.
+#   harness     400 single-turn runs at concurrency 8, plus LangSmith
+#               span-ingestion polling: ~2 h. This is the long pole, and it
+#               scales close to linearly in trace count — 300 traces measured
+#               at roughly 15-25 min per 100 at this concurrency, and the
+#               ingestion poll does not parallelise away.
+#   ablation    Phase 5 over a single-turn-only corpus, BOTH injection modes.
+#               Every trace here is the `M = 1` degenerate case
+#               (docs/architecture/04-ablation-engine.md, "Single-turn
+#               degenerate case"): Mode A reduces to a post-hoc edit of the one
+#               response span, done directly by the ablation engine WITHOUT
+#               calling `Harness.replay`, so it makes no app calls. The cost is
+#               proposal/plan/revise LLM calls plus Mode-C fault re-runs
+#               through the app for the ablate subset — and the ablate subset
+#               is now 70% of 400 rather than of 300: ~30-60 min.
+#   engine      400 traces at analysis_concurrency 16 = 25 batches at ~49 s per
+#               batch plus consolidation: ~25 min (apps/engine/README.md,
+#               "Analysis concurrency").
 #   scoring     seconds (TF-IDF, no judge).
 #
-#   Total: roughly 1.5-2 h of wall clock on the first run, most of it
-#   generation and harness time. A re-run with a warm expansion cache and an
-#   existing trace store is dominated by the Engine pass alone (~21 min).
+#   Total: roughly 4-5.5 h of wall clock on the first run, dominated by the
+#   harness. A re-run with a warm expansion cache and an existing trace store
+#   is dominated by the Engine pass alone (~25 min) — and a run that dies part
+#   way should be picked up with `--resume data/pipeline/submission` rather
+#   than restarted, which skips every stage whose artifacts are already there
+#   (benchmark/pipeline/resume.py).
 run_id: submission
-generation_config: configs/generation/v0.yaml
+generation_config: configs/generation/submission.yaml
 taxonomy: configs/taxonomy.yaml
 target_app_config: configs/target_app.yaml
 engine_app_config: configs/engine.yaml
@@ -64,7 +74,7 @@ seed_issueboard: null
 artifacts_root: data/pipeline
 # WARM THIS BEFORE THE TIMED RUN. Generation is the only stage whose cost is
 # fully recoverable in advance: expansions are pure functions of (config hash,
-# dim, variation, persona, seed), so pre-computing them moves ~300 OpenAI calls
+# dim, variation, persona, seed), so pre-computing them moves 420 OpenAI calls
 # out of the measured window and makes the timed run's generation stage ~0s
 # (measured: the mini smoke reports 0.0s against a warm cache).
 #
@@ -80,19 +90,21 @@ artifacts_root: data/pipeline
 #   uv run python -c "
 #   from benchmark.generation.config_loader import load_generation_config
 #   from benchmark.generation.generators import generate_inputs
-#   cfg = load_generation_config('configs/generation/v0.yaml')
+#   cfg = load_generation_config('configs/generation/submission.yaml')
 #   d = generate_inputs(cfg, cache_dir='data/expansion_cache')
 #   print(len(d.inputs), 'inputs cached')"
 #
 # It is idempotent and resumable — a second call is all cache hits, and an
-# interrupted one keeps whatever it already wrote.
+# interrupted one keeps whatever it already wrote. Expect 420 inputs.
 expansion_cache: data/expansion_cache
 
-# Single-turn only: exactly 300 of the grid's 310 single-turn inputs, a seeded
-# sample so a rerun picks the same 300. No multi-turn traces in this corpus.
+# Single-turn only: exactly 400 of the grid's 420 single-turn inputs, a seeded
+# sample so a rerun picks the same 400. No multi-turn traces in this corpus —
+# and none generated either, since the submission generation config is
+# `mode: single_turn` rather than v0's `mixed`.
 input_modes: [single_turn]
 max_inputs_per_mode:
-  single_turn: 300
+  single_turn: 400
   multi_turn: 0
 slice_seed: 20260824
 
@@ -116,9 +128,11 @@ engine:
   # (apps/engine/README.md, "Analysis concurrency"). 16 is the clamp ceiling.
   analysis_concurrency: 16
   # MUST be passed explicitly: the server default of 25 caps a run at ~23
-  # traces, and the failure mode is a recursion error mid-corpus.
+  # traces, and the failure mode is a recursion error mid-corpus. 400 traces at
+  # N=16 is 25 batches, so the loop costs 2 + 25 = 27 supersteps — past the
+  # default on its own.
   recursion_limit: 10000
-  # `runs.wait` is ONE blocking request spanning the whole ~21 min pass; the
+  # `runs.wait` is ONE blocking request spanning the whole ~25 min pass; the
   # SDK's default read timeout is 300 s and would abort it five minutes in.
   # Generous margin over the projected time, same reasoning as full.yaml.
   timeout_s: 10800
@@ -129,10 +143,17 @@ scoring:
   text_fallback_threshold: 0.5
 
 deliverables:
-  # The assignment's own number, met exactly rather than with full.yaml's
-  # 40-trace margin: this config has no quarantine slack to spend, so a
-  # quarantined trace here means a re-run (the harness skips inputs that
-  # already have an ok trace, so a re-run is cheap).
+  # Still the assignment's own number, and deliberately NOT raised to 400.
+  # The gap is the point: 400 traces collected against a 300-trace deliverable
+  # is 25% quarantine slack. Traces the collector cannot retrieve are
+  # quarantined rather than stored (they are our bug, not signal), and each one
+  # comes out of that gap — so a quarter of the corpus can fail collection
+  # before `traces_file_scale` fails and the run has to be re-run. The previous
+  # 300/300 sizing had no slack at all: one quarantined trace meant a re-run.
+  #
+  # Watch `harness_stats.quarantined` in the manifest rather than discovering
+  # it in the deliverables report — and if it does bite, `--resume` re-runs the
+  # harness against the existing inputs without re-buying generation.
   min_traces: 300
 
 servers:

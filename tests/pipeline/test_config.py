@@ -89,15 +89,20 @@ def test_the_checked_in_submission_config_parses_and_is_full_scale():
     assert cfg.engine.analysis_concurrency == 16
     assert cfg.engine.recursion_limit >= 10_000
     assert cfg.deliverables.min_traces >= 300
-    assert cfg.resolve(cfg.generation_config).name == "v0.yaml"
+    # Its OWN generation config, not v0: v0's grid is 310 single-turn cells and
+    # cannot yield the 400 this run collects.
+    assert cfg.resolve(cfg.generation_config).name == "submission.yaml"
     assert cfg.input_modes == ["single_turn"]
-    assert cfg.max_inputs_per_mode == {"single_turn": 300, "multi_turn": 0}
+    assert cfg.max_inputs_per_mode == {"single_turn": 400, "multi_turn": 0}
 
 
-def test_the_submission_config_slices_to_exactly_300_single_turn_inputs():
-    """The assignment's own deliverable number, single-turn only — no sampled
-    multi-turn tail the way full.yaml has one (mirrors
-    test_the_full_config_is_scoped_to_the_documented_run_size)."""
+def test_the_submission_config_slices_to_exactly_400_single_turn_inputs():
+    """400 collected against a 300-trace deliverable — the quarantine slack.
+
+    Mirrors test_the_full_config_is_scoped_to_the_documented_run_size. The grid
+    behind it is asserted separately, against the real YAML, in
+    tests/test_generation_submission_config.py; this one is about the slice.
+    """
     from benchmark.generation.config_loader import load_generation_config
     from benchmark.pipeline.runner import slice_inputs
     from benchmark.schemas import InputDataset, InputSpec
@@ -114,7 +119,9 @@ def test_the_submission_config_slices_to_exactly_300_single_turn_inputs():
         sum(len(d.variations) for d in generation.adversarial_dims)
         + len(generation.fixed_adversarial)
     )
-    assert (single, multi) == (310, 920), "v0.yaml changed shape; re-check the slice"
+    # No multi-turn cells at all: the grid is `mode: single_turn`, so the run
+    # does not pay to expand conversations it then drops.
+    assert (single, multi) == (420, 0), "submission.yaml changed shape; re-check the slice"
 
     grid = InputDataset(
         inputs=[
@@ -128,8 +135,10 @@ def test_the_submission_config_slices_to_exactly_300_single_turn_inputs():
     )
     sliced = slice_inputs(grid, cfg)
     modes = {m: sum(1 for s in sliced.inputs if s.mode == m) for m in ("single_turn", "multi_turn")}
-    assert modes == {"single_turn": 300, "multi_turn": 0}
-    assert len(sliced.inputs) == 300 == cfg.deliverables.min_traces
+    assert modes == {"single_turn": 400, "multi_turn": 0}
+    assert len(sliced.inputs) == 400
+    # The gap between what is collected and what is required IS the slack.
+    assert len(sliced.inputs) - cfg.deliverables.min_traces == 100
 
 
 def test_run_dir_is_run_id_under_artifacts_root(tmp_path):
