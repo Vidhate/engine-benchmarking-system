@@ -2,6 +2,13 @@
 
 An end-to-end benchmark for **Engine**-style agents — systems that read production traces of an AI application and report the errors hiding in them.
 
+**Assignment Submissions Notes**
+1. Start with high level architecture diagrams here : `docs/handwritten/`   
+2. Responses to questions sent in assignment instruction questions : `docs/adi-notes.md`  
+3. Some known issues I'm aware of in this build : `docs/known-issues.md`  
+4. Final reports on gpt-5.1-mini dummy Engine benchmarking run - `docs/benchmarking_runs/report.md`  
+5. A more readable capture of the benchmark report in a LaTeX report - `docs/paper/main.pdf`  
+
 ## The idea
 
 Evaluating a trace error-analysis agent has a bootstrapping problem: real traces come without ground-truth labels. This benchmark manufactures its own ground truth by **ablation**:
