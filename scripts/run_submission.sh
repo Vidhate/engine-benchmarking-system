@@ -20,6 +20,13 @@ set +a
 : "${OPENAI_API_KEY:?OPENAI_API_KEY is empty after loading .env}"
 : "${LANGSMITH_API_KEY:?LANGSMITH_API_KEY is empty after loading .env}"
 
+# Dedicated LangSmith project for the submission run so test/smoke traces
+# never mix in. The target app honors this env var (setdefault in agent.py);
+# it must match configs/target_app_submission.yaml's langsmith_project, which
+# is where the collector reads from. A mismatch fails loudly (IngestionTimeout
+# — the collector would find no runs), never silently.
+export LANGSMITH_PROJECT="${LANGSMITH_PROJECT:-engine-bench-submission}"
+
 # --- 1. pre-warm the expansion cache (idempotent; ~free when already warm) --
 echo "[run_submission] pre-warming generation cache..."
 uv run python - <<'PY'

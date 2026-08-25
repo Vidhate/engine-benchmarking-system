@@ -68,7 +68,10 @@
 run_id: submission
 generation_config: configs/generation/submission.yaml
 taxonomy: configs/taxonomy.yaml
-target_app_config: configs/target_app.yaml
+# Submission variant: dedicated LangSmith project (engine-bench-submission) so
+# test/smoke traces never mix with the run. run_submission.sh exports
+# LANGSMITH_PROJECT to match — the app honors the env var via setdefault.
+target_app_config: configs/target_app_submission.yaml
 engine_app_config: configs/engine.yaml
 seed_issueboard: null
 artifacts_root: data/pipeline
