@@ -104,15 +104,57 @@ def test_overrides_keep_the_repo_root(spy):
     assert (spy[0]["cfg"].root / "pyproject.toml").exists()
 
 
-def test_fake_harness_and_fake_engine_reach_the_runner(spy):
-    """Each flag substitutes its own seam, and nothing else."""
-    cli.main(["run", "--config", MINI, "--fake-harness", "--fake-engine"])
+def test_each_fake_flag_substitutes_its_own_seam(spy):
+    cli.main(["run", "--config", MINI, "--fake-harness", "--fake-ablation", "--fake-engine"])
     call = spy[0]
     assert isinstance(call["harness_factory"], cli.FakeHarnessFactory)
     assert isinstance(call["engine_invoker"], cli.FakeEngineInvoker)
     assert isinstance(call["expander"], cli.FakeExpander)
-    # --fake-ablation was NOT passed, so the real Phase-5 stage was loaded.
+    assert call["ablation_stage"] is cli.fake_run_ablation
+
+
+def test_fake_engine_alone_leaves_the_other_two_seams_real(spy):
+    """--fake-engine is independent: the harness and the ablation stay real."""
+    cli.main(["run", "--config", MINI, "--fake-engine"])
+    call = spy[0]
+    assert isinstance(call["engine_invoker"], cli.FakeEngineInvoker)
+    assert call["harness_factory"] is None
+    assert call["expander"] is None
     assert call["ablation_stage"] is not cli.fake_run_ablation
+
+
+def test_a_fake_harness_without_a_fake_ablation_is_refused(capsys):
+    """The one combination that cannot work, refused before anything is paid for.
+
+    `--fake-harness` alone leaves the REAL `benchmark.ablation.run_ablation`
+    driving `FakeHarness`, which implements `run_batch` and nothing else — no
+    `replay`, `run_with_faults`, `turn_boundaries`, `activation_evidence` or
+    `locate_checkpoint`. The run would die on a raw `AttributeError` in the
+    ablation stage, minutes in, with generation and the whole batch already
+    spent.
+    """
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["run", "--config", MINI, "--fake-harness"])
+    assert exit_info.value.code != 0
+
+    message = capsys.readouterr().err
+    assert "--fake-harness requires --fake-ablation" in message
+    # It has to say WHY, and name the way out — a bare "invalid combination"
+    # sends the reader to the source to find out which flag to add.
+    assert "run_with_faults" in message
+    assert "--fake-ablation" in message
+
+
+def test_a_fake_harness_without_a_fake_ablation_never_reaches_the_runner(spy):
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--config", MINI, "--fake-harness", "--fake-engine"])
+    assert spy == [], "the pipeline started despite an unusable flag combination"
+
+
+def test_the_fake_harness_run_starts_no_target_app(spy):
+    """Nothing in an offline run talks to the target app, so none is managed."""
+    cli.main(["run", "--config", MINI, "--fake-harness", "--fake-ablation", "--fake-engine"])
+    assert spy[0]["servers"].describe() == {}
 
 
 def test_the_fake_expander_never_writes_to_the_shared_expansion_cache(spy):

@@ -16,7 +16,10 @@
                 --fake-harness   no target app, no LangSmith, and no OpenAI
                                  call to expand prompts either (the canned
                                  traces never read the prompt text, so a real
-                                 expansion would be a paid call thrown away)
+                                 expansion would be a paid call thrown away).
+                                 REQUIRES --fake-ablation: the real ablation
+                                 stage replays and fault-injects through the
+                                 harness, which the fake cannot do.
                 --fake-ablation  no LLM ablation agent, no injection
                 --fake-engine    no Engine server
 
@@ -87,7 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "canned traces instead of the target app + LangSmith, and a network-free "
-            "prompt expander with them (benchmark.pipeline.fakes)"
+            "prompt expander with them (benchmark.pipeline.fakes). Requires "
+            "--fake-ablation"
         ),
     )
     run.add_argument(
@@ -182,7 +186,9 @@ def _cmd_run(args) -> int:
     # `--fake-harness --fake-ablation --fake-engine` starts nothing at all,
     # which is what makes the offline run offline rather than merely unused.
     unmanaged = set()
-    if args.fake_harness and args.fake_ablation:
+    if args.fake_harness:
+        # Guarded in main(): --fake-harness implies --fake-ablation, so nothing
+        # in this run talks to the target app.
         unmanaged.add("target_app")
     if args.fake_engine:
         unmanaged.add("engine")
@@ -222,7 +228,24 @@ def _cmd_check(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "fake_harness", False) and not args.fake_ablation:
+        # The two fakes are not independent. `--fake-harness` alone leaves the
+        # REAL benchmark.ablation.run_ablation driving the stand-in harness,
+        # and the real stage needs a live target app: it forks threads
+        # (locate_checkpoint, turn_boundaries), replays them (replay) and
+        # re-runs traces under a fault shim (run_with_faults,
+        # activation_evidence). FakeHarness implements none of those — it only
+        # knows run_batch — so the run dies on a raw AttributeError several
+        # minutes in, after generation and the batch have already been paid
+        # for. Refused up front instead.
+        parser.error(
+            "--fake-harness requires --fake-ablation: the real ablation stage drives "
+            "the harness through replay/run_with_faults/turn_boundaries, and the fake "
+            "harness only implements run_batch. Add --fake-ablation for a fully "
+            "offline run, or drop --fake-harness to ablate against the real target app."
+        )
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
