@@ -57,6 +57,7 @@ from benchmark.pipeline.manifest import (
     stage_timer,
     utcnow,
 )
+from benchmark.pipeline.progress import Progress
 from benchmark.pipeline.render import render_markdown
 from benchmark.pipeline.scoring import ScoredBoard, score_engine_delta
 from benchmark.pipeline.servers import ServerLifetime
@@ -317,6 +318,7 @@ def run_pipeline(
     servers: ServerLifetime | None = None,
     judge: DescriptionJudge | None = None,
     artifact_paths: ArtifactPaths | None = None,
+    progress: Progress | None = None,
 ) -> PipelineRun:
     """Configs -> BenchmarkReport, with every artifact and its lineage on disk.
 
@@ -324,10 +326,15 @@ def run_pipeline(
     only implementation is a fake, and a pipeline that silently defaults to a
     fake ablation would produce a report that looks exactly like a real one.
     Pass `benchmark.pipeline.contracts.load_ablation_stage()` for the real one.
+
+    `progress` defaults to a live `Progress()` (stderr, timestamped, on) so the
+    CLI is followable out of the box; pass `Progress(quiet=True)` to silence it
+    or a stream-backed one to capture it. It never writes to an artifact.
     """
     timings: list[StageTiming] = []
     warnings: list[str] = []
     started_at = utcnow()
+    progress = progress or Progress()
 
     artifacts = RunArtifacts(cfg.run_dir, artifact_paths)
     artifacts.write_json("pipeline_config", cfg.model_dump(mode="json"))
@@ -343,12 +350,13 @@ def run_pipeline(
     servers = servers or ServerLifetime(cfg.root, {}, enabled=False)
 
     # ------------------------------------------------------- Stage I: inputs
-    with stage_timer("generation", timings):
+    with progress.stage("generation") as stg, stage_timer("generation", timings):
         generation_cfg = load_generation_config(cfg.resolve(cfg.generation_config))
         inputs = generate_inputs(
             generation_cfg, expander, cache_dir=cfg.resolve(cfg.expansion_cache)
         )
         inputs = slice_inputs(inputs, cfg)
+        stg.set_detail(f"{len(inputs.inputs)} inputs, dataset_id={inputs.dataset_id[:12]}")
     artifacts.write_model("inputs", inputs)
     log.info("inputs: %s specs, dataset_id=%s", len(inputs.inputs), inputs.dataset_id)
 
@@ -361,13 +369,26 @@ def run_pipeline(
 
     # ------------ Stages II + III: ONE target-app server lifetime, in order --
     with servers.running("target_app"):
-        with stage_timer("harness", timings):
-            outputs, traces = harness.run_batch(inputs)
+        n_inputs = len(inputs.inputs)
+
+        def _harness_done() -> int:
+            stats = harness.stats
+            return sum(stats.get(k, 0) for k in ("ran", "skipped", "quarantined"))
+
+        with progress.stage("harness") as stg:
+            with progress.poll("harness batch", _harness_done, n_inputs, interval=2.0):
+                with stage_timer("harness", timings):
+                    outputs, traces = harness.run_batch(inputs)
+            stg.set_detail(f"{len(traces.traces)} traces, stats={harness.stats}")
         artifacts.write_model("outputs", outputs)
         artifacts.write_model("traces", traces)
         log.info("traces: %s collected, harness stats=%s", len(traces.traces), harness.stats)
 
-        with stage_timer("ablation", timings):
+        # `run_ablation`'s signature is pinned (benchmark/pipeline/contracts.py)
+        # and exposes no progress callback or partial-result hook, so this
+        # stage only gets a banner — there is no clean per-error signal to
+        # poll the way `harness.stats` gives the batch one.
+        with progress.stage("ablation") as stg, stage_timer("ablation", timings):
             result = assert_ablation_result(
                 ablation_stage(
                     traces=traces,
@@ -378,6 +399,10 @@ def run_pipeline(
                     store=store,
                     export_path=export_path,
                 )
+            )
+            stg.set_detail(
+                f"{len(result.records)} records, {len(result.ground_truth.issues)} "
+                f"ground-truth issue(s)"
             )
 
     ablated: TraceDataset = result.ablated
@@ -422,13 +447,29 @@ def run_pipeline(
     assert_export_file_clean(written_export)
 
     # ------------------------------------ Stage IV: the Engine's own lifetime
+    n_traces = len(ablated.traces)
+    concurrency = max(1, cfg.engine.analysis_concurrency)
+    projected_batches = -(-n_traces // concurrency)  # ceil division
     try:
-        with servers.running("engine"), stage_timer("engine", timings):
-            invocation = engine_invoker(
-                trace_file=written_export,
-                seed_board=seed_board,
-                categories=categories,
-                engine=cfg.engine,
+        with servers.running("engine"), progress.stage("engine") as stg:
+            progress.note(
+                f"    engine: {n_traces} trace(s), analysis_concurrency={concurrency}, "
+                f"~{projected_batches} batch(es) projected"
+            )
+            with (
+                stage_timer("engine", timings),
+                progress.heartbeat(f"engine run ({cfg.engine.model})", interval=30.0),
+            ):
+                invocation = engine_invoker(
+                    trace_file=written_export,
+                    seed_board=seed_board,
+                    categories=categories,
+                    engine=cfg.engine,
+                )
+            stg.set_detail(
+                f"{len(invocation.board.issues)} issue(s), "
+                f"{len(invocation.board.occurrences)} occurrence(s), "
+                f"{invocation.seconds:.0f}s server time"
             )
     except EngineRunFailed as exc:
         # The run is lost; the response must not be. A full-scale pass is
@@ -490,7 +531,7 @@ def run_pipeline(
         warnings.insert(0, _fake_warning(faked, implementations))
 
     # ---------------------------------------------------------- Stage V: score
-    with stage_timer("scoring", timings):
+    with progress.stage("scoring") as stg, stage_timer("scoring", timings):
         base_rates = build_base_rates(
             ground_truth=ground_truth,
             split=split,
@@ -519,6 +560,10 @@ def run_pipeline(
                 seed=cfg.engine.seed,
             ),
             judge=judge,
+        )
+        stg.set_detail(
+            f"{len(report.category_scores)} categories scored, "
+            f"{len(scored.board.occurrences)} occurrence(s) in the scored delta"
         )
     artifacts.write_model("report", report)
     # The Engine's own delta, as scored — the board the numbers describe, kept
@@ -592,27 +637,31 @@ def run_pipeline(
         warnings=warnings,
     )
 
-    # The SCORED board, not the verbatim one: the prose describes the numbers,
-    # and the numbers describe the Engine's delta.
-    markdown = render_markdown(
-        report, ground_truth=ground_truth, scored_board=scored.board, manifest=manifest
-    )
-    artifacts.write_text("summary", markdown)
-
-    artifacts.write_model("manifest", manifest)
-
-    # Runs last, and off the run directory rather than off these objects: the
-    # deliverable is what someone else can pick up from disk, not what this
-    # process happens to be holding.
-    # `judge=None` on purpose: the re-score is a reproducibility check, and
-    # re-running an LLM judge would both fail to reproduce and double its cost.
-    checks = check_deliverables(cfg.run_dir, min_traces=cfg.deliverables.min_traces)
-    artifacts.write_json("deliverables", [c.model_dump(mode="json") for c in checks])
-    for check in checks:
-        (log.info if check.ok else log.error)(
-            "deliverable %s: %s — %s", check.name, "ok" if check.ok else "FAILED", check.detail
+    with progress.stage("render/deliverables") as stg:
+        # The SCORED board, not the verbatim one: the prose describes the
+        # numbers, and the numbers describe the Engine's delta.
+        markdown = render_markdown(
+            report, ground_truth=ground_truth, scored_board=scored.board, manifest=manifest
         )
-    log.info("report written to %s", artifacts.path("summary"))
+        artifacts.write_text("summary", markdown)
+
+        artifacts.write_model("manifest", manifest)
+
+        # Runs last, and off the run directory rather than off these objects:
+        # the deliverable is what someone else can pick up from disk, not what
+        # this process happens to be holding.
+        # `judge=None` on purpose: the re-score is a reproducibility check, and
+        # re-running an LLM judge would both fail to reproduce and double its
+        # cost.
+        checks = check_deliverables(cfg.run_dir, min_traces=cfg.deliverables.min_traces)
+        artifacts.write_json("deliverables", [c.model_dump(mode="json") for c in checks])
+        for check in checks:
+            (log.info if check.ok else log.error)(
+                "deliverable %s: %s — %s", check.name, "ok" if check.ok else "FAILED", check.detail
+            )
+        log.info("report written to %s", artifacts.path("summary"))
+        passed = sum(1 for c in checks if c.ok)
+        stg.set_detail(f"{passed}/{len(checks)} deliverables ok")
 
     return PipelineRun(
         cfg=cfg,
