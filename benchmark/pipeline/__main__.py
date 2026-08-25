@@ -6,10 +6,26 @@
 
 * `run`   — the whole pipeline. Manages both app servers by default (each via
             its own `scripts/serve.sh`); `--no-serve` assumes they are already
-            up. `--fake-ablation` substitutes the Phase-5 stand-in and says so
-            in the report; without it, Phase 5's real `run_ablation` is
-            imported and a missing Phase 5 is a loud failure, never a silent
-            downgrade.
+            up. Every stage is real by default: a missing Phase 5 is a loud
+            failure, never a silent downgrade.
+
+            The three `--fake-*` flags substitute the CI doubles from
+            `benchmark.pipeline.fakes`, one per external seam, and every one of
+            them stamps a FAKED warning onto the manifest and the report:
+
+                --fake-harness   no target app, no LangSmith, and no OpenAI
+                                 call to expand prompts either (the canned
+                                 traces never read the prompt text, so a real
+                                 expansion would be a paid call thrown away)
+                --fake-ablation  no LLM ablation agent, no injection
+                --fake-engine    no Engine server
+
+            All three together is the offline end-to-end run — no servers, no
+            keys, no network:
+
+                python -m benchmark.pipeline run \\
+                    --config configs/pipeline/mini.yaml \\
+                    --fake-harness --fake-ablation --fake-engine
 * `score` — the standalone scoring entrypoint: re-runs `score()` over a
             finished run's artifacts, reading nothing but files.
 * `check` — the assignment-deliverables checklist over a finished run.
@@ -27,7 +43,12 @@ from pathlib import Path
 from benchmark.pipeline.config import find_root, load_pipeline_config
 from benchmark.pipeline.contracts import AblationStageUnavailable, load_ablation_stage
 from benchmark.pipeline.deliverables import check_deliverables, rescore_from_disk
-from benchmark.pipeline.fakes import fake_run_ablation
+from benchmark.pipeline.fakes import (
+    FakeEngineInvoker,
+    FakeExpander,
+    FakeHarnessFactory,
+    fake_run_ablation,
+)
 from benchmark.pipeline.progress import Progress
 from benchmark.pipeline.runner import run_pipeline
 from benchmark.pipeline.servers import ServerLifetime
@@ -62,9 +83,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not start/stop the app servers — they are already running",
     )
     run.add_argument(
+        "--fake-harness",
+        action="store_true",
+        help=(
+            "canned traces instead of the target app + LangSmith, and a network-free "
+            "prompt expander with them (benchmark.pipeline.fakes)"
+        ),
+    )
+    run.add_argument(
         "--fake-ablation",
         action="store_true",
-        help="use the Phase-5 stand-in (benchmark.pipeline.fakes.fake_run_ablation)",
+        help="no injection: the pass-through stand-in (benchmark.pipeline.fakes)",
+    )
+    run.add_argument(
+        "--fake-engine",
+        action="store_true",
+        help="a canned issueboard instead of the Engine server (benchmark.pipeline.fakes)",
     )
     run.add_argument(
         "--quiet",
@@ -99,11 +133,6 @@ def _cmd_run(args) -> int:
 
     if args.fake_ablation:
         stage = fake_run_ablation
-        print(
-            "WARNING: running with the FAKE ablation stage — traces are not modified and "
-            "the ground truth is synthetic. Wiring evidence only.",
-            file=sys.stderr,
-        )
     else:
         try:
             stage = load_ablation_stage()
@@ -111,9 +140,54 @@ def _cmd_run(args) -> int:
             print(f"BLOCKED: {exc}", file=sys.stderr)
             return 3
 
-    servers = ServerLifetime(cfg.root, cfg.servers, enabled=not args.no_serve)
+    # `None` means "the runner builds the real one". The fakes are only ever
+    # reached through an explicit flag, so no combination of defaults can
+    # produce a faked run.
+    harness_factory = FakeHarnessFactory() if args.fake_harness else None
+    # The fake harness fabricates its traces and never reads the prompt text,
+    # so expanding prompts for real would be a paid OpenAI call whose output is
+    # discarded — and it would also stop this being an offline run.
+    expander = FakeExpander() if args.fake_harness else None
+    engine_invoker = FakeEngineInvoker() if args.fake_engine else None
+
+    faked = [
+        name
+        for name, on in (
+            ("harness (+ prompt expansion)", args.fake_harness),
+            ("ablation", args.fake_ablation),
+            ("engine", args.fake_engine),
+        )
+        if on
+    ]
+    if faked:
+        print(
+            f"WARNING: running with FAKE stage(s): {', '.join(faked)}. Development "
+            f"stand-ins produce evidence about wiring, never about the Engine — the "
+            f"manifest and the report say so too.",
+            file=sys.stderr,
+        )
+
+    # A faked seam has no server to talk to, so the run does not start one:
+    # `--fake-harness --fake-ablation --fake-engine` starts nothing at all,
+    # which is what makes the offline run offline rather than merely unused.
+    unmanaged = set()
+    if args.fake_harness and args.fake_ablation:
+        unmanaged.add("target_app")
+    if args.fake_engine:
+        unmanaged.add("engine")
+    managed = {k: v for k, v in cfg.servers.items() if k not in unmanaged}
+
+    servers = ServerLifetime(cfg.root, managed, enabled=not args.no_serve)
     progress = Progress(quiet=args.quiet)
-    run = run_pipeline(cfg, ablation_stage=stage, servers=servers, progress=progress)
+    run = run_pipeline(
+        cfg,
+        ablation_stage=stage,
+        engine_invoker=engine_invoker,
+        harness_factory=harness_factory,
+        expander=expander,
+        servers=servers,
+        progress=progress,
+    )
 
     print(run.markdown)
     print(f"artifacts: {run.run_dir}")

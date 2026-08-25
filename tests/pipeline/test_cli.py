@@ -9,12 +9,15 @@ choice, and the exit codes a CI job would branch on.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
 from benchmark.pipeline import __main__ as cli
 from benchmark.pipeline.contracts import AblationStageUnavailable
-from tests.pipeline.conftest import MINI_PIPELINE_CONFIG
+from tests.pipeline.conftest import MINI_PIPELINE_CONFIG, REPO_ROOT
 
 
 @pytest.fixture
@@ -99,6 +102,75 @@ def test_the_run_id_and_artifacts_root_can_be_overridden(spy, tmp_path):
 def test_overrides_keep_the_repo_root(spy):
     cli.main(["run", "--config", MINI, "--fake-ablation", "--run-id", "x"])
     assert (spy[0]["cfg"].root / "pyproject.toml").exists()
+
+
+def test_fake_harness_and_fake_engine_reach_the_runner(spy):
+    """Each flag substitutes its own seam, and nothing else."""
+    cli.main(["run", "--config", MINI, "--fake-harness", "--fake-engine"])
+    call = spy[0]
+    assert isinstance(call["harness_factory"], cli.FakeHarnessFactory)
+    assert isinstance(call["engine_invoker"], cli.FakeEngineInvoker)
+    assert isinstance(call["expander"], cli.FakeExpander)
+    # --fake-ablation was NOT passed, so the real Phase-5 stage was loaded.
+    assert call["ablation_stage"] is not cli.fake_run_ablation
+
+
+def test_the_default_run_fakes_nothing(spy):
+    """Every seam is real unless a flag says otherwise."""
+    cli.main(["run", "--config", MINI])
+    call = spy[0]
+    assert call["harness_factory"] is None
+    assert call["engine_invoker"] is None
+    assert call["expander"] is None
+
+
+# ------------------------------------------------- the offline end-to-end run
+
+def test_the_fake_flags_run_the_whole_pipeline_offline(tmp_path):
+    """The exact command a developer types, with no servers, keys or network.
+
+    A subprocess rather than `cli.main(...)`: the claim under test is about the
+    process a terminal starts, and the environment it inherits is half of it.
+    Both API keys are blanked — present-but-empty, so the repo-root `.env` that
+    `load_dotenv` reads cannot put them back — which means any seam that had
+    NOT been faked would fail loudly instead of quietly reaching the network.
+    """
+    env = {
+        **os.environ,
+        "OPENAI_API_KEY": "",
+        "LANGSMITH_API_KEY": "",
+        "LANGSMITH_TRACING": "false",
+    }
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "benchmark.pipeline", "run",
+            "--config", MINI,
+            "--fake-harness", "--fake-ablation", "--fake-engine",
+            "--artifacts-root", str(tmp_path),
+            "--run-id", "offline",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
+
+    run_dir = tmp_path / "offline"
+    for name in ("inputs.json", "raw_traces.json", "ablated_traces.json", "traces.json",
+                 "predicted_issueboard.json", "report.json", "report.md", "manifest.json"):
+        assert (run_dir / name).exists(), f"{name} missing from {run_dir}"
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    faked = [w for w in manifest["warnings"] if "FAKED" in w]
+    assert faked, f"no FAKED warning in {manifest['warnings']}"
+    # All three, named — a run that faked the harness and said only "ablation"
+    # would read as three-quarters real.
+    for stage in ("ablation", "engine_invoker", "harness"):
+        assert stage in faked[0], f"{stage} is faked but the warning does not say so"
+    assert "FAKED" in (run_dir / "report.md").read_text()
+    assert "FAKE" in proc.stderr
 
 
 def test_a_failing_deliverable_makes_the_run_exit_nonzero(spy, monkeypatch):
