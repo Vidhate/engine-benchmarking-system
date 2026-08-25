@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from benchmark.ablation.agent import AblationAgent, CorpusDigest, OpenAIAblationAgent
 from benchmark.ablation.apply import apply_ablations
 from benchmark.ablation.export import write_engine_export
-from benchmark.ablation.inject import assert_threads_alive
+from benchmark.ablation.inject import assert_threads_alive, live_threads
 from benchmark.ablation.propose import DEFAULT_MIN_PER_MODE, build_digest, propose_errors
 from benchmark.ablation.split import make_split
 from benchmark.ablation.validate import ValidationOutcome, validate_specs
@@ -175,9 +175,37 @@ class AblationEngine:
         # one `get_history` per distinct thread against a live server — and
         # `assert_threads_alive` would abort a perfectly valid dependency-fault
         # run over threads it was never going to use.
+        #
+        # Only MULTI-TURN traces need a live thread: replay_edit on an M=1
+        # trace is a consistency-managed post-hoc edit that never touches the
+        # server (inject.apply_replay_edit), so single-turn traces stay
+        # eligible even when their collection lifetime's server is long dead —
+        # which is exactly what happens when a crashed harness is resumed
+        # across server restarts.
         replayable: set[str] | None = None
         if any(p.issue.injection_mode == "replay_edit" for p in proposals):
-            replayable = assert_threads_alive(ablate_traces, self.harness)
+            multi_turn = [t for t in ablate_traces if len(t.turns) > 1]
+            single_turn_count = len(ablate_traces) - len(multi_turn)
+            if multi_turn:
+                replayable = live_threads(multi_turn, self.harness)
+                if not replayable and single_turn_count == 0:
+                    assert_threads_alive(multi_turn, self.harness)  # raises DeadThreadRefs
+                elif len(replayable) < len(multi_turn):
+                    log.warning(
+                        "%d/%d multi-turn candidate traces have a live thread; the rest "
+                        "are not replay_edit-eligible in this server lifetime "
+                        "(single-turn traces are unaffected: %d remain eligible)",
+                        len(replayable),
+                        len(multi_turn),
+                        single_turn_count,
+                    )
+            else:
+                log.info(
+                    "all %d ablate traces are single-turn — replay_edit is a post-hoc "
+                    "edit there; no thread-liveness probe needed",
+                    len(ablate_traces),
+                )
+                replayable = set()
         else:
             log.info("no replay_edit error proposed — skipping the thread-liveness probe")
 

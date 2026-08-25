@@ -224,7 +224,13 @@ def validate_specs(
                 reason = f"the filter names a field no trace has: {exc}"
             else:
                 if spec.mode == "replay_edit" and replayable_trace_ids is not None:
-                    candidates = [t for t in candidates if t.trace_id in replayable_trace_ids]
+                    # Single-turn traces bypass the liveness filter: their
+                    # replay_edit is a post-hoc edit that never forks a thread.
+                    candidates = [
+                        t
+                        for t in candidates
+                        if len(t.turns) <= 1 or t.trace_id in replayable_trace_ids
+                    ]
                 reason = (
                     f"filter matched {len(candidates)} trace(s) in the ablate set, "
                     f"below min_eligible={min_eligible}"

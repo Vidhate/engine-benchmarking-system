@@ -141,6 +141,10 @@ def apply_ablations(
     liveness: dict[str, bool] = {}
 
     def replayable(trace: Trace) -> bool:
+        # Single-turn replay_edit is a post-hoc edit — no thread involved, so
+        # a dead collection-lifetime server never disqualifies the trace.
+        if len(trace.turns) <= 1:
+            return True
         ref = thread_ref(trace)
         if ref is None:
             return False

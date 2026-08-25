@@ -143,11 +143,28 @@ def test_dry_runs_never_persist_a_rejected_injection(target_cfg, store, traces, 
 
 
 def test_replay_edit_candidates_are_limited_to_live_threads(traces, inputs, harness):
+    """Liveness limits MULTI-TURN replay candidates only: a multi-turn-filtered
+    proposal with zero live threads is dropped..."""
+    from benchmark.schemas.ablation import FilterStep
+
+    proposal = make_proposal(
+        filter_steps=[FilterStep(field="mode", op="eq", value="multi_turn")]
+    )
     outcome = _validate(
-        [make_proposal()], traces, inputs, harness, replayable_trace_ids=set()
+        [proposal], traces, inputs, harness, replayable_trace_ids=set(), max_replans=0
     )
     assert outcome.specs == []
     assert "below min_eligible" in outcome.dropped["E-hallucination-00"]
+
+
+def test_single_turn_replay_candidates_bypass_the_liveness_filter(traces, inputs, harness):
+    """...while single-turn candidates survive dead threads: M=1 replay_edit is
+    a post-hoc edit that never forks a thread (the crash-resume scenario —
+    a corpus collected across dead server lifetimes stays fully eligible)."""
+    outcome = _validate(
+        [make_proposal()], traces, inputs, harness, replayable_trace_ids=set()
+    )
+    assert outcome.specs, "single-turn candidates must survive an empty liveness set"
 
 
 def test_the_validated_proposal_is_returned_so_apply_uses_the_revised_text(

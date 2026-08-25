@@ -126,15 +126,24 @@ def test_the_split_is_reported_rather_than_hidden(result, inputs):
     assert result.injected_counts, "per-error injection counts are part of the report"
 
 
-def test_a_dead_thread_corpus_fails_loudly_before_anything_is_injected(
-    target_cfg, store, traces, inputs, categories, ablation_cfg, tmp_path, agent
+def test_an_all_multi_turn_dead_thread_corpus_fails_loudly_before_injecting(
+    target_cfg, store, categories, ablation_cfg, tmp_path, agent
 ):
+    """Multi-turn replay genuinely needs live threads, so an ALL-multi-turn
+    corpus whose threads are all dead must still abort loudly. (A corpus with
+    single-turn traces proceeds instead — those are post-hoc edits; see
+    test_a_single_turn_corpus_survives_dead_server_threads.)"""
     from benchmark.ablation.inject import DeadThreadRefs
+    from tests.ablation.conftest import make_inputs, make_traces
 
+    multi_inputs = make_inputs(n_safe=0, n_adv=0, n_multi=3)
+    multi_traces = make_traces(multi_inputs)
+    for t in multi_traces.traces:
+        store.put(t)
     harness = FakeHarness(target_cfg, store, live_threads=set())
     engine = AblationEngine(harness, store, ablation_cfg, agent=agent)
     with pytest.raises(DeadThreadRefs, match="one server lifetime"):
-        engine.run(traces, inputs, categories, tmp_path / "engine_traces.json")
+        engine.run(multi_traces, multi_inputs, categories, tmp_path / "engine_traces.json")
 
 
 def test_a_dropped_error_is_reported_with_its_reason(
@@ -281,3 +290,32 @@ def test_the_run_is_reproducible_for_a_seed(
             sorted((o.error_id, o.trace_id) for o in result.ground_truth.occurrences)
         )
     assert boards[0] == boards[1]
+
+
+
+def test_a_single_turn_corpus_survives_dead_server_threads(
+    inputs, categories, ablation_cfg, store, tmp_path, agent, target_cfg
+):
+    """The crash-resume scenario: every thread is dead (the corpus was
+    collected under earlier, now-gone server lifetimes), but the corpus is
+    single-turn — where replay_edit is a post-hoc edit that never forks a
+    thread. Mode A must remain fully eligible, no DeadThreadRefs, and the
+    engine must not probe liveness at all (a probe is a real server call)."""
+    from tests.ablation.conftest import make_inputs, make_traces
+
+    single_inputs = make_inputs(n_multi=0)
+    single_traces = make_traces(single_inputs)
+    for t in single_traces.traces:
+        store.put(t)
+    harness = FakeHarness(target_cfg, store, live_threads=set())  # all dead
+    engine = AblationEngine(harness, store, ablation_cfg, agent=agent)
+
+    result = engine.run(
+        single_traces, single_inputs, categories, tmp_path / "engine_traces.json"
+    )
+
+    modes = {i.injection_mode for i in result.ground_truth.issues}
+    assert "replay_edit" in modes, "dead threads must not exclude single-turn Mode A"
+    assert harness.boundary_probes == [], (
+        "an all-single-turn corpus must not probe thread liveness"
+    )
