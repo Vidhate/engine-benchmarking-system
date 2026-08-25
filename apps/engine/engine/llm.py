@@ -22,6 +22,21 @@ MODEL_ENV_VAR = "ENGINE_MODEL"
 # default. Overridden per run via configurable, or globally via ENGINE_MODEL.
 DEFAULT_MODEL = "gpt-5-mini"
 
+# Per-request timeout, in seconds. The SDK's own default is 600 s, and that is
+# not a theoretical number here: one hung analysis request stalled a whole
+# batch for exactly 600 s before the transport gave up. A batch costs its
+# SLOWEST trace (apps/engine/README.md, "the straggler tax"), so a single
+# stuck request does not cost 600 s of one trace — it costs 600 s of the entire
+# batch. 120 s is generous against the ~49 s a real batch takes.
+REQUEST_TIMEOUT_S = 120
+# Bounded retries on top of that. A retry is the right answer to the two
+# failures this transport actually sees — a 429 and a dropped connection — and
+# `max_retries` is the SDK's own exponential backoff, so this costs nothing on
+# a healthy run. Two, not more: the Engine already runs `analysis_concurrency`
+# requests at once, and a deep retry ladder on every one of them turns a
+# provider blip into a much longer stall than the failure it is papering over.
+MAX_RETRIES = 2
+
 
 def resolve_model_name(config: Mapping[str, Any] | None) -> str:
     """Run config wins, then ENGINE_MODEL, then the pinned default.
@@ -41,5 +56,15 @@ def resolve_model_name(config: Mapping[str, Any] | None) -> str:
 
 def build_model(name: str) -> BaseChatModel:
     """Chat Completions (not the Responses API) so message content stays a
-    plain string, matching how the target app's traces were produced."""
-    return ChatOpenAI(model=name, use_responses_api=False)
+    plain string, matching how the target app's traces were produced.
+
+    `timeout` and `max_retries` are NOT decoration: see the constants above.
+    They are set here, on the one construction site, so every Engine node —
+    analysis and consolidation alike — inherits the same bounded call.
+    """
+    return ChatOpenAI(
+        model=name,
+        use_responses_api=False,
+        timeout=REQUEST_TIMEOUT_S,
+        max_retries=MAX_RETRIES,
+    )
