@@ -20,3 +20,6 @@ apps/engine/scripts/.server.log
 apps/engine/scripts/.last_run.json
 apps/engine/scripts/.model_swap.json
 apps/engine/.langgraph_api/
+
+# claude work artifacts
+.claude/
